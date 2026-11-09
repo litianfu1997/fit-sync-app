@@ -1,0 +1,63 @@
+export const platformNames: Record<string, string> = {
+  LOCAL: "本地 FIT",
+  COROS: "COROS",
+  IGPSPORT: "iGPSPORT",
+  ONELAP: "迈金",
+  XINGZHE: "行者",
+  GARMIN: "Garmin",
+  STRAVA: "Strava",
+};
+export const platformName = (code?: string) =>
+  platformNames[code || ""] || code || "本地 FIT";
+export const platformInitials: Record<string, string> = {
+  LOCAL: "本", ONELAP: "迈", XINGZHE: "行", GARMIN: "G",
+  COROS: "C", IGPSPORT: "iG", STRAVA: "S",
+};
+export const km = (meters?: number | null) =>
+  meters == null
+    ? "—"
+    : (meters / 1000).toLocaleString("zh-CN", { maximumFractionDigits: 1 });
+export function duration(seconds?: number | null) {
+  if (seconds == null) return "—";
+  const minutes = Math.floor(seconds / 60);
+  return minutes >= 60
+    ? `${Math.floor(minutes / 60)}小时${minutes % 60}分`
+    : `${minutes}分钟`;
+}
+export function date(value?: number) {
+  if (!value) return "尚无记录";
+  return new Date(value).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+export const statuses: Record<string, string> = {
+  ACTIVE: "已连接",
+  AUTH_EXPIRED: "登录已过期",
+  CONNECTED: "已连接",
+  QUEUED: "排队中",
+  PENDING: "等待执行",
+  RUNNING: "正在同步",
+  CONFIRMING: "等待远端确认",
+  SUCCESS: "已完成",
+  SUCCEEDED: "已完成",
+  COMPLETED: "已完成",
+  FAILED: "失败",
+  RETRY: "等待重试",
+  RETRYABLE: "等待重试",
+  WAITING_USER: "需要操作",
+  CANCELLED: "已取消",
+  PERMANENT_FAILURE: "无法完成",
+  DISCONNECTED: "未连接",
+};
+export const statusLabel = (status: string) => statuses[status] || status;
+export const jobKind = (kind: string) =>
+  ({
+    PULL: "拉取活动",
+    DELIVERY: "投递活动",
+    SYNC: "同步活动",
+    IMPORT: "导入 FIT",
+  })[kind] || kind;

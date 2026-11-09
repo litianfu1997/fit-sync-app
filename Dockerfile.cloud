@@ -1,0 +1,18 @@
+FROM maven:3.9.9-eclipse-temurin-21 AS build
+WORKDIR /workspace
+COPY pom.xml ./
+COPY fit-core ./fit-core
+COPY server ./server
+COPY app/src/main/java/com/fitsync/app/fit ./app/src/main/java/com/fitsync/app/fit
+COPY app/src/main/java/com/fitsync/app/domain ./app/src/main/java/com/fitsync/app/domain
+COPY app/src/test/java/com/fitsync/app/fit ./app/src/test/java/com/fitsync/app/fit
+RUN mvn -B -ntp -DskipTests package
+
+FROM eclipse-temurin:21-jre-alpine
+RUN addgroup -S fitsync && adduser -S -G fitsync fitsync && mkdir -p /data/fits && chown -R fitsync:fitsync /data
+WORKDIR /app
+COPY --from=build /workspace/server/target/fitsync-server-0.1.0-SNAPSHOT.jar app.jar
+USER fitsync
+ENV SPRING_PROFILES_ACTIVE=prod FITSYNC_STORAGE_DIR=/data/fits
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]

@@ -1,0 +1,30 @@
+spring:
+  application:
+    name: fitsync-cloud
+  profiles:
+    default: local
+  servlet:
+    multipart:
+      max-file-size: 25MB
+      max-request-size: 26MB
+  datasource:
+    hikari:
+      maximum-pool-size: 8
+  jackson:
+    default-property-inclusion: non_null
+server:
+  port: ${PORT:8080}
+  error:
+    include-message: never
+    include-stacktrace: never
+fitsync:
+  storage-dir: ${FITSYNC_STORAGE_DIR:./.data/fits}
+  encryption-key: ${FITSYNC_ENCRYPTION_KEY:}
+  cors-origins: ${FITSYNC_CORS_ORIGINS:http://localhost:5173,http://127.0.0.1:5173}
+  wechat-app-id: ${WECHAT_APP_ID:}
+  wechat-app-secret: ${WECHAT_APP_SECRET:}
+  native-ad-unit-id: ${WECHAT_NATIVE_AD_UNIT_ID:}
+  rewarded-ad-unit-id: ${WECHAT_REWARDED_AD_UNIT_ID:}
+  scheduler-enabled: ${FITSYNC_SCHEDULER_ENABLED:true}
+  session-days: 30
+  sync-interval-ms: 900000

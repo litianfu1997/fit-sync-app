@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: fitsync
+      POSTGRES_USER: fitsync
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env.cloud 设置数据库密码}
+    volumes:
+      - fitsync_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fitsync -d fitsync"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.cloud
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      DATABASE_URL: jdbc:postgresql://postgres:5432/fitsync
+      DATABASE_USERNAME: fitsync
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?请设置数据库密码}
+      FITSYNC_ENCRYPTION_KEY: ${FITSYNC_ENCRYPTION_KEY:?请设置 Base64 编码的 32 字节随机密钥}
+      FITSYNC_STORAGE_DIR: /data/fits
+      FITSYNC_CORS_ORIGINS: ${FITSYNC_CORS_ORIGINS:-}
+      WECHAT_APP_ID: ${WECHAT_APP_ID:?请设置微信 AppID}
+      WECHAT_APP_SECRET: ${WECHAT_APP_SECRET:?请设置微信 AppSecret}
+      WECHAT_NATIVE_AD_UNIT_ID: ${WECHAT_NATIVE_AD_UNIT_ID:-}
+    volumes:
+      - fitsync_files:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    ports:
+      - "127.0.0.1:8090:80"
+    depends_on:
+      - server
+    restart: unless-stopped
+volumes:
+  fitsync_db:
+  fitsync_files:
