@@ -1,13 +1,14 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onUnmounted, ref } from "vue";
 import { themeColors, theme } from "../../lib/theme";
 import { onLoad } from "@dcloudio/uni-app";
 import AppShell from "../../components/AppShell.vue";
 import SessionGate from "../../components/SessionGate.vue";
 import LoadState from "../../components/LoadState.vue";
-import { api, confirm, go, messageOf, session, toast } from "../../lib/api";
+import { api, apiBase, confirm, go, messageOf, session, toast } from "../../lib/api";
 import { useLoad } from "../../lib/page";
 import { date, platformName, platformInitials, statusLabel } from "../../lib/format";
+import { platformLoginHints } from "../../lib/web-session";
 import type { Account, PlatformCode, Rule } from "../../lib/types";
 const accounts = ref<Account[]>([]),
   rules = ref<Rule[]>([]),
@@ -16,9 +17,26 @@ const accounts = ref<Account[]>([]),
   connectPlatform = ref<PlatformCode>("COROS"),
   username = ref(""),
   password = ref(""),
-  storeCredentials = ref(false),
+  stravaClientId = ref(""),
+  stravaClientSecret = ref(""),
+  oauthChallengeId = ref(""),
+  oauthAuthorizeUrl = ref(""),
+  oauthPolling = ref(false),
+  storeCredentials = ref(true),
   connectError = ref(""),
   pendingAccount = ref("");
+let oauthPollTimer: ReturnType<typeof setInterval> | null = null;
+const authMode = (code: PlatformCode) =>
+  session.config?.platforms.find((p) => p.code === code)?.authMode || "UNAVAILABLE";
+const isStravaOAuth = computed(() => authMode(connectPlatform.value) === "OAUTH");
+const stravaOAuthReady = computed(() => !!session.config?.stravaOAuthConfigured);
+const loginHint = computed(() => platformLoginHints[connectPlatform.value]);
+const connectablePlatforms = computed(
+  () =>
+    session.config?.platforms.filter(
+      (p) => p.authMode === "PASSWORD" || p.authMode === "WEB_SESSION" || p.authMode === "OAUTH",
+    ) || [],
+);
 const source = ref<PlatformCode>("LOCAL"),
   destinationIds = ref<string[]>([]),
   historyDays = ref("90"),
@@ -28,6 +46,30 @@ const source = ref<PlatformCode>("LOCAL"),
 const activityIds = ref<string[]>([]);
 const selectedMode = ref(false);
 onLoad((query) => {
+  if (query?.connect) {
+    showConnect.value = true;
+    const requested = String(query.connect).toUpperCase() as PlatformCode;
+    if (
+      ["COROS", "IGPSPORT", "ONELAP", "XINGZHE", "GARMIN", "STRAVA"].includes(
+        requested,
+      )
+    ) {
+      connectPlatform.value = requested;
+    }
+  }
+  if (query?.stravaOAuth === "success") {
+    toast("Strava 已连接");
+  } else if (query?.stravaOAuth === "error") {
+    showConnect.value = true;
+    connectPlatform.value = "STRAVA";
+    try {
+      connectError.value = query.stravaOAuthMsg
+        ? decodeURIComponent(String(query.stravaOAuthMsg))
+        : "Strava 授权未完成，请重试";
+    } catch {
+      connectError.value = "Strava 授权未完成，请重试";
+    }
+  }
   if (!query?.activityIds) return;
   selectedMode.value = true;
   try {
@@ -39,6 +81,9 @@ onLoad((query) => {
     syncError.value = "活动选择信息已失效，请返回活动列表重新选择";
   }
 });
+onUnmounted(() => {
+  clearOAuthPoll();
+});
 const ruleSource = ref<PlatformCode>("LOCAL"),
   ruleDestination = ref(""),
   includeHistory = ref(false),
@@ -47,7 +92,9 @@ const ruleSource = ref<PlatformCode>("LOCAL"),
   ruleError = ref("");
 const supportedPlatforms = computed(
   () =>
-    session.config?.platforms.filter((p) => p.authMode === "PASSWORD") || [],
+    session.config?.platforms.filter(
+      (p) => p.authMode === "PASSWORD" || p.authMode === "WEB_SESSION" || p.authMode === "OAUTH",
+    ) || [],
 );
 const sourceOptions = computed(() => [
   { code: "LOCAL" as PlatformCode, name: "本地活动库（导入的 FIT）" },
@@ -99,8 +146,98 @@ function toggleDestination(id: string) {
     ? destinationIds.value.filter((x) => x !== id)
     : [...destinationIds.value, id];
 }
+function clearOAuthPoll() {
+  if (oauthPollTimer) {
+    clearInterval(oauthPollTimer);
+    oauthPollTimer = null;
+  }
+  oauthPolling.value = false;
+}
+function startOAuthPoll(challengeId: string) {
+  clearOAuthPoll();
+  oauthPolling.value = true;
+  oauthPollTimer = setInterval(async () => {
+    try {
+      const result = await api<{ status: string; message?: string }>(
+        `/accounts/oauth/strava/${challengeId}`,
+      );
+      if (result.status === "SUCCEEDED") {
+        clearOAuthPoll();
+        oauthChallengeId.value = "";
+        oauthAuthorizeUrl.value = "";
+        showConnect.value = false;
+        toast("Strava 已连接");
+        await reload();
+      } else if (result.status === "FAILED" || result.status === "EXPIRED") {
+        clearOAuthPoll();
+        connectError.value = result.message || "Strava 授权已过期，请重新发起";
+      }
+    } catch {
+      // 单次轮询网络波动忽略，下一轮继续查询。
+    }
+  }, 2500);
+}
+function copyOAuthUrl() {
+  if (!oauthAuthorizeUrl.value) return;
+  uni.setClipboardData({
+    data: oauthAuthorizeUrl.value,
+    success: () => toast("已复制授权链接，请在浏览器中打开并完成授权"),
+  });
+}
+async function startStravaOAuth() {
+  connectError.value = "";
+  if (
+    !stravaOAuthReady.value &&
+    (!stravaClientId.value.trim() || !stravaClientSecret.value.trim())
+  ) {
+    connectError.value = "请先填写 Strava Client ID 与客户端密钥";
+    return;
+  }
+  connecting.value = true;
+  try {
+    const isH5 = typeof window !== "undefined";
+    const base = apiBase();
+    const absApi = /^https?:\/\//i.test(base)
+      ? base
+      : isH5
+        ? new URL(base, window.location.origin).toString().replace(/\/+$/, "")
+        : base;
+    const redirectUri = `${absApi}/v1/accounts/oauth/strava/callback`;
+    const returnUrl = isH5 ? `${window.location.origin}/#/pages/sync/index` : undefined;
+    const result = await api<{ challengeId: string; authorizeUrl: string }>(
+      "/accounts/oauth/strava/start",
+      "POST",
+      {
+        ...(stravaOAuthReady.value
+          ? {}
+          : {
+              clientId: stravaClientId.value.trim(),
+              clientSecret: stravaClientSecret.value.trim(),
+            }),
+        redirectUri,
+        ...(returnUrl ? { returnUrl } : {}),
+      },
+    );
+    stravaClientSecret.value = "";
+    if (isH5) {
+      window.location.assign(result.authorizeUrl);
+      return;
+    }
+    oauthChallengeId.value = result.challengeId;
+    oauthAuthorizeUrl.value = result.authorizeUrl;
+    startOAuthPoll(result.challengeId);
+  } catch (reason) {
+    connectError.value = messageOf(reason);
+  } finally {
+    connecting.value = false;
+  }
+}
 async function connect() {
   connectError.value = "";
+  if (isStravaOAuth.value) {
+    await startStravaOAuth();
+    return;
+  }
   if (!username.value.trim() || !password.value) {
     connectError.value = "请填写平台账号与密码";
     return;
@@ -111,13 +248,21 @@ async function connect() {
   }
   connecting.value = true;
   try {
-    await api<Account>("/accounts", "POST", {
-      platform: connectPlatform.value,
-      username: username.value.trim(),
-      password: password.value,
-      storeCredentials: storeCredentials.value,
-    });
+    await api<Account>(
+      "/accounts",
+      "POST",
+      {
+        platform: connectPlatform.value,
+        username: username.value.trim(),
+        password: password.value,
+        storeCredentials: storeCredentials.value,
+      },
+      true,
+      {},
+      90000,
+    );
     username.value = "";
+    password.value = "";
     showConnect.value = false;
     toast("平台已连接");
     await reload();
@@ -127,6 +272,23 @@ async function connect() {
     password.value = "";
     connecting.value = false;
   }
+}
+function selectConnectPlatform(code: PlatformCode) {
+  if (!connectablePlatforms.value.some((p) => p.code === code)) return;
+  showConnect.value = true;
+  if (connectPlatform.value === code) return;
+  connectPlatform.value = code;
+  connectError.value = "";
+  username.value = "";
+  password.value = "";
+  oauthChallengeId.value = "";
+  oauthAuthorizeUrl.value = "";
+  clearOAuthPoll();
+  storeCredentials.value = true;
+}
+function changeConnectPlatform(event: any) {
+  const next = connectablePlatforms.value[Number(event.detail.value)]?.code;
+  if (next) selectConnectPlatform(next);
 }
 async function disconnect(account: Account) {
   if (
@@ -165,12 +327,19 @@ async function sync() {
   }
   syncing.value = true;
   try {
-    const result = await api<{ jobIds: string[] }>("/sync", "POST", {
-      sourcePlatform: source.value,
-      destinationAccountIds: destinationIds.value,
-      historyDays: days,
-      ...(activityIds.value.length ? { activityIds: activityIds.value } : {}),
-    });
+    const result = await api<{ jobIds: string[] }>(
+      "/sync",
+      "POST",
+      {
+        sourcePlatform: source.value,
+        destinationAccountIds: destinationIds.value,
+        historyDays: days,
+        ...(activityIds.value.length ? { activityIds: activityIds.value } : {}),
+      },
+      true,
+      {},
+      60000,
+    );
     syncMessage.value = result.jobIds.length
       ? `已提交 ${result.jobIds.length} 个同步任务，可在任务记录查看进度。`
       : "本次没有需要新增的同步任务。";
@@ -258,7 +427,7 @@ const accountPlatform = (id: string) =>
               ></view
             ><button
               class="btn primary small"
-              :disabled="!supportedPlatforms.length"
+              :disabled="!connectablePlatforms.length"
               @click="showConnect = !showConnect"
             >
               {{ showConnect ? "收起" : "连接平台" }}
@@ -268,6 +437,11 @@ const accountPlatform = (id: string) =>
               v-for="platform in session.config?.platforms"
               :key="platform.code"
               class="platform-tile"
+              :class="{
+                active: showConnect && connectPlatform === platform.code,
+                connected: accounts.some((a) => a.platform === platform.code),
+              }"
+              @click="selectConnectPlatform(platform.code)"
               ><view
                 class="platform-monogram"
                 :class="platform.code.toLowerCase()"
@@ -277,16 +451,24 @@ const accountPlatform = (id: string) =>
                 ><text class="tiny muted">{{
                   accounts.some((a) => a.platform === platform.code)
                     ? "已连接"
-                    : platform.authMode === "PASSWORD"
-                      ? "支持云端授权 · 实验性"
-                      : "云端授权尚未支持"
+                    : authMode(platform.code) === "OAUTH"
+                      ? "官方 OAuth 跳转授权"
+                      : authMode(platform.code) === "PASSWORD" ||
+                          authMode(platform.code) === "WEB_SESSION"
+                        ? "系统内直接登录 · 实验性"
+                        : "云端授权尚未支持"
                 }}</text></view
               ><view
                 v-if="accounts.some((a) => a.platform === platform.code)"
                 class="status-dot" /></view></view
           ><text class="tiny muted block"
-            >目前 COROS、iGPSPORT 支持实验性云端连接；其他平台可先导入
-            FIT，未提供模拟登录。</text
+            >高驰、iGPSPORT、迈金、行者、Garmin 中国站支持系统内直接登录；Strava
+            通过官方 OAuth 2.0 授权并自动刷新令牌，无需手动复制 Cookie 或 Token。</text
+          ><view v-if="accounts.length" class="connected-hint-row"
+            ><text class="tiny muted">已连接账号可直接前往活动列表一键去重拉取。</text
+            ><button class="text-button" @click="go('activities')">
+              前往活动列表拉取 ›
+            </button></view
           ><view
             v-for="account in accounts"
             :key="account.id"
@@ -312,69 +494,119 @@ const accountPlatform = (id: string) =>
           <view v-if="showConnect" class="form-panel"
             ><text class="section-title">授权云端连接</text
             ><text class="muted"
-              >平台协议可能变化，遇到验证码或风控会明确提示。</text
+              >{{ loginHint?.note || "输入平台账号密码，由云服务完成登录并加密保存登录态，支持会话过期自动续期。" }}</text
             ><view class="form-grid"
               ><view class="form-field"
                 ><text class="field-label">运动平台</text
                 ><picker
-                  :range="supportedPlatforms"
+                  :range="connectablePlatforms"
                   range-key="name"
                   :value="
                     Math.max(
                       0,
-                      supportedPlatforms.findIndex(
+                      connectablePlatforms.findIndex(
                         (p) => p.code === connectPlatform,
                       ),
                     )
                   "
-                  @change="
-                    connectPlatform =
-                      supportedPlatforms[Number($event.detail.value)].code
-                  "
+                  @change="changeConnectPlatform"
                   ><view class="input select-input"
                     >{{ platformName(connectPlatform) }}<text>⌄</text></view
                   ></picker
                 ></view
-              ><view class="form-field"
-                ><text class="field-label">平台账号</text
-                ><input
-                  v-model="username"
-                  class="input"
-                  placeholder="平台手机号、邮箱或用户名"
-                  :disabled="connecting"
-                  autocomplete="off" /></view
-              ><view class="form-field"
-                ><text class="field-label">平台密码</text
-                ><input
-                  v-model="password"
-                  class="input"
-                  password
-                  placeholder="仅本次提交，客户端不保存"
-                  :disabled="connecting"
-                  autocomplete="off" /></view></view
-            ><checkbox-group
-              @change="storeCredentials = $event.detail.value.includes('store')"
-              ><label class="check-line"
-                ><checkbox
-                  value="store"
-                  :checked="storeCredentials"
-                  :color="themeColors.primary"
-                /><text
-                  >允许云服务加密托管登录凭据，以便会话过期后恢复自动同步</text
-                ></label
-              ></checkbox-group
-            ><text class="tiny muted"
-              >不勾选仅保留平台登录会话，过期后需重新连接。密码提交后会从本页清空。</text
-            ><text v-if="connectError" class="error-text">{{
+              >
+              <template v-if="isStravaOAuth">
+                <view v-if="!stravaOAuthReady" class="form-field"
+                  ><text class="field-label">Strava Client ID</text
+                  ><input
+                    v-model="stravaClientId"
+                    class="input"
+                    placeholder="例如 183007"
+                    :disabled="connecting"
+                    autocomplete="off" /></view
+                ><view v-if="!stravaOAuthReady" class="form-field"
+                  ><text class="field-label">Strava 客户端密钥（Client Secret）</text
+                  ><input
+                    v-model="stravaClientSecret"
+                    class="input"
+                    password
+                    placeholder="仅用于云端换取与刷新授权令牌"
+                    :disabled="connecting"
+                    autocomplete="off" /></view
+                >
+                <view
+                  v-if="oauthAuthorizeUrl"
+                  class="notice info-notice web-session-guide"
+                >
+                  <text class="item-title">请在浏览器中打开以下链接完成 Strava 官方授权</text>
+                  <text class="tiny muted" selectable>{{ oauthAuthorizeUrl }}</text>
+                  <view class="extension-actions">
+                    <button class="btn primary small" @click="copyOAuthUrl">
+                      复制授权链接
+                    </button>
+                    <text v-if="oauthPolling" class="tiny muted"
+                      >正在等待你在浏览器完成授权…</text
+                    >
+                  </view>
+                </view>
+                <text v-else class="tiny muted session-field-wide"
+                  >点击下方按钮将跳转至 Strava 官方授权页完成登录并授予活动读写权限，授权完成后自动返回并由云端加密存储与续期令牌。</text
+                >
+              </template>
+              <template v-else>
+                <view class="form-field"
+                  ><text class="field-label">{{
+                    loginHint?.accountLabel || "平台账号"
+                  }}</text
+                  ><input
+                    v-model="username"
+                    class="input"
+                    :placeholder="
+                      loginHint?.accountPlaceholder || '平台手机号、邮箱或用户名'
+                    "
+                    :disabled="connecting"
+                    autocomplete="off" /></view
+                >
+                <view class="form-field"
+                  ><text class="field-label">平台密码</text
+                  ><input
+                    v-model="password"
+                    class="input"
+                    password
+                    placeholder="仅本次提交，客户端不保存"
+                    :disabled="connecting"
+                    autocomplete="off" /></view
+                >
+                <checkbox-group
+                  @change="storeCredentials = $event.detail.value.includes('store')"
+                  ><label class="check-line"
+                    ><checkbox
+                      value="store"
+                      :checked="storeCredentials"
+                      :color="themeColors.primary"
+                    /><text
+                      >允许云服务加密托管登录凭据，以便会话过期后自动续期</text
+                    ></label
+                  ></checkbox-group
+                ><text class="tiny muted"
+                  >默认保存加密登录态（Token / Cookie / SSO 凭据）；勾选托管凭据后，若长会话彻底过期可由云端静默重登。密码提交后会立即从本页清空。</text
+                >
+              </template>
+            </view>
+            <text v-if="connectError" class="error-text">{{
               connectError
-            }}</text
-            ><button
+            }}</text>
+            <button
               class="btn primary"
               :loading="connecting"
               :disabled="connecting"
               @click="connect"
             >
-              授权并连接
+              {{
+                isStravaOAuth
+                  ? "前往 Strava 官方授权登录"
+                  : "授权并保存登录态"
+              }}
             </button></view
           ></view
         >

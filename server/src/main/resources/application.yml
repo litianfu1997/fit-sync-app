@@ -1,6 +1,10 @@
 spring:
   application:
     name: fitsync-cloud
+  config:
+    import:
+      - optional:file:.env[.properties]
+      - optional:file:server/.env[.properties]
   profiles:
     default: local
   servlet:
@@ -20,7 +24,9 @@ server:
 fitsync:
   storage-dir: ${FITSYNC_STORAGE_DIR:./.data/fits}
   encryption-key: ${FITSYNC_ENCRYPTION_KEY:}
-  cors-origins: ${FITSYNC_CORS_ORIGINS:http://localhost:5173,http://127.0.0.1:5173}
+  # 本地开发默认放行 uni-app H5 开发端口（与 clients/uniapp/vite.config.ts 的 server.port 保持一致）。
+  # 浏览器直连代理后的 /api 会带上页面自身的 Origin，未列入白名单会被 CorsFilter 直接 403。
+  cors-origins: ${FITSYNC_CORS_ORIGINS:http://localhost:5273,http://127.0.0.1:5273,http://localhost:5173,http://127.0.0.1:5173}
   wechat-app-id: ${WECHAT_APP_ID:}
   wechat-app-secret: ${WECHAT_APP_SECRET:}
   native-ad-unit-id: ${WECHAT_NATIVE_AD_UNIT_ID:}
@@ -28,3 +34,7 @@ fitsync:
   scheduler-enabled: ${FITSYNC_SCHEDULER_ENABLED:true}
   session-days: 30
   sync-interval-ms: 900000
+  strava:
+    client-id: ${STRAVA_CLIENT_ID:}
+    client-secret: ${STRAVA_CLIENT_SECRET:}
+    redirect-uri: ${STRAVA_REDIRECT_URI:}

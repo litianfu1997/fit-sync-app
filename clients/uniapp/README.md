@@ -14,7 +14,9 @@ Copy-Item .env.example .env.local
 npm.cmd run dev:h5
 ```
 
-浏览器打开 `http://127.0.0.1:5173`。默认 `/api` 经 Vite 代理到 `http://127.0.0.1:8080`；后端端口变化时修改 `.env.local` 的 `VITE_DEV_PROXY_TARGET`。
+浏览器打开 `http://127.0.0.1:5273`（端口见 `vite.config.ts` 的 `server.port`）。默认 `/api` 经 Vite 代理到 `http://127.0.0.1:8080`；后端端口变化时修改 `.env.local` 的 `VITE_DEV_PROXY_TARGET`。
+
+页面来源需在后端 CORS 白名单内，否则浏览器直连代理后的 `/api` 会收到 `403 Invalid CORS request`。本地默认已放行 5273，换端口启动时要在启动 Java 服务前设置 `FITSYNC_CORS_ORIGINS`。
 
 Web 和微信小程序都提供用户名密码**注册**与**登录**，同一账号在两端通用，登录令牌保留在本机，刷新页面不会新建用户。密码只提交一次、不落盘；服务端保存 PBKDF2 加盐散列，不保存明文。
 
@@ -49,8 +51,8 @@ Web 和微信小程序都提供用户名密码**注册**与**登录**，同一�
 ## 页面与实际能力
 
 - 概览：活动数、骑行距离、连接账号、待处理任务与最近活动。
-- 活动：分页列表，H5 本地文件选择 / 微信聊天文件选择，FIT 真实上传、重复导入提示、指标与 GPS 轨迹简图、原始 FIT 导出。可逐页选择最多 20 条活动投递到目标平台；待核对活动可查看相似候选并明确确认为另一场活动，之后按已授权规则继续同步。轨迹只显示真实采样，不请求地图底图。
-- 同步：COROS、iGPSPORT 实验性账号授权；其他平台明确标注暂不支持云端授权。密码只在内存提交一次，提交后清空；托管凭据必须由用户单独勾选。
+- 活动：支持从已连接平台一键去重拉取活动并保存至云端（实时展示拉取与去重统计），支持关键词搜索、运动/待核对筛选、来源平台筛选与时间排序；支持 H5 本地文件选择 / 微信聊天文件选择上传 FIT；详情页支持多副本查看、平台同步状态与单条补发、原始 FIT 导出、待核对活动「合并到候选」或「保持分离」，以及云端活动删除。轨迹只显示真实采样，不请求地图底图。
+- 同步：六个运动平台（COROS、iGPSPORT、迈金、行者、Garmin 中国站、Strava）均支持直接在 Web 端与微信小程序端输入平台账号密码完成登录，由云端自动提取并加密保存登录态，无需手动复制 Cookie 或 Token；勾选托管凭据后可在会话失效时自动续登。桌面 Chrome／Edge 安装 [FitSync 会话助手扩展](../../clients/browser-extension/README.md) 后，也可在网页额外使用「弹窗快捷授权」。密码只在内存提交一次，提交后清空；托管凭据支持由用户勾选控制。
 - 规则：来源 / 目标选择、历史补齐开关、启停与删除。开启规则即授权云端持续执行。
 - 任务：分页状态、错误说明与手动重试，刷新查看实际后台结果。
 - 设置：账号昵称、密码与绑定微信、网页授权确认码、连通性检查、切换服务器后清理登录态、退出提示云端规则仍继续运行。
@@ -80,7 +82,7 @@ H5 生产通过网关部署静态文件，并将 `/api` 反向代理至 Java 服
 - 注册登录：`GET /config`、`POST /auth/register`、`POST /auth/login`、`POST /auth/dev-login`、`POST /auth/wechat`、`GET /me`、`PUT /me`。
 - 账号打通：`POST /auth/wechat/bind`、`POST /auth/password`、`POST /auth/password/change`。
 - 网页确认：`POST /auth/web-challenges`、`GET /auth/web-challenges/{id}`（`X-Login-Poll-Token` 请求头）、`POST /auth/web-challenges/confirm`。
-- 活动：`GET /dashboard`、`GET /activities`、`POST /activities/import`、`GET /activities/{id}`、`GET /activities/{id}/file`。
+- 活动：`GET /dashboard`、`GET /activities`、`POST /activities/pull`、`GET /activities/pull`、`POST /activities/import`、`GET /activities/{id}`、`DELETE /activities/{id}`、`GET /activities/{id}/file`、`POST /activities/{id}/review`。
 - 授权与同步：`/accounts`、`/rules`、`POST /sync`、`GET /jobs`、`POST /jobs/{id}/retry`。
 
 路径均位于 `/api/v1` 下。开发与部署细节以 Java 服务 README 为准。

@@ -67,6 +67,7 @@ export function api<T>(
   data?: any,
   authenticated = true,
   extraHeaders: Record<string, string> = {},
+  timeoutMs = 30000,
 ): Promise<T> {
   let base: string;
   try {
@@ -79,7 +80,7 @@ export function api<T>(
       url: `${base}/v1${path}`,
       method,
       data,
-      timeout: 30000,
+      timeout: timeoutMs,
       header: {
         "Content-Type": "application/json",
         ...(authenticated && session.token
@@ -92,12 +93,16 @@ export function api<T>(
           resolve(res.data as T);
         else reject(errorResponse(res.statusCode, res.data));
       },
-      fail: () =>
+      fail: (err) => {
+        const timedOut = /timeout/i.test(String(err?.errMsg || ""));
         reject(
           new ApiError(
-            "无法连接服务器。请检查服务器地址、网络或 HTTPS 合法域名配置。",
+            timedOut
+              ? "平台响应超时，请稍后重试；若已收到验证码邮件，请重新点击获取验证码后再提交。"
+              : "无法连接服务器。请检查服务器地址、网络或 HTTPS 合法域名配置。",
           ),
-        ),
+        );
+      },
     });
   });
 }

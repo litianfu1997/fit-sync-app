@@ -33,6 +33,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Flow;
 import java.util.concurrent.TimeUnit;
+import java.util.zip.GZIPOutputStream;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSession;
@@ -277,6 +278,414 @@ class CloudConnectorsTest {
     assertEquals(3, http.requests.size());
   }
 
+  @Test
+  void webConnectorsRejectIncompleteSessionsWithoutNetwork() {
+    StubClient http = new StubClient();
+    assertFalse(onelap(http).connectWeb(Map.of()).status() == SUCCESS);
+    assertFalse(xingzhe(http).connectWeb(Map.of()).status() == SUCCESS);
+    assertFalse(garmin(http).connectWeb(Map.of("cookie", "SESSION=no-jwt")).status() == SUCCESS);
+    assertFalse(strava(http).connectWeb(Map.of("cookie", "other=value")).status() == SUCCESS);
+    assertTrue(http.requests.isEmpty());
+  }
+
+  @Test
+  void webSessionFieldsRejectHeaderInjectionAndOversize() {
+    StubClient http = new StubClient();
+    assertFalse(
+        onelap(http)
+                .connectWeb(Map.of("token", "bad\r\nInjected: header"))
+                .status()
+            == SUCCESS);
+    assertFalse(
+        strava(http)
+                .connectWeb(Map.of("cookie", "x".repeat(70_000)))
+                .status()
+            == SUCCESS);
+    assertTrue(http.requests.isEmpty());
+  }
+
+  @Test
+  void stravaRejectsForeignObjectHostRedirectAndDoesNotLeakCookie() throws Exception {
+    StubClient http = new StubClient();
+    Session session =
+        new Session(null, null, null, null, false,
+            Map.of("cookie", "_strava4_session=secret-session"));
+    ConnectorResult<FitDownload> foreign =
+        strava(http).downloadFit(
+            session,
+            new RemoteActivity(
+                "1", null, null, null, "https://evil.example/export_original", Map.of()));
+    assertEquals(PERMANENT_FAILURE, foreign.status());
+    assertEquals("UNTRUSTED_FIT_HOST", foreign.code());
+    assertTrue(http.requests.isEmpty());
+  }
+
+  @Test
+  void onelapRefreshRetriesOnlyOriginalRequestAndRotatesTokens() throws Exception {
+    StubClient http = new StubClient();
+    http.reply(401, "{}");
+    http.reply(200, "{\"data\":{\"token\":\"fresh\",\"refresh_token\":\"refresh-2\"}}");
+    http.reply(200, "{\"data\":{\"list\":[]}}");
+    Session session =
+        new Session("old", "u1", null, null, false,
+            Map.of("refreshToken", "refresh-1", "cookie", "SESSION=abc"));
+    ConnectorResult<ActivityPage> page = onelap(http).listActivities(session, 0, null);
+    assertEquals(SUCCESS, page.status());
+    assertEquals("fresh", session.accessToken());
+    assertEquals("refresh-2", session.attribute("refreshToken"));
+    assertEquals(3, http.requests.size());
+  }
+
+  @Test
+  void xingzheUploadNeverRepostsAfterUncertainAcceptedResponse() throws Exception {
+    StubClient http = new StubClient();
+    http.reply(200, "{\"code\":0,\"data\":{}}");
+    Session session =
+        new Session(null, null, null, null, false, Map.of("cookie", "session=xyz"));
+    ConnectorResult<UploadResult> upload = xingzhe(http).uploadFit(session, fit(), "ride.fit");
+    assertEquals(PROCESSING, upload.status());
+    assertNotNull(upload.confirmationToken());
+    http.reply(200, "[]");
+    ConnectorResult<UploadResult> pending =
+        xingzhe(http).checkUpload(session, upload.confirmationToken());
+    assertEquals(PROCESSING, pending.status());
+    assertEquals(
+        1,
+        http.requests.stream()
+            .filter(r -> r.uri().getPath().equals("/api/v1/fit/upload/"))
+            .count());
+  }
+
+  @Test
+  void stravaParsesCSRFAndConfirmsUploadWithRealActivityId() throws Exception {
+    StubClient http = new StubClient();
+    http.reply(
+        200,
+        "<html><meta name=\"csrf-token\" content=\"csrf-token-value\"></html>");
+    http.reply(200, "{\"id\":987,\"workflow\":\"ready\"}");
+    http.reply(
+        200,
+        "{\"id\":987,\"workflow\":\"success\",\"activity\":{\"id\":123456789}}");
+    Session session =
+        new Session(null, null, null, null, false, Map.of("cookie", "_strava4_session=x"));
+    StravaConnector connector = strava(http);
+    ConnectorResult<UploadResult> upload = connector.uploadFit(session, fit(), "ride.fit");
+    assertEquals(PROCESSING, upload.status());
+    assertEquals("987", upload.confirmationToken());
+    assertEquals("csrf-token-value", session.attribute("csrf"));
+    ConnectorResult<UploadResult> confirmed =
+        connector.checkUpload(session, upload.confirmationToken());
+    assertEquals(SUCCESS, confirmed.status());
+    assertEquals("123456789", confirmed.value().remoteActivityId());
+    assertFalse(body(http.requests.get(1)).contains("_strava4_session"));
+    assertEquals(3, http.requests.size());
+  }
+
+  @Test
+  void garminImportResultDistinguishesSuccessDuplicateAndRejectedFit() throws Exception {
+    StubClient http = new StubClient();
+    String success =
+        "{\"detailedImportResult\":{\"successes\":[{\"internalId\":\"555\"}],\"failures\":[]}}";
+    http.reply(200, success);
+    Session session =
+        new Session("jwt", "u1", null, null, false,
+            Map.of("cookie", "JWT_WEB=jwt; SESSION=abc", "csrf", "csrf"));
+    ConnectorResult<UploadResult> uploaded = garmin(http).uploadFit(session, fit(), "ride.fit");
+    assertEquals(SUCCESS, uploaded.status());
+    assertEquals("555", uploaded.value().remoteActivityId());
+
+    http.reply(
+        200,
+        "{\"detailedImportResult\":{\"successes\":[],\"failures\":[{\"messages\":[{\"code\":202,\"content\":\"Duplicate Activity.\"}]}]}}");
+    assertEquals(DUPLICATE, garmin(http).uploadFit(session, fit(), "ride.fit").status());
+
+    http.reply(
+        200,
+        "{\"detailedImportResult\":{\"successes\":[],\"failures\":[{\"messages\":[{\"code\":500,\"content\":\"bad fit\"}]}]}}");
+    assertEquals(
+        PERMANENT_FAILURE, garmin(http).uploadFit(session, fit(), "ride.fit").status());
+    assertEquals(3, http.requests.size());
+  }
+
+  @Test
+  void garminActivityRequestsStayOnChinaGcApiHost() {
+    StubClient http = new StubClient();
+    http.reply(200, "[]");
+    Session session =
+        new Session("jwt", null, null, null, false, Map.of("cookie", "JWT_WEB=jwt"));
+    ConnectorResult<ActivityPage> page = garmin(http).listActivities(session, 0, null);
+    assertEquals(SUCCESS, page.status());
+    assertEquals(
+        "connect.garmin.cn", http.requests.getFirst().uri().getHost());
+    assertTrue(http.requests.getFirst().uri().getPath().startsWith("/gc-api/"));
+    assertFalse(http.requests.getFirst().headers().firstValue("Cookie").orElse("").contains("null"));
+  }
+
+  @Test
+  void onelapLoginHashesPasswordAndStoresRefreshTokenAndReloginsOnExpiredRefresh()
+      throws Exception {
+    StubClient http = new StubClient();
+    http.reply(
+        200,
+        "{\"code\":200,\"data\":[{\"token\":\"onelap-jwt\",\"refresh_token\":\"onelap-rt\",\"uid\":\"u-onelap\"}]}",
+        Map.of("Set-Cookie", List.of("JSESSIONID=ol-cookie; Path=/; HttpOnly")));
+    ConnectorResult<Session> logged =
+        onelap(http).login("13800138000", "secret-pass", true);
+    assertEquals(SUCCESS, logged.status());
+    Session session = logged.value();
+    assertEquals("onelap-jwt", session.accessToken());
+    assertEquals("u-onelap", session.externalUserId());
+    assertEquals("onelap-rt", session.attribute("refreshToken"));
+    assertEquals("JSESSIONID=ol-cookie", session.attribute("cookie"));
+    String loginBody = body(http.requests.getFirst());
+    assertTrue(loginBody.contains("591fac3e56ffbdc6f310c1b646050c09"));
+    assertFalse(loginBody.contains("secret-pass"));
+    assertTrue(http.requests.getFirst().headers().firstValue("sign").isPresent());
+
+    http.reply(401, "{}");
+    http.reply(401, "{}");
+    http.reply(
+        200,
+        "{\"code\":200,\"data\":{\"token\":\"onelap-jwt-2\",\"refresh_token\":\"onelap-rt-2\",\"uid\":\"u-onelap\"}}");
+    http.reply(200, "{\"code\":200,\"data\":{\"list\":[]}}");
+    ConnectorResult<ActivityPage> page = onelap(http).listActivities(session, 0, null);
+    assertEquals(SUCCESS, page.status());
+    assertEquals("onelap-jwt-2", session.accessToken());
+    assertEquals("onelap-rt-2", session.attribute("refreshToken"));
+    assertEquals(5, http.requests.size());
+  }
+
+  @Test
+  void xingzheLoginEncryptsPasswordWithRsaCapturesCookieAndRelogins() throws Exception {
+    StubClient http = new StubClient();
+    http.reply(
+        200,
+        "{\"code\":0,\"data\":{\"userid\":\"xz-100\",\"username\":\"rider\"}}",
+        Map.of("Set-Cookie", List.of("sessionid=xz-sess-1; Path=/; HttpOnly")));
+    ConnectorResult<Session> logged =
+        xingzhe(http).login("13900139000", "xz-secret", true);
+    assertEquals(SUCCESS, logged.status());
+    Session session = logged.value();
+    assertEquals("xz-100", session.externalUserId());
+    assertEquals("sessionid=xz-sess-1", session.attribute("cookie"));
+    String loginBody = body(http.requests.getFirst());
+    assertFalse(loginBody.contains("xz-secret"));
+    assertTrue(loginBody.contains("\"password\":"));
+
+    http.reply(401, "{}");
+    http.reply(
+        200,
+        "{\"code\":0,\"data\":{\"userid\":\"xz-100\",\"username\":\"rider\"}}",
+        Map.of("Set-Cookie", List.of("sessionid=xz-sess-2; Path=/; HttpOnly")));
+    http.reply(200, "[]");
+    ConnectorResult<ActivityPage> page = xingzhe(http).listActivities(session, 0, null);
+    assertEquals(SUCCESS, page.status());
+    assertEquals("sessionid=xz-sess-2", session.attribute("cookie"));
+    assertEquals(4, http.requests.size());
+  }
+
+  @Test
+  void garminLoginExchangesSsoTicketForJwtWebAndSsoCookie() throws Exception {
+    StubClient http = new StubClient();
+    http.reply(
+        200,
+        "<form><input type=\"hidden\" name=\"_csrf\" value=\"form-csrf-1\"></form>",
+        Map.of("Set-Cookie", List.of("GARMIN-SSO=sso1; Path=/")));
+    http.reply(
+        302,
+        "",
+        Map.of(
+            "Location", List.of("https://connect.garmin.cn/app/?ticket=ST-12345"),
+            "Set-Cookie", List.of("CASTGC=TGT-999; Path=/")));
+    http.reply(
+        200,
+        "<html><meta name=\"csrf-token\" content=\"connect-csrf-1\"></html>",
+        Map.of("Set-Cookie", List.of("JWT_WEB=jwt-web-1; Path=/", "SESSION=s1; Path=/")));
+    ConnectorResult<Session> logged =
+        garmin(http).login("garmin@example.com", "garmin-pass", true);
+    assertEquals(SUCCESS, logged.status());
+    Session session = logged.value();
+    assertEquals("jwt-web-1", session.accessToken());
+    assertEquals("connect-csrf-1", session.attribute("csrf"));
+    assertTrue(session.attribute("ssoCookie").contains("CASTGC=TGT-999"));
+    assertTrue(session.attribute("cookie").contains("JWT_WEB=jwt-web-1"));
+    assertTrue(body(http.requests.get(1)).contains("_csrf=form-csrf-1"));
+    assertEquals(3, http.requests.size());
+  }
+
+  @Test
+  void stravaLoginSubmitsAuthenticityTokenAndCapturesSessionCookie() throws Exception {
+    StubClient http = new StubClient();
+    http.reply(
+        200,
+        "<form><input type=\"hidden\" name=\"authenticity_token\" value=\"strava-csrf-1\"></form>",
+        Map.of("Set-Cookie", List.of("_strava4_session=pre; Path=/")));
+    http.reply(
+        302,
+        "",
+        Map.of(
+            "Location", List.of("https://www.strava.com/dashboard"),
+            "Set-Cookie", List.of("_strava4_session=real-session-1; Path=/; HttpOnly")));
+    ConnectorResult<Session> logged =
+        strava(http).login("rider@example.com", "strava-pass", true);
+    assertEquals(SUCCESS, logged.status());
+    Session session = logged.value();
+    assertEquals("_strava4_session=real-session-1", session.attribute("cookie"));
+    String postBody = body(http.requests.get(1));
+    assertTrue(postBody.contains("authenticity_token=strava-csrf-1"));
+    assertTrue(postBody.contains("remember_me=on"));
+    assertEquals(2, http.requests.size());
+  }
+
+  @Test
+  void stravaOAuthExchangeRefreshListUploadAndSkipPull() throws Exception {
+    assertTrue(StravaConnector.hasRequiredOAuthScopes("read,activity:read_all,activity:write"));
+    assertFalse(StravaConnector.hasRequiredOAuthScopes("read"));
+    String authorizeUrl =
+        StravaConnector.authorizeUrl(
+            "183007", "http://127.0.0.1:8080/api/v1/accounts/oauth/strava/callback", "state-1");
+    assertTrue(authorizeUrl.contains("client_id=183007"));
+    assertTrue(authorizeUrl.contains("response_type=code"));
+    assertTrue(authorizeUrl.contains("state=state-1"));
+    assertTrue(authorizeUrl.contains("activity%3Awrite"));
+
+    StubClient http = new StubClient();
+    long expiresFuture = CLOCK.millis() / 1000L + 3600L;
+    http.reply(
+        200,
+        "{\"access_token\":\"acc-1\",\"refresh_token\":\"ref-1\",\"expires_at\":"
+            + expiresFuture
+            + ",\"athlete\":{\"id\":778899,\"firstname\":\"Lin\",\"lastname\":\"Rider\"}}");
+    StravaConnector connector =
+        new StravaConnector("183007", "app-secret", http, URI.create("https://www.strava.com"), CLOCK);
+
+    ConnectorResult<Session> authRes =
+        connector.exchangeOAuthCode(
+            "183007", "app-secret", "auth-code-1", "read,activity:read_all,activity:write", false);
+    assertEquals(SUCCESS, authRes.status());
+    Session session = authRes.value();
+    assertEquals("778899", session.externalUserId());
+    assertEquals("Lin Rider", session.attribute("displayName"));
+    assertEquals("OAUTH", session.attribute("authType"));
+    assertEquals("acc-1", session.accessToken());
+    assertEquals("ref-1", session.attribute("refreshToken"));
+    assertNull(session.attribute("clientId"));
+    assertEquals(1, http.requests.size());
+    assertTrue(connector.skipPullAsDestination(session));
+
+    ConnectorResult<FitDownload> dl =
+        connector.downloadFit(session, activity("https://www.strava.com/activities/1/export_original"));
+    assertEquals(PERMANENT_FAILURE, dl.status());
+    assertEquals("NO_ORIGINAL_FILE", dl.code());
+    assertEquals(1, http.requests.size());
+
+    http.reply(401, "{}");
+    http.reply(
+        200,
+        "{\"access_token\":\"acc-2\",\"refresh_token\":\"ref-2\",\"expires_at\":"
+            + (expiresFuture + 3600L)
+            + "}");
+    http.reply(
+        200,
+        "[{\"id\":1001,\"name\":\"Morning Ride\",\"distance\":42195.0,"
+            + "\"start_date\":\"2026-11-09T01:00:00Z\",\"sport_type\":\"Ride\","
+            + "\"external_id\":\"fitsync-abc.fit\"}]");
+    ConnectorResult<ActivityPage> page = connector.listActivities(session, 0L, null);
+    assertEquals(SUCCESS, page.status());
+    assertEquals(1, page.value().items().size());
+    assertEquals("1001", page.value().items().getFirst().remoteActivityId());
+    assertEquals("/api/v3/athlete/activities", http.requests.get(1).uri().getPath());
+    assertTrue(http.requests.get(1).uri().getQuery().contains("per_page=100"));
+    assertEquals(
+        "Bearer acc-1",
+        http.requests.get(1).headers().firstValue("Authorization").orElseThrow());
+    assertEquals("/oauth/token", http.requests.get(2).uri().getPath());
+    assertTrue(body(http.requests.get(2)).contains("refresh_token=ref-1"));
+    assertEquals(
+        "Bearer acc-2",
+        http.requests.get(3).headers().firstValue("Authorization").orElseThrow());
+    assertEquals("acc-2", session.accessToken());
+    assertEquals("ref-2", session.attribute("refreshToken"));
+
+    byte[] fitBytes = new byte[] {14, 0x10, 0, 0, 0, 0, 0, 0, '.', 'F', 'I', 'T', 0, 0, 0, 0};
+    http.reply(201, "{\"id\":987654,\"status\":\"Your activity is still being processed.\"}");
+    ConnectorResult<UploadResult> upRes = connector.uploadFit(session, fitBytes, "ride.fit");
+    assertEquals(PROCESSING, upRes.status());
+    assertEquals("987654", upRes.confirmationToken());
+    assertEquals(15_000L, upRes.retryAfterMillis());
+    assertEquals("/api/v3/uploads", http.requests.get(4).uri().getPath());
+    assertEquals(
+        "Bearer acc-2",
+        http.requests.get(4).headers().firstValue("Authorization").orElseThrow());
+    String uploadBody = body(http.requests.get(4));
+    assertTrue(uploadBody.contains("external_id"));
+    assertTrue(uploadBody.contains("fitsync-"));
+
+    http.reply(429, "{}", Map.of("Retry-After", List.of("900")));
+    ConnectorResult<UploadResult> limited = connector.checkUpload(session, "987654");
+    assertEquals(RETRYABLE_FAILURE, limited.status());
+    assertEquals("RATE_LIMITED", limited.code());
+    assertEquals(900_000L, limited.retryAfterMillis());
+
+    http.reply(200, "{\"id\":987654,\"status\":\"Your activity is still being processed.\"}");
+    ConnectorResult<UploadResult> stillPending = connector.checkUpload(session, "987654");
+    assertEquals(PROCESSING, stillPending.status());
+    assertEquals(60_000L, stillPending.retryAfterMillis());
+
+    http.reply(200, "{\"id\":987654,\"activity_id\":555666}");
+    ConnectorResult<UploadResult> checked = connector.checkUpload(session, "987654");
+    assertEquals(SUCCESS, checked.status());
+    assertEquals("555666", checked.value().remoteActivityId());
+    assertEquals(8, http.requests.size());
+  }
+
+  @Test
+  void stravaGzipHtmlResponseDecompressesBounded() throws Exception {
+    StubClient http = new StubClient();
+    ByteArrayOutputStream gz = new ByteArrayOutputStream();
+    try (GZIPOutputStream out = new GZIPOutputStream(gz)) {
+      out.write(
+          "<html><head><meta name=\"csrf-token\" content=\"gz-csrf-1\"></head></html>"
+              .getBytes(StandardCharsets.UTF_8));
+    }
+    http.reply(
+        200,
+        gz.toByteArray(),
+        Map.of(
+            "Content-Encoding", List.of("gzip"),
+            "Set-Cookie", List.of("_strava4_session=gz-pre; Path=/")));
+    http.reply(
+        302,
+        "",
+        Map.of(
+            "Location", List.of("/dashboard"),
+            "Set-Cookie", List.of("_strava4_session=gz-auth; Path=/")));
+    StravaConnector connector = strava(http);
+    ConnectorResult<Session> res = connector.login("rider@example.com", "pw", false);
+    assertEquals(SUCCESS, res.status());
+    assertEquals(
+        "gzip",
+        http.requests.get(0).headers().firstValue("Accept-Encoding").orElseThrow());
+    assertTrue(body(http.requests.get(1)).contains("authenticity_token=gz-csrf-1"));
+    assertTrue(res.value().attribute("cookie").contains("_strava4_session=gz-auth"));
+  }
+
+  private static OnelapConnector onelap(StubClient http) {
+    return new OnelapConnector(http, URI.create("https://otm.onelap.cn"), CLOCK);
+  }
+
+  private static XingzheConnector xingzhe(StubClient http) {
+    return new XingzheConnector(http, URI.create("https://www.imxingzhe.com"), CLOCK);
+  }
+
+  private static GarminConnector garmin(StubClient http) {
+    return new GarminConnector(http, URI.create("https://connect.garmin.cn"), CLOCK);
+  }
+
+  private static StravaConnector strava(StubClient http) {
+    return new StravaConnector(http, URI.create("https://www.strava.com"), CLOCK);
+  }
+
   private static Session session(boolean store) {
     return new Session("old-token", "u1", "account", "secret", store);
   }
@@ -354,11 +763,19 @@ class CloudConnectorsTest {
     final Queue<Object> replies = new ArrayDeque<>();
 
     void reply(int status, String value) {
-      reply(status, value.getBytes(StandardCharsets.UTF_8));
+      reply(status, value.getBytes(StandardCharsets.UTF_8), Map.of());
+    }
+
+    void reply(int status, String value, Map<String, List<String>> headers) {
+      reply(status, value.getBytes(StandardCharsets.UTF_8), headers);
     }
 
     void reply(int status, byte[] value) {
-      replies.add(new Reply(status, value));
+      reply(status, value, Map.of());
+    }
+
+    void reply(int status, byte[] value, Map<String, List<String>> headers) {
+      replies.add(new Reply(status, value, headers));
     }
 
     void fail(IOException exception) {
@@ -388,7 +805,7 @@ class CloudConnectorsTest {
             }
 
             public HttpHeaders headers() {
-              return HttpHeaders.of(Map.of(), (a, b) -> true);
+              return HttpHeaders.of(reply.headers, (a, b) -> true);
             }
 
             public InputStream body() {
@@ -462,6 +879,6 @@ class CloudConnectorsTest {
       throw new UnsupportedOperationException();
     }
 
-    private record Reply(int status, byte[] bytes) {}
+    private record Reply(int status, byte[] bytes, Map<String, List<String>> headers) {}
   }
 }

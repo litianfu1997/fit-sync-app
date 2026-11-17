@@ -1,6 +1,7 @@
 package com.fitsync.cloud;
 
 import com.fitsync.cloud.connector.*;
+import jakarta.annotation.PreDestroy;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
@@ -11,6 +12,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 @Service
@@ -22,7 +25,16 @@ public class JobService {
   private final long interval;
   private final String worker = CloudStore.id();
   private final TransactionTemplate enqueueTransaction;
+  private final ExecutorService pullExecutor;
   private static final long LEASE = Duration.ofMinutes(15).toMillis();
+  private static final int MAX_PULL_PAGES = 20;
+  private static final Set<String> PERMANENT_REMOTE_SKIP_CODES =
+      Set.of(
+          "NO_ORIGINAL_FILE",
+          "UNSUPPORTED_ORIGINAL_FORMAT",
+          "INVALID_FIT",
+          "INVALID_ORIGINAL_FILE",
+          "IMPORT_INVALID");
 
   public JobService(
       CloudStore store,
@@ -38,6 +50,21 @@ public class JobService {
     this.interval = interval;
     this.enqueueTransaction = new TransactionTemplate(transactions);
     this.enqueueTransaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_NESTED);
+    this.pullExecutor =
+        enabled
+            ? Executors.newFixedThreadPool(
+                2,
+                r -> {
+                  Thread t = new Thread(r, "fitsync-pull");
+                  t.setDaemon(true);
+                  return t;
+                })
+            : null;
+  }
+
+  @PreDestroy
+  public void shutdown() {
+    if (pullExecutor != null) pullExecutor.shutdownNow();
   }
 
   public List<Map<String, Object>> rules(String user) {
@@ -133,6 +160,267 @@ public class JobService {
   }
 
   @Transactional
+  public Map<String, Object> pullFromPlatforms(
+      String user, List<String> accountIds, List<String> platforms, int historyDays) {
+    store.db.queryForObject("SELECT id FROM app_user WHERE id=? FOR UPDATE", String.class, user);
+    if (historyDays < 1 || historyDays > 365) throw ApiException.bad("回填范围为 1 至 365 天");
+    var allAccounts =
+        store.db.queryForList(
+            "SELECT * FROM platform_account WHERE user_id=? ORDER BY platform", user);
+    if (allAccounts.isEmpty()) throw ApiException.bad("请先连接至少一个运动平台账号");
+
+    Set<String> targetAccountIds =
+        accountIds == null
+            ? Set.of()
+            : accountIds.stream()
+                .filter(Objects::nonNull)
+                .map(String::trim)
+                .filter(s -> !s.isBlank())
+                .collect(java.util.stream.Collectors.toSet());
+    for (String reqId : targetAccountIds) store.owned("platform_account", reqId, user);
+
+    Set<String> targetPlatforms =
+        platforms == null
+            ? Set.of()
+            : platforms.stream()
+                .filter(Objects::nonNull)
+                .map(s -> s.trim().toUpperCase(Locale.ROOT))
+                .filter(s -> !s.isBlank())
+                .collect(java.util.stream.Collectors.toSet());
+
+    var selectedAccounts = new ArrayList<Map<String, Object>>();
+    for (var acc : allAccounts) {
+      String id = CloudStore.str(acc, "id");
+      String platform = CloudStore.str(acc, "platform");
+      boolean matchId = targetAccountIds.isEmpty() || targetAccountIds.contains(id);
+      boolean matchPlatform = targetPlatforms.isEmpty() || targetPlatforms.contains(platform);
+      if (matchId && matchPlatform) selectedAccounts.add(acc);
+    }
+    if (selectedAccounts.isEmpty()) throw ApiException.bad("未找到匹配的已连接平台账号");
+
+    List<Map<String, Object>> startedAccounts = new ArrayList<>();
+    List<Map<String, Object>> skippedPlatforms = new ArrayList<>();
+    List<String> jobIds = new ArrayList<>();
+    List<String> dispatchIds = new ArrayList<>();
+    long now = System.currentTimeMillis();
+
+    for (var acc : selectedAccounts) {
+      String accountId = CloudStore.str(acc, "id");
+      String platform = CloudStore.str(acc, "platform");
+      String displayName = CloudStore.str(acc, "display_name");
+      if (accounts.connector(platform).skipPullAsDestination(accounts.session(acc))) {
+        skippedPlatforms.add(
+            Map.of(
+                "accountId",
+                accountId,
+                "platform",
+                platform,
+                "displayName",
+                displayName == null ? platform : displayName,
+                "reason",
+                "Strava 官方 OAuth 授权暂不支持导出原始 FIT 文件，可用于接收其他平台同步"));
+        continue;
+      }
+      var activePulls =
+          store.db.queryForList(
+              "SELECT id,status FROM sync_job WHERE user_id=? AND account_id=? AND kind='PULL' AND"
+                  + " status IN ('PENDING','RUNNING','RETRY') ORDER BY created_at DESC LIMIT 1",
+              user,
+              accountId);
+      String jobId;
+      String status;
+      if (!activePulls.isEmpty()) {
+        jobId = CloudStore.str(activePulls.getFirst(), "id");
+        status = CloudStore.str(activePulls.getFirst(), "status");
+        if (!"RUNNING".equals(status)) {
+          store.db.update(
+              "UPDATE sync_job SET status='PENDING',next_run_at=?,updated_at=? WHERE id=? AND"
+                  + " user_id=?",
+              now,
+              now,
+              jobId,
+              user);
+          status = "PENDING";
+          dispatchIds.add(jobId);
+        }
+      } else {
+        jobId = pull(user, accountId, historyDays, List.of(), null);
+        status = "PENDING";
+        dispatchIds.add(jobId);
+      }
+      jobIds.add(jobId);
+      startedAccounts.add(
+          Map.of(
+              "accountId",
+              accountId,
+              "platform",
+              platform,
+              "displayName",
+              displayName == null ? platform : displayName,
+              "jobId",
+              jobId,
+              "status",
+              status));
+    }
+    if (jobIds.isEmpty()) {
+      String reason =
+          skippedPlatforms.isEmpty()
+              ? "没有可拉取活动的平台账号"
+              : skippedPlatforms.getFirst().get("reason").toString();
+      throw ApiException.bad(reason);
+    }
+    dispatchPull(dispatchIds);
+    return Map.of(
+        "jobIds", jobIds, "accounts", startedAccounts, "skippedPlatforms", skippedPlatforms);
+  }
+
+  public Map<String, Object> pullStatus(String user, List<String> jobIds) {
+    List<Map<String, Object>> rows;
+    if (jobIds != null && !jobIds.isEmpty()) {
+      List<String> cleanIds =
+          jobIds.stream()
+              .filter(Objects::nonNull)
+              .map(String::trim)
+              .filter(s -> !s.isBlank())
+              .distinct()
+              .limit(20)
+              .toList();
+      if (cleanIds.isEmpty()) return Map.of("jobs", List.of(), "activeCount", 0, "totals", zeroProgress());
+      String placeholders = String.join(",", Collections.nCopies(cleanIds.size(), "?"));
+      List<Object> args = new ArrayList<>(cleanIds.size() + 1);
+      args.add(user);
+      args.addAll(cleanIds);
+      rows =
+          store.db.queryForList(
+              "SELECT j.*,a.platform,a.display_name,a.status AS account_status FROM sync_job j"
+                  + " JOIN platform_account a ON a.id=j.account_id WHERE j.user_id=? AND"
+                  + " j.kind='PULL' AND j.id IN ("
+                  + placeholders
+                  + ") ORDER BY j.created_at DESC",
+              args.toArray());
+    } else {
+      long cutoff = System.currentTimeMillis() - Duration.ofMinutes(15).toMillis();
+      rows =
+          store.db.queryForList(
+              "SELECT j.*,a.platform,a.display_name,a.status AS account_status FROM sync_job j"
+                  + " JOIN platform_account a ON a.id=j.account_id WHERE j.user_id=? AND"
+                  + " j.kind='PULL' AND (j.status IN ('PENDING','RUNNING','RETRY') OR j.updated_at>=?)"
+                  + " ORDER BY j.created_at DESC LIMIT 10",
+              user,
+              cutoff);
+    }
+    long totalFetched = 0,
+        totalExisting = 0,
+        totalImported = 0,
+        totalMerged = 0,
+        totalReview = 0,
+        totalSkipped = 0,
+        totalPages = 0;
+    int activeCount = 0;
+    List<Map<String, Object>> jobs = new ArrayList<>(rows.size());
+    for (var row : rows) {
+      String status = CloudStore.str(row, "status");
+      if (Set.of("PENDING", "RUNNING", "RETRY").contains(status)) activeCount++;
+      Map<String, Object> payload = Map.of();
+      String rawPayload = CloudStore.str(row, "payload_json");
+      if (rawPayload != null && !rawPayload.isBlank()) {
+        try {
+          payload = store.decode(rawPayload);
+        } catch (Exception ignored) {
+        }
+      }
+      long fetched = CloudStore.number(payload, "fetched");
+      long existingSkipped = CloudStore.number(payload, "existingSkipped");
+      long imported = CloudStore.number(payload, "imported");
+      long merged = CloudStore.number(payload, "merged");
+      long needsReview = CloudStore.number(payload, "needsReview");
+      long skippedNoFit =
+          payload.containsKey("skippedNoFit")
+              ? CloudStore.number(payload, "skippedNoFit")
+              : CloudStore.number(payload, "skipped");
+      long pages = CloudStore.number(payload, "pages");
+      totalFetched += fetched;
+      totalExisting += existingSkipped;
+      totalImported += imported;
+      totalMerged += merged;
+      totalReview += needsReview;
+      totalSkipped += skippedNoFit;
+      totalPages += pages;
+
+      var progress = new LinkedHashMap<String, Object>();
+      progress.put("fetched", fetched);
+      progress.put("existingSkipped", existingSkipped);
+      progress.put("imported", imported);
+      progress.put("merged", merged);
+      progress.put("needsReview", needsReview);
+      progress.put("skippedNoFit", skippedNoFit);
+      progress.put("pages", pages);
+
+      var item = new LinkedHashMap<String, Object>();
+      item.put("id", row.get("id"));
+      item.put("accountId", row.get("account_id"));
+      item.put("platform", row.get("platform"));
+      item.put("displayName", row.get("display_name"));
+      item.put("accountStatus", row.get("account_status"));
+      item.put("status", status);
+      item.put("message", row.get("message"));
+      item.put("progress", progress);
+      item.put("createdAtEpochMs", row.get("created_at"));
+      item.put("updatedAtEpochMs", row.get("updated_at"));
+      jobs.add(item);
+    }
+    var totals = new LinkedHashMap<String, Object>();
+    totals.put("fetched", totalFetched);
+    totals.put("existingSkipped", totalExisting);
+    totals.put("imported", totalImported);
+    totals.put("merged", totalMerged);
+    totals.put("needsReview", totalReview);
+    totals.put("skippedNoFit", totalSkipped);
+    totals.put("pages", totalPages);
+    return Map.of("jobs", jobs, "activeCount", activeCount, "totals", totals);
+  }
+
+  private static Map<String, Object> zeroProgress() {
+    var totals = new LinkedHashMap<String, Object>();
+    totals.put("fetched", 0L);
+    totals.put("existingSkipped", 0L);
+    totals.put("imported", 0L);
+    totals.put("merged", 0L);
+    totals.put("needsReview", 0L);
+    totals.put("skippedNoFit", 0L);
+    totals.put("pages", 0L);
+    return totals;
+  }
+
+  private void dispatchPull(List<String> jobIds) {
+    if (!enabled || pullExecutor == null || jobIds.isEmpty()) return;
+    List<String> ids = List.copyOf(jobIds);
+    Runnable submit =
+        () -> {
+          for (String jobId : ids) {
+            pullExecutor.submit(
+                () -> {
+                  try {
+                    runOne(jobId);
+                  } catch (Exception ignored) {
+                  }
+                });
+          }
+        };
+    if (TransactionSynchronizationManager.isSynchronizationActive()) {
+      TransactionSynchronizationManager.registerSynchronization(
+          new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+              submit.run();
+            }
+          });
+    } else {
+      submit.run();
+    }
+  }
+
+  @Transactional
   public Map<String, Object> sync(
       String user,
       String source,
@@ -163,16 +451,27 @@ public class JobService {
       if (activityIds.isEmpty()) throw ApiException.bad("请先导入 FIT 文件");
       if (activityIds.size() > 100) throw ApiException.bad("本地活动超过 100 条，请从活动列表选择分批同步");
       selected = true;
-    } else
-      sourceAccount =
-          CloudStore.str(
-              store.one(
-                  "SELECT * FROM platform_account WHERE user_id=? AND platform=?", user, source),
-              "id");
+    } else {
+      var sourceAcc =
+          store.one("SELECT * FROM platform_account WHERE user_id=? AND platform=?", user, source);
+      sourceAccount = CloudStore.str(sourceAcc, "id");
+      if (accounts
+          .connector(source)
+          .skipPullAsDestination(accounts.session(sourceAcc))) {
+        throw ApiException.bad("Strava 官方 OAuth 授权暂不支持导出原始 FIT 文件，可用于接收其他平台或本地活动同步");
+      }
+    }
     if (selected && destinations.isEmpty()) throw ApiException.bad("请选择目标账号");
     List<String> ids = new ArrayList<>();
-    // 目标预拉取先入队；所有拉取完成前不投递，减少跨平台循环。
-    for (String target : destinations) ids.add(pull(user, target, historyDays, List.of(), null));
+    List<String> pullIds = new ArrayList<>();
+    // 目标预拉取先入队；所有拉取完成前不投递，减少跨平台循环。对纯 OAuth 不可导出原文件的目标跳过以节省 API 配额。
+    for (String target : destinations) {
+      if (!shouldSkipPull(user, target)) {
+        String pullId = pull(user, target, historyDays, List.of(), null);
+        ids.add(pullId);
+        pullIds.add(pullId);
+      }
+    }
     if (selected) {
       for (String id : activityIds) {
         store.owned("activity", id, user);
@@ -182,8 +481,11 @@ public class JobService {
         }
       }
     } else {
-      ids.add(pull(user, sourceAccount, historyDays, destinations, null));
+      String pullId = pull(user, sourceAccount, historyDays, destinations, null);
+      ids.add(pullId);
+      pullIds.add(pullId);
     }
+    dispatchPull(pullIds);
     return Map.of("jobIds", ids);
   }
 
@@ -223,6 +525,13 @@ public class JobService {
     payload.put("since", since);
     payload.put("destinations", destinations);
     payload.put("cursor", null);
+    payload.put("fetched", 0L);
+    payload.put("existingSkipped", 0L);
+    payload.put("imported", 0L);
+    payload.put("merged", 0L);
+    payload.put("needsReview", 0L);
+    payload.put("skippedNoFit", 0L);
+    payload.put("pages", 0L);
     return enqueue(
         user,
         "PULL",
@@ -387,7 +696,9 @@ public class JobService {
                 + " a.status='CONNECTED'")) {
       String user = CloudStore.str(rule, "user_id"),
           dest = CloudStore.str(rule, "destination_account_id");
-      pull(user, dest, 90, List.of(), "auto-pull:" + dest + ":" + bucket);
+      if (!shouldSkipPull(user, dest)) {
+        pull(user, dest, 90, List.of(), "auto-pull:" + dest + ":" + bucket);
+      }
       for (var source :
           store.db.queryForList(
               "SELECT id FROM platform_account WHERE user_id=? AND platform=? AND"
@@ -395,10 +706,18 @@ public class JobService {
               user,
               rule.get("source_platform"))) {
         String id = CloudStore.str(source, "id");
-        pull(user, id, 90, List.of(), "auto-pull:" + id + ":" + bucket);
+        if (!shouldSkipPull(user, id)) {
+          pull(user, id, 90, List.of(), "auto-pull:" + id + ":" + bucket);
+        }
       }
     }
     store.db.update("DELETE FROM user_session WHERE expires_at<?", System.currentTimeMillis());
+  }
+
+  private boolean shouldSkipPull(String user, String accountId) {
+    var account = store.owned("platform_account", accountId, user);
+    String platform = CloudStore.str(account, "platform");
+    return accounts.connector(platform).skipPullAsDestination(accounts.session(account));
   }
 
   @Scheduled(fixedDelay = 3000, initialDelay = 3000)
@@ -520,72 +839,290 @@ public class JobService {
       Map<String, Object> account,
       PlatformConnector connector,
       Session session) {
+    String jobId = CloudStore.str(job, "id");
     String user = CloudStore.str(job, "user_id"), accountId = CloudStore.str(account, "id");
-    var payload = store.decode(CloudStore.str(job, "payload_json"));
-    var result =
-        connector.listActivities(
-            session, CloudStore.number(payload, "since"), CloudStore.str(payload, "cursor"));
-    if (result.status() != ConnectorResult.Status.SUCCESS) {
-      applyFailure(job, result);
-      return;
-    }
-    for (var remote : result.value().items()) {
-      if (store.db.queryForObject(
-              "SELECT COUNT(*) FROM platform_copy WHERE user_id=? AND account_id=? AND remote_id=?",
-              Integer.class,
-              user,
-              accountId,
-              remote.remoteActivityId())
-          > 0) continue;
-      var downloaded = connector.downloadFit(session, remote);
-      if (downloaded.status() == ConnectorResult.Status.PERMANENT_FAILURE) {
-        payload.put("skipped", CloudStore.number(payload, "skipped") + 1);
-        continue;
-      }
-      if (downloaded.status() != ConnectorResult.Status.SUCCESS) {
-        applyFailure(job, downloaded);
+    String platform = CloudStore.str(account, "platform");
+    var payload = new LinkedHashMap<>(store.decode(CloudStore.str(job, "payload_json")));
+    long since = CloudStore.number(payload, "since");
+    String cursor = CloudStore.str(payload, "cursor");
+    long fetched = CloudStore.number(payload, "fetched");
+    long existingSkipped = CloudStore.number(payload, "existingSkipped");
+    long imported = CloudStore.number(payload, "imported");
+    long merged = CloudStore.number(payload, "merged");
+    long needsReview = CloudStore.number(payload, "needsReview");
+    long skippedNoFit =
+        payload.containsKey("skippedNoFit")
+            ? CloudStore.number(payload, "skippedNoFit")
+            : CloudStore.number(payload, "skipped");
+    long pages = CloudStore.number(payload, "pages");
+
+    for (int page = 0; page < MAX_PULL_PAGES; page++) {
+      var result = connector.listActivities(session, since, cursor);
+      if (result.status() != ConnectorResult.Status.SUCCESS) {
+        savePullProgress(
+            jobId,
+            payload,
+            cursor,
+            fetched,
+            existingSkipped,
+            imported,
+            merged,
+            needsReview,
+            skippedNoFit,
+            pages,
+            null);
+        applyFailure(job, result);
         return;
       }
-      Map<String, Object> imported;
-      try {
-        imported =
-            activities.importFit(
+      pages++;
+      var remotes = result.value().items();
+      fetched += remotes.size();
+      Set<String> knownRemoteIds = findKnownRemoteIds(user, accountId, remotes);
+
+      for (var remote : remotes) {
+        if (knownRemoteIds.contains(remote.remoteActivityId())) {
+          existingSkipped++;
+          continue;
+        }
+        var downloaded = connector.downloadFit(session, remote);
+        if (downloaded.status() == ConnectorResult.Status.PERMANENT_FAILURE) {
+          skippedNoFit++;
+          String code = downloaded.code();
+          if (code == null || PERMANENT_REMOTE_SKIP_CODES.contains(code)) {
+            recordRemoteSkip(
                 user,
-                downloaded.value().bytes(),
-                CloudStore.str(account, "platform"),
                 accountId,
-                remote.remoteActivityId());
-      } catch (ApiException invalid) {
-        payload.put("skipped", CloudStore.number(payload, "skipped") + 1);
-        continue;
+                remote.remoteActivityId(),
+                code == null ? "NO_ORIGINAL_FILE" : code,
+                downloaded.message());
+          }
+          continue;
+        }
+        if (downloaded.status() != ConnectorResult.Status.SUCCESS) {
+          savePullProgress(
+              jobId,
+              payload,
+              cursor,
+              fetched,
+              existingSkipped,
+              imported,
+              merged,
+              needsReview,
+              skippedNoFit,
+              pages,
+              null);
+          applyFailure(job, downloaded);
+          return;
+        }
+        Map<String, Object> importedResult;
+        try {
+          importedResult =
+              activities.importFit(
+                  user,
+                  downloaded.value().bytes(),
+                  platform,
+                  accountId,
+                  remote.remoteActivityId(),
+                  remote.name());
+        } catch (ApiException invalid) {
+          skippedNoFit++;
+          recordRemoteSkip(
+              user,
+              accountId,
+              remote.remoteActivityId(),
+              "IMPORT_INVALID",
+              invalid.getMessage());
+          continue;
+        }
+        String dedupAction = Objects.toString(importedResult.get("dedupAction"), "CREATE_NEW");
+        switch (dedupAction) {
+          case "DUPLICATE_FILE", "AUTO_MERGE" -> merged++;
+          case "NEEDS_REVIEW" -> needsReview++;
+          default -> imported++;
+        }
+        String activity = importedResult.get("activityId").toString();
+        plan(user, activity);
+        if (payload.get("destinations") instanceof List<?> destinations)
+          for (Object target : destinations) delivery(user, activity, target.toString());
       }
-      String activity = imported.get("activityId").toString();
-      plan(user, activity);
-      if (payload.get("destinations") instanceof List<?> destinations)
-        for (Object target : destinations) delivery(user, activity, target.toString());
+
+      String nextCursor = result.value().nextCursor();
+      boolean hasMore =
+          result.value().hasMore() && nextCursor != null && !Objects.equals(cursor, nextCursor);
+      cursor = hasMore ? nextCursor : null;
+      String liveMessage =
+          "正在拉取第 "
+              + pages
+              + " 页（新增 "
+              + imported
+              + " 条，去重 "
+              + merged
+              + " 条"
+              + (needsReview > 0 ? "，待核对 " + needsReview + " 条" : "")
+              + "）";
+      savePullProgress(
+          jobId,
+          payload,
+          cursor,
+          fetched,
+          existingSkipped,
+          imported,
+          merged,
+          needsReview,
+          skippedNoFit,
+          pages,
+          hasMore ? liveMessage : null);
+      heartbeat(jobId, accountId);
+
+      if (!hasMore) {
+        store.db.update(
+            "UPDATE platform_account SET last_sync_at=?,last_error=NULL,status='CONNECTED' WHERE"
+                + " id=? AND user_id=?",
+            System.currentTimeMillis(),
+            accountId,
+            user);
+        finish(
+            job,
+            "SUCCEEDED",
+            buildPullSummary(fetched, existingSkipped, imported, merged, needsReview, skippedNoFit),
+            0);
+        return;
+      }
     }
-    if (result.value().hasMore() && result.value().nextCursor() != null) {
-      payload.put("cursor", result.value().nextCursor());
+
+    finish(job, "PENDING", "已拉取 " + pages + " 页，继续拉取剩余活动", 0);
+  }
+
+  private void savePullProgress(
+      String jobId,
+      Map<String, Object> payload,
+      String cursor,
+      long fetched,
+      long existingSkipped,
+      long imported,
+      long merged,
+      long needsReview,
+      long skippedNoFit,
+      long pages,
+      String message) {
+    payload.put("cursor", cursor);
+    payload.put("fetched", fetched);
+    payload.put("existingSkipped", existingSkipped);
+    payload.put("imported", imported);
+    payload.put("merged", merged);
+    payload.put("needsReview", needsReview);
+    payload.put("skippedNoFit", skippedNoFit);
+    payload.put("skipped", skippedNoFit);
+    payload.put("pages", pages);
+    if (message != null) {
+      String trimmed = message.length() > 280 ? message.substring(0, 280) : message;
       store.db.update(
-          "UPDATE sync_job SET payload_json=? WHERE id=? AND lease_owner=?",
+          "UPDATE sync_job SET payload_json=?,message=?,updated_at=? WHERE id=? AND lease_owner=?",
           store.encode(payload),
-          job.get("id"),
+          trimmed,
+          System.currentTimeMillis(),
+          jobId,
           worker);
-      finish(job, "PENDING", "继续拉取下一页", 0);
     } else {
       store.db.update(
-          "UPDATE platform_account SET last_sync_at=?,last_error=NULL,status='CONNECTED' WHERE id=?"
-              + " AND user_id=?",
+          "UPDATE sync_job SET payload_json=?,updated_at=? WHERE id=? AND lease_owner=?",
+          store.encode(payload),
           System.currentTimeMillis(),
-          accountId,
-          user);
-      long skipped = CloudStore.number(payload, "skipped");
-      finish(
-          job,
-          "SUCCEEDED",
-          skipped == 0 ? "活动拉取完成" : "活动拉取完成，" + skipped + " 条活动缺少有效原始 FIT，已跳过",
-          0);
+          jobId,
+          worker);
     }
+  }
+
+  private Set<String> findKnownRemoteIds(
+      String user, String accountId, List<RemoteActivity> remotes) {
+    if (remotes == null || remotes.isEmpty()) return Set.of();
+    List<String> remoteIds =
+        remotes.stream()
+            .map(RemoteActivity::remoteActivityId)
+            .filter(id -> id != null && !id.isBlank())
+            .distinct()
+            .toList();
+    if (remoteIds.isEmpty()) return Set.of();
+    String placeholders = String.join(",", Collections.nCopies(remoteIds.size(), "?"));
+    List<Object> args = new ArrayList<>(remoteIds.size() + 2);
+    args.add(user);
+    args.add(accountId);
+    args.addAll(remoteIds);
+    Set<String> known = new HashSet<>();
+    for (var row :
+        store.db.queryForList(
+            "SELECT remote_id FROM platform_copy WHERE user_id=? AND account_id=? AND remote_id"
+                + " IN ("
+                + placeholders
+                + ")",
+            args.toArray())) {
+      String rid = CloudStore.str(row, "remote_id");
+      if (rid != null) known.add(rid);
+    }
+    for (var row :
+        store.db.queryForList(
+            "SELECT remote_id FROM remote_activity_skip WHERE user_id=? AND account_id=? AND"
+                + " remote_id IN ("
+                + placeholders
+                + ")",
+            args.toArray())) {
+      String rid = CloudStore.str(row, "remote_id");
+      if (rid != null) known.add(rid);
+    }
+    return known;
+  }
+
+  private void recordRemoteSkip(
+      String user, String accountId, String remoteId, String reasonCode, String message) {
+    if (remoteId == null || remoteId.isBlank()) return;
+    long now = System.currentTimeMillis();
+    String safeMsg =
+        message == null ? null : (message.length() > 280 ? message.substring(0, 280) : message);
+    int updated =
+        store.db.update(
+            "UPDATE remote_activity_skip SET reason_code=?,message=?,updated_at=? WHERE"
+                + " account_id=? AND remote_id=? AND user_id=?",
+            reasonCode,
+            safeMsg,
+            now,
+            accountId,
+            remoteId,
+            user);
+    if (updated == 0) {
+      try {
+        store.db.update(
+            "INSERT INTO"
+                + " remote_activity_skip(id,user_id,account_id,remote_id,reason_code,message,created_at,updated_at)"
+                + " VALUES(?,?,?,?,?,?,?,?)",
+            CloudStore.id(),
+            user,
+            accountId,
+            remoteId,
+            reasonCode,
+            safeMsg,
+            now,
+            now);
+      } catch (DuplicateKeyException ignored) {
+      }
+    }
+  }
+
+  private static String buildPullSummary(
+      long fetched,
+      long existingSkipped,
+      long imported,
+      long merged,
+      long needsReview,
+      long skippedNoFit) {
+    if (fetched == 0) return "活动拉取完成，该时间范围内暂无新活动";
+    StringBuilder sb = new StringBuilder();
+    sb.append("拉取完成：扫描 ").append(fetched).append(" 条");
+    if (imported > 0) sb.append("，新增 ").append(imported).append(" 条");
+    if (merged > 0) sb.append("，去重合并 ").append(merged).append(" 条");
+    if (existingSkipped > 0) sb.append("，已同步跳过 ").append(existingSkipped).append(" 条");
+    if (needsReview > 0) sb.append("，待核对 ").append(needsReview).append(" 条");
+    if (skippedNoFit > 0) sb.append("，缺少有效原始 FIT 已跳过 ").append(skippedNoFit).append(" 条");
+    return sb.toString();
   }
 
   private void processDelivery(

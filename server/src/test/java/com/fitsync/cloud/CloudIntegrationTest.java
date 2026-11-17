@@ -6,6 +6,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 import com.fitsync.cloud.connector.*;
+import com.fitsync.fitcore.FitParser;
 import java.io.ByteArrayOutputStream;
 import java.nio.*;
 import java.util.*;
@@ -26,7 +27,10 @@ import org.springframework.transaction.support.TransactionTemplate;
       "fitsync.storage-dir=./target/test-fits",
       "fitsync.encryption-key=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
       "fitsync.scheduler-enabled=false",
-      "fitsync.auth-rate-limit=1000"
+      "fitsync.auth-rate-limit=1000",
+      "fitsync.strava.client-id=",
+      "fitsync.strava.client-secret=",
+      "fitsync.strava.redirect-uri="
     })
 @ActiveProfiles("local")
 @AutoConfigureMockMvc
@@ -397,6 +401,251 @@ class CloudIntegrationTest {
   }
 
   @Test
+  void webSessionConnectorIsEncryptedNotReturnedAndCanReconnect() throws Exception {
+    PlatformConnector web = mock(PlatformConnector.class);
+    doReturn(web).when(accounts).connector("STRAVA");
+    when(web.connectWeb(any()))
+        .thenReturn(
+            ConnectorResult.success(
+                new Session(
+                    null,
+                    null,
+                    null,
+                    null,
+                    false,
+                    Map.of("cookie", "_strava4_session=very-secret-cookie"))));
+    Login login = login();
+    String body =
+        "{\"platform\":\"STRAVA\",\"displayName\":\"我的 Strava\",\"session\":{"
+            + "\"cookie\":\"_strava4_session=very-secret-cookie\"}}";
+    var response =
+        mvc.perform(
+                post("/api/v1/accounts/web-session")
+                    .header("Authorization", "Bearer " + login.token())
+                    .contentType("application/json")
+                    .content(body))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.platform").value("STRAVA"))
+            .andReturn()
+            .getResponse();
+    String json = response.getContentAsString();
+    assertFalse(json.contains("very-secret-cookie"));
+    String account = store.json.readTree(json).get("id").asText();
+    var row = store.owned("platform_account", account, login.user());
+    assertFalse(CloudStore.str(row, "encrypted_session").contains("very-secret-cookie"));
+    assertEquals(
+        "very-secret-cookie",
+        accounts.session(row).attribute("cookie").replace("_strava4_session=", ""));
+    assertEquals(1, accounts.list(login.user()).size());
+    mvc.perform(
+            post("/api/v1/accounts/web-session")
+                .header("Authorization", "Bearer " + login.token())
+                .contentType("application/json")
+                .content("{\"platform\":\"STRAVA\",\"displayName\":\"另一个账号\",\"session\":{}}"))
+        .andExpect(status().isBadRequest());
+  }
+
+  @Test
+  void webSessionConfigAdvertisesFourSupportedPlatforms() throws Exception {
+    mvc.perform(get("/api/v1/config"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.stravaOAuthConfigured").value(false))
+        .andExpect(jsonPath("$.platforms[?(@.code=='COROS')].authMode").value("PASSWORD"))
+        .andExpect(jsonPath("$.platforms[?(@.code=='IGPSPORT')].authMode").value("PASSWORD"))
+        .andExpect(jsonPath("$.platforms[?(@.code=='STRAVA')].authMode").value("OAUTH"))
+        .andExpect(jsonPath("$.platforms[?(@.code=='ONELAP')].authMode").value("PASSWORD"))
+        .andExpect(jsonPath("$.platforms[?(@.code=='XINGZHE')].authMode").value("PASSWORD"))
+        .andExpect(jsonPath("$.platforms[?(@.code=='GARMIN')].authMode").value("PASSWORD"));
+  }
+
+  @Test
+  void stravaOAuthFlowPersistsAccountSkipsDestinationPullAndRejectsReplay() throws Exception {
+    Login login = login();
+    mvc.perform(
+            post("/api/v1/accounts/oauth/strava/start")
+                .header("Authorization", "Bearer " + login.token())
+                .contentType("application/json")
+                .content(
+                    store.encode(
+                        Map.of(
+                            "clientId",
+                            "cid-1",
+                            "clientSecret",
+                            "csec-1",
+                            "redirectUri",
+                            "http://127.0.0.1:8080/api/v1/accounts/oauth/strava/callback",
+                            "returnUrl",
+                            "https://evil.example.com/steal"))))
+        .andExpect(status().isBadRequest());
+
+    var badScopeStart =
+        store.json.readTree(
+            mvc.perform(
+                    post("/api/v1/accounts/oauth/strava/start")
+                        .header("Authorization", "Bearer " + login.token())
+                        .contentType("application/json")
+                        .content(
+                            store.encode(
+                                Map.of(
+                                    "clientId",
+                                    "cid-1",
+                                    "clientSecret",
+                                    "csec-1",
+                                    "redirectUri",
+                                    "http://127.0.0.1:8080/api/v1/accounts/oauth/strava/callback",
+                                    "returnUrl",
+                                    "http://127.0.0.1:8080/sync"))))
+                .andExpect(status().isOk())
+                .andReturn()
+                .getResponse()
+                .getContentAsString());
+    String badId = badScopeStart.get("challengeId").asText();
+    String badState = queryParam(badScopeStart.get("authorizeUrl").asText(), "state");
+    mvc.perform(
+            get("/api/v1/accounts/oauth/strava/callback")
+                .param("state", badState)
+                .param("code", "code-bad")
+                .param("scope", "read"))
+        .andExpect(status().isFound())
+        .andExpect(
+            header()
+                .string(
+                    "Location",
+                    org.hamcrest.Matchers.startsWith(
+                        "http://127.0.0.1:8080/sync?stravaOAuth=error")));
+    mvc.perform(
+            get("/api/v1/accounts/oauth/strava/" + badId)
+                .header("Authorization", "Bearer " + login.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.status").value("FAILED"));
+
+    var stravaMock = mock(com.fitsync.cloud.connector.StravaConnector.class);
+    when(stravaMock.exchangeOAuthCode(
+            eq("cid-1"), eq("csec-1"), eq("code-123"), anyString(), eq(true)))
+        .thenReturn(
+            ConnectorResult.success(
+                new Session(
+                    "strava-access-1",
+                    "778899",
+                    null,
+                    null,
+                    false,
+                    Map.of(
+                        "authType", "OAUTH",
+                        "refreshToken", "strava-refresh-1",
+                        "expiresAt", "2000000000",
+                        "scope", "read,activity:read_all,activity:write",
+                        "clientId", "cid-1",
+                        "clientSecret", "csec-1",
+                        "displayName", "Strava Rider"))));
+    when(stravaMock.skipPullAsDestination(any())).thenCallRealMethod();
+    doReturn(stravaMock).when(accounts).connector("STRAVA");
+
+    var startJson =
+        store.json.readTree(
+            mvc.perform(
+                    post("/api/v1/accounts/oauth/strava/start")
+                        .header("Authorization", "Bearer " + login.token())
+                        .contentType("application/json")
+                        .content(
+                            store.encode(
+                                Map.of(
+                                    "clientId",
+                                    "cid-1",
+                                    "clientSecret",
+                                    "csec-1",
+                                    "redirectUri",
+                                    "http://127.0.0.1:8080/api/v1/accounts/oauth/strava/callback",
+                                    "returnUrl",
+                                    "http://127.0.0.1:8080/sync"))))
+                .andExpect(status().isOk())
+                .andReturn()
+                .getResponse()
+                .getContentAsString());
+    String challengeId = startJson.get("challengeId").asText();
+    String authorizeUrl = startJson.get("authorizeUrl").asText();
+    assertTrue(authorizeUrl.contains("client_id=cid-1"));
+    String state = queryParam(authorizeUrl, "state");
+    assertFalse(state.isBlank());
+    var challengeRow =
+        store.one("SELECT status,state_hash,encrypted_context FROM oauth_challenge WHERE id=?", challengeId);
+    assertEquals("PENDING", challengeRow.get("status"));
+    assertEquals(CryptoService.hash(state), challengeRow.get("state_hash"));
+    assertFalse(CloudStore.str(challengeRow, "encrypted_context").contains("csec-1"));
+
+    mvc.perform(
+            get("/api/v1/accounts/oauth/strava/callback")
+                .param("state", state)
+                .param("code", "code-123")
+                .param("scope", "read,activity:read_all,activity:write"))
+        .andExpect(status().isFound())
+        .andExpect(header().string("Location", "http://127.0.0.1:8080/sync?stravaOAuth=success"));
+
+    mvc.perform(
+            get("/api/v1/accounts/oauth/strava/" + challengeId)
+                .header("Authorization", "Bearer " + login.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.status").value("SUCCEEDED"));
+
+    // 同一 state 不可重放。
+    mvc.perform(
+            get("/api/v1/accounts/oauth/strava/callback")
+                .param("state", state)
+                .param("code", "code-123")
+                .param("scope", "read,activity:read_all,activity:write"))
+        .andExpect(status().isBadRequest());
+    verify(stravaMock, times(1))
+        .exchangeOAuthCode(eq("cid-1"), eq("csec-1"), eq("code-123"), anyString(), eq(true));
+
+    var accountsResp =
+        mvc.perform(get("/api/v1/accounts").header("Authorization", "Bearer " + login.token()))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$[0].platform").value("STRAVA"))
+            .andExpect(jsonPath("$[0].displayName").value("Strava Rider"))
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    assertFalse(accountsResp.contains("csec-1"));
+    assertFalse(accountsResp.contains("strava-access-1"));
+    assertFalse(accountsResp.contains("strava-refresh-1"));
+
+    String stravaId = store.json.readTree(accountsResp).get(0).get("id").asText();
+    var accRow = store.owned("platform_account", stravaId, login.user());
+    assertFalse(CloudStore.str(accRow, "encrypted_session").contains("csec-1"));
+    assertEquals("strava-refresh-1", accounts.session(accRow).attribute("refreshToken"));
+
+    String activityId = imported(login);
+    jobs.rule(login.user(), "LOCAL", stravaId, true, true);
+    jobs.scheduleRules();
+    jobs.sync(login.user(), "LOCAL", List.of(stravaId), List.of(activityId), 90);
+    assertEquals(
+        0,
+        store.db.queryForObject(
+            "SELECT COUNT(*) FROM sync_job WHERE user_id=? AND account_id=? AND kind='PULL'",
+            Integer.class,
+            login.user(),
+            stravaId));
+    assertThrows(
+        ApiException.class,
+        () -> jobs.sync(login.user(), "STRAVA", List.of(), List.of(), 90));
+  }
+
+  private static String queryParam(String url, String key) {
+    String query = java.net.URI.create(url).getRawQuery();
+    if (query == null) return "";
+    for (String pair : query.split("&")) {
+      int idx = pair.indexOf('=');
+      if (idx > 0
+          && java.net.URLDecoder.decode(pair.substring(0, idx), java.nio.charset.StandardCharsets.UTF_8)
+              .equals(key)) {
+        return java.net.URLDecoder.decode(
+            pair.substring(idx + 1), java.nio.charset.StandardCharsets.UTF_8);
+      }
+    }
+    return "";
+  }
+
+  @Test
   void pendingRuleJobsStopWhenRuleIsDisabled() throws Exception {
     Login login = login();
     String account = account(login), activity = imported(login);
@@ -626,6 +875,492 @@ class CloudIntegrationTest {
     mvc.perform(get("/api/v1/me").header("Authorization", "Bearer " + other))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.id").value(login.user()));
+  }
+
+  @Test
+  void pullFromConnectedPlatformsDeduplicatesStoresInCloudAndSkipsPermanentMissingFiles()
+      throws Exception {
+    Login alice = login(), bob = login();
+    String corosAccount = account(alice);
+
+    PlatformConnector igpsport = mock(PlatformConnector.class);
+    doReturn(igpsport).when(accounts).connector("IGPSPORT");
+    when(igpsport.login(anyString(), anyString(), anyBoolean()))
+        .thenReturn(
+            ConnectorResult.success(
+                new Session("igp-token", "igp-user-1", "igp@example.com", "pw", true)));
+    String igpResp =
+        mvc.perform(
+                post("/api/v1/accounts")
+                    .header("Authorization", "Bearer " + alice.token())
+                    .contentType("application/json")
+                    .content(
+                        "{\"platform\":\"IGPSPORT\",\"username\":\"igp@example.com\",\"password\":\"very-secret-pw\",\"storeCredentials\":true}"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.pullSupported").value(true))
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    String igpAccount = store.json.readTree(igpResp).get("id").asText();
+
+    byte[] corosRide = rideFit(10_000, 2, 3_600_000, 3_500_000, 4_219_500, 148, 1);
+    byte[] igpSameRide = rideFit(10_020, 2, 3_602_000, 3_500_000, 4_220_000, 150, 200);
+    byte[] corosRun = rideFit(50_000, 1, 1_800_000, 1_780_000, 1_000_000, 155, 1);
+    assertNotEquals(FitParser.sha256(corosRide), FitParser.sha256(igpSameRide));
+
+    when(connector.listActivities(any(), anyLong(), any()))
+        .thenReturn(
+            ConnectorResult.success(
+                new ActivityPage(
+                    List.of(
+                        new RemoteActivity("coros-ride-1", 631_075_600_000L, "周日西湖拉练", 42195.0, null, Map.of()),
+                        new RemoteActivity("coros-missing-1", 631_076_000_000L, "无原文件活动", 5000.0, null, Map.of()),
+                        new RemoteActivity("coros-run-1", 631_115_600_000L, "奥森 10K 晨跑", 10000.0, null, Map.of())),
+                    null,
+                    false)));
+    when(connector.downloadFit(any(), argThat(a -> a != null && "coros-ride-1".equals(a.remoteActivityId()))))
+        .thenReturn(ConnectorResult.success(new FitDownload(corosRide, "coros-ride-1.fit")));
+    when(connector.downloadFit(any(), argThat(a -> a != null && "coros-missing-1".equals(a.remoteActivityId()))))
+        .thenReturn(ConnectorResult.failure(ConnectorResult.Status.PERMANENT_FAILURE, "NO_ORIGINAL_FILE", "COROS 未保留该活动的 FIT"));
+    when(connector.downloadFit(any(), argThat(a -> a != null && "coros-run-1".equals(a.remoteActivityId()))))
+        .thenReturn(ConnectorResult.success(new FitDownload(corosRun, "coros-run-1.fit")));
+
+    when(igpsport.listActivities(any(), anyLong(), any()))
+        .thenReturn(
+            ConnectorResult.success(
+                new ActivityPage(
+                    List.of(
+                        new RemoteActivity("igp-ride-1", 631_075_620_000L, "IGP 同步骑行", 42200.0, null, Map.of())),
+                    null,
+                    false)));
+    when(igpsport.downloadFit(any(), argThat(a -> a != null && "igp-ride-1".equals(a.remoteActivityId()))))
+        .thenReturn(ConnectorResult.success(new FitDownload(igpSameRide, "igp-ride-1.fit")));
+
+    String pullStartJson =
+        mvc.perform(
+                post("/api/v1/activities/pull")
+                    .header("Authorization", "Bearer " + alice.token())
+                    .contentType("application/json")
+                    .content("{\"historyDays\":90}"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.accounts.length()").value(2))
+            .andExpect(jsonPath("$.skippedPlatforms.length()").value(0))
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    var pullTree = store.json.readTree(pullStartJson);
+    List<String> jobIds = new ArrayList<>();
+    for (var n : pullTree.get("jobIds")) jobIds.add(n.asText());
+    assertEquals(2, jobIds.size());
+
+    // 在同步执行前再次点击拉取会复用活跃任务而不重复排队。
+    String secondStart =
+        mvc.perform(
+                post("/api/v1/activities/pull")
+                    .header("Authorization", "Bearer " + alice.token())
+                    .contentType("application/json")
+                    .content("{\"historyDays\":90}"))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    assertEquals(
+        Set.copyOf(jobIds),
+        Set.of(
+            store.json.readTree(secondStart).get("jobIds").get(0).asText(),
+            store.json.readTree(secondStart).get("jobIds").get(1).asText()));
+
+    for (String jid : jobIds) jobs.runOne(jid);
+
+    mvc.perform(
+            get("/api/v1/activities/pull")
+                .param("jobIds", String.join(",", jobIds))
+                .header("Authorization", "Bearer " + alice.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.activeCount").value(0))
+        .andExpect(jsonPath("$.totals.fetched").value(4))
+        .andExpect(jsonPath("$.totals.imported").value(2))
+        .andExpect(jsonPath("$.totals.merged").value(1))
+        .andExpect(jsonPath("$.totals.skippedNoFit").value(1));
+
+    // 其他用户无法查看 alice 的拉取任务。
+    mvc.perform(
+            get("/api/v1/activities/pull")
+                .param("jobIds", String.join(",", jobIds))
+                .header("Authorization", "Bearer " + bob.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.jobs.length()").value(0));
+
+    // 3 条远端有效活动 + 1 条无原文件：跨平台去重合并后云端共保存 2 条规范活动。
+    String listJson =
+        mvc.perform(get("/api/v1/activities").header("Authorization", "Bearer " + alice.token()))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.total").value(2))
+            .andExpect(jsonPath("$.items[0].title").value("奥森 10K 晨跑"))
+            .andExpect(jsonPath("$.items[1].title").value("周日西湖拉练"))
+            .andExpect(jsonPath("$.items[1].variantCount").value(2))
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    var listTree = store.json.readTree(listJson);
+    String mergedRideId = listTree.get("items").get(1).get("id").asText();
+    var ridePlatforms = new HashSet<String>();
+    for (var p : listTree.get("items").get(1).get("platforms")) ridePlatforms.add(p.asText());
+    assertEquals(Set.of("COROS", "IGPSPORT"), ridePlatforms);
+    assertTrue(listTree.get("items").get(1).get("track").size() >= 2);
+
+    // 活动详情包含两个来源 FIT 副本与两个平台映射，且可从云端导出原始 FIT。
+    mvc.perform(
+            get("/api/v1/activities/" + mergedRideId)
+                .header("Authorization", "Bearer " + alice.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.variants.length()").value(2))
+        .andExpect(jsonPath("$.copies.length()").value(2));
+    mvc.perform(
+            get("/api/v1/activities/" + mergedRideId + "/file")
+                .header("Authorization", "Bearer " + alice.token()))
+        .andExpect(status().isOk());
+
+    // 再次拉取时，已同步活动与 remote_activity_skip 均跳过，不重复下载 FIT。
+    String pullAgainJson =
+        mvc.perform(
+                post("/api/v1/activities/pull")
+                    .header("Authorization", "Bearer " + alice.token())
+                    .contentType("application/json")
+                    .content("{\"accountIds\":[\"" + corosAccount + "\",\"" + igpAccount + "\"]}"))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    List<String> againJobIds = new ArrayList<>();
+    for (var n : store.json.readTree(pullAgainJson).get("jobIds")) againJobIds.add(n.asText());
+    for (String jid : againJobIds) jobs.runOne(jid);
+    verify(connector, times(3)).downloadFit(any(), any());
+    verify(igpsport, times(1)).downloadFit(any(), any());
+
+    mvc.perform(
+            get("/api/v1/activities/pull")
+                .param("jobIds", String.join(",", againJobIds))
+                .header("Authorization", "Bearer " + alice.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.totals.existingSkipped").value(4))
+        .andExpect(jsonPath("$.totals.imported").value(0))
+        .andExpect(jsonPath("$.totals.merged").value(0));
+
+    // 解绑带 remote_activity_skip 的账号不会触发外键约束错误，且云端活动保留。
+    mvc.perform(
+            delete("/api/v1/accounts/" + corosAccount)
+                .header("Authorization", "Bearer " + alice.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.success").value(true));
+    mvc.perform(get("/api/v1/activities").header("Authorization", "Bearer " + alice.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.total").value(2));
+  }
+
+  @Test
+  void pullSkipsStravaOAuthGracefullyAndDrainsMultiplePagesInSingleRun() throws Exception {
+    Login login = login();
+    account(login);
+    var stravaMock = mock(StravaConnector.class);
+    when(stravaMock.skipPullAsDestination(any())).thenCallRealMethod();
+    doReturn(stravaMock).when(accounts).connector("STRAVA");
+    accounts.persistOAuth(
+        login.user(),
+        "STRAVA",
+        "Strava Rider",
+        new Session(
+            "strava-access",
+            "778899",
+            null,
+            null,
+            false,
+            Map.of("authType", "OAUTH", "refreshToken", "strava-refresh")));
+
+    byte[] p1Ride = rideFit(20_000, 2, 3_600_000, 3_500_000, 3_000_000, 140, 1);
+    byte[] p2Ride = rideFit(40_000, 2, 3_600_000, 3_500_000, 3_500_000, 145, 1);
+    when(connector.listActivities(any(), anyLong(), isNull()))
+        .thenReturn(
+            ConnectorResult.success(
+                new ActivityPage(
+                    List.of(new RemoteActivity("p1-1", 631_085_600_000L, "第一页骑行", 30000.0, null, Map.of())),
+                    "2",
+                    true)));
+    when(connector.listActivities(any(), anyLong(), eq("2")))
+        .thenReturn(
+            ConnectorResult.success(
+                new ActivityPage(
+                    List.of(new RemoteActivity("p2-1", 631_105_600_000L, "第二页骑行", 35000.0, null, Map.of())),
+                    null,
+                    false)));
+    when(connector.downloadFit(any(), argThat(a -> a != null && "p1-1".equals(a.remoteActivityId()))))
+        .thenReturn(ConnectorResult.success(new FitDownload(p1Ride, "p1.fit")));
+    when(connector.downloadFit(any(), argThat(a -> a != null && "p2-1".equals(a.remoteActivityId()))))
+        .thenReturn(ConnectorResult.success(new FitDownload(p2Ride, "p2.fit")));
+
+    // 单独请求 Strava OAuth 拉取被明确拒绝；全量拉取时自动跳过 Strava 仅拉取 COROS。
+    mvc.perform(
+            post("/api/v1/activities/pull")
+                .header("Authorization", "Bearer " + login.token())
+                .contentType("application/json")
+                .content("{\"platforms\":[\"STRAVA\"]}"))
+        .andExpect(status().isBadRequest());
+
+    String pullJson =
+        mvc.perform(
+                post("/api/v1/activities/pull")
+                    .header("Authorization", "Bearer " + login.token()))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.accounts.length()").value(1))
+            .andExpect(jsonPath("$.accounts[0].platform").value("COROS"))
+            .andExpect(jsonPath("$.skippedPlatforms.length()").value(1))
+            .andExpect(jsonPath("$.skippedPlatforms[0].platform").value("STRAVA"))
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    String jobId = store.json.readTree(pullJson).get("jobIds").get(0).asText();
+    jobs.runOne(jobId);
+
+    mvc.perform(
+            get("/api/v1/activities/pull")
+                .param("jobIds", jobId)
+                .header("Authorization", "Bearer " + login.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.jobs[0].status").value("SUCCEEDED"))
+        .andExpect(jsonPath("$.totals.pages").value(2))
+        .andExpect(jsonPath("$.totals.imported").value(2));
+  }
+
+  @Test
+  void pullResumesFromSavedCursorAfterTransientFailure() throws Exception {
+    Login login = login();
+    account(login);
+    byte[] p1Ride = rideFit(20_000, 2, 3_600_000, 3_500_000, 3_000_000, 140, 1);
+    byte[] p2Ride = rideFit(40_000, 2, 3_600_000, 3_500_000, 3_500_000, 145, 1);
+    when(connector.listActivities(any(), anyLong(), isNull()))
+        .thenReturn(
+            ConnectorResult.success(
+                new ActivityPage(
+                    List.of(new RemoteActivity("p1-1", 631_085_600_000L, "第一页骑行", 30000.0, null, Map.of())),
+                    "2",
+                    true)));
+    when(connector.listActivities(any(), anyLong(), eq("2")))
+        .thenReturn(ConnectorResult.failure(ConnectorResult.Status.RETRYABLE_FAILURE, "HTTP_503", "平台限流"))
+        .thenReturn(
+            ConnectorResult.success(
+                new ActivityPage(
+                    List.of(new RemoteActivity("p2-1", 631_105_600_000L, "第二页骑行", 35000.0, null, Map.of())),
+                    null,
+                    false)));
+    when(connector.downloadFit(any(), argThat(a -> a != null && "p1-1".equals(a.remoteActivityId()))))
+        .thenReturn(ConnectorResult.success(new FitDownload(p1Ride, "p1.fit")));
+    when(connector.downloadFit(any(), argThat(a -> a != null && "p2-1".equals(a.remoteActivityId()))))
+        .thenReturn(ConnectorResult.success(new FitDownload(p2Ride, "p2.fit")));
+
+    String pullJson =
+        mvc.perform(
+                post("/api/v1/activities/pull").header("Authorization", "Bearer " + login.token()))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    String jobId = store.json.readTree(pullJson).get("jobIds").get(0).asText();
+    jobs.runOne(jobId);
+
+    var midRow = store.one("SELECT status,payload_json FROM sync_job WHERE id=?", jobId);
+    assertEquals("RETRY", midRow.get("status"));
+    assertEquals("2", store.decode(CloudStore.str(midRow, "payload_json")).get("cursor"));
+
+    store.db.update("UPDATE sync_job SET next_run_at=0 WHERE id=?", jobId);
+    jobs.runOne(jobId);
+
+    verify(connector, times(1)).listActivities(any(), anyLong(), isNull());
+    verify(connector, times(2)).listActivities(any(), anyLong(), eq("2"));
+    mvc.perform(
+            get("/api/v1/activities/pull")
+                .param("jobIds", jobId)
+                .header("Authorization", "Bearer " + login.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.jobs[0].status").value("SUCCEEDED"))
+        .andExpect(jsonPath("$.totals.pages").value(2))
+        .andExpect(jsonPath("$.totals.imported").value(2));
+  }
+
+  @Test
+  void activityListFiltersMergeIntoCandidateAndDeleteWorkEndToEnd() throws Exception {
+    Login login = login(), other = login();
+    String corosAccount = account(login);
+    byte[] rideBase = rideFit(10_000, 2, 3_600_000, 3_500_000, 4_219_500, 148, 1);
+    byte[] rideSimilar = rideFit(10_240, 2, 3_250_000, 3_150_000, 3_950_000, 149, 200);
+    byte[] run = rideFit(50_000, 1, 1_800_000, 1_750_000, 1_000_000, 155, 1);
+
+    var r1 = activities.importFit(login.user(), rideBase, "COROS", corosAccount, "c-1", "晨骑太湖");
+    var r2 = activities.importFit(login.user(), rideSimilar, "LOCAL", null, null, null);
+    var r3 = activities.importFit(login.user(), run, "LOCAL", null, null, "傍晚慢跑");
+
+    String candidateId = r1.get("activityId").toString();
+    String reviewId = r2.get("activityId").toString();
+    String runId = r3.get("activityId").toString();
+    assertEquals("NEEDS_REVIEW", r2.get("dedupAction"));
+    assertEquals(true, r2.get("needsReview"));
+
+    mvc.perform(
+            get("/api/v1/activities")
+                .param("filter", "RUNNING")
+                .header("Authorization", "Bearer " + login.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.total").value(1))
+        .andExpect(jsonPath("$.items[0].id").value(runId));
+
+    mvc.perform(
+            get("/api/v1/activities")
+                .param("filter", "REVIEW")
+                .header("Authorization", "Bearer " + login.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.total").value(1))
+        .andExpect(jsonPath("$.items[0].id").value(reviewId));
+
+    mvc.perform(
+            get("/api/v1/activities")
+                .param("query", "太湖")
+                .param("platform", "COROS")
+                .header("Authorization", "Bearer " + login.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.total").value(1))
+        .andExpect(jsonPath("$.items[0].id").value(candidateId));
+
+    mvc.perform(
+            get("/api/v1/activities")
+                .param("sort", "OLDEST")
+                .header("Authorization", "Bearer " + login.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.items[0].id").value(candidateId));
+
+    // 合并到候选活动：迁移副本并移除重复活动记录。
+    mvc.perform(
+            post("/api/v1/activities/" + reviewId + "/review")
+                .header("Authorization", "Bearer " + login.token())
+                .contentType("application/json")
+                .content("{\"decision\":\"MERGE_INTO_CANDIDATE\"}"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.activityId").value(candidateId))
+        .andExpect(jsonPath("$.merged").value(true))
+        .andExpect(jsonPath("$.movedVariants").value(1));
+
+    mvc.perform(
+            get("/api/v1/activities/" + reviewId)
+                .header("Authorization", "Bearer " + login.token()))
+        .andExpect(status().isNotFound());
+    mvc.perform(
+            get("/api/v1/activities/" + candidateId)
+                .header("Authorization", "Bearer " + login.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.variantCount").value(2));
+
+    // 非所有者不可删除，所有者删除后磁盘文件与记录均清理。
+    mvc.perform(
+            delete("/api/v1/activities/" + runId)
+                .header("Authorization", "Bearer " + other.token()))
+        .andExpect(status().isNotFound());
+    mvc.perform(
+            delete("/api/v1/activities/" + runId)
+                .header("Authorization", "Bearer " + login.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.success").value(true));
+    mvc.perform(
+            get("/api/v1/activities/" + runId)
+                .header("Authorization", "Bearer " + login.token()))
+        .andExpect(status().isNotFound());
+    mvc.perform(
+            get("/api/v1/activities/" + runId + "/file")
+                .header("Authorization", "Bearer " + login.token()))
+        .andExpect(status().isNotFound());
+  }
+
+  private static byte[] rideFit(
+      int startTimeSec,
+      int sport,
+      int elapsedMs,
+      int movingMs,
+      int distanceCm,
+      int avgHr,
+      int manufacturer) {
+    var body = new ByteArrayOutputStream();
+    // Local 0: file_id (global 0), fields: type(0,1,0), manufacturer(1,2,0x84)
+    body.writeBytes(new byte[] {0x40, 0, 0, 0, 0, 2, 0, 1, 0, 1, 2, (byte) 0x84});
+    body.write(0);
+    body.write(4);
+    body.writeBytes(ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN).putShort((short) manufacturer).array());
+
+    // Local 2: record (global 20), fields: lat(0,4,0x85), lon(1,4,0x85), timestamp(253,4,0x86)
+    body.writeBytes(
+        new byte[] {0x42, 0, 0, 20, 0, 3, 0, 4, (byte) 0x85, 1, 4, (byte) 0x85, (byte) 253, 4, (byte) 0x86});
+    for (int i = 0; i < 2; i++) {
+      body.write(2);
+      body.writeBytes(
+          ByteBuffer.allocate(4)
+              .order(ByteOrder.LITTLE_ENDIAN)
+              .putInt(360_000_000 + i * 50_000)
+              .array());
+      body.writeBytes(
+          ByteBuffer.allocate(4)
+              .order(ByteOrder.LITTLE_ENDIAN)
+              .putInt(1_430_000_000 + i * 50_000)
+              .array());
+      body.writeBytes(
+          ByteBuffer.allocate(4)
+              .order(ByteOrder.LITTLE_ENDIAN)
+              .putInt(startTimeSec + i * 600)
+              .array());
+    }
+
+    // Local 1: session (global 18)
+    body.writeBytes(
+        new byte[] {
+          0x41,
+          0,
+          0,
+          18,
+          0,
+          6,
+          2,
+          4,
+          (byte) 0x86,
+          5,
+          1,
+          0,
+          7,
+          4,
+          (byte) 0x86,
+          8,
+          4,
+          (byte) 0x86,
+          9,
+          4,
+          (byte) 0x86,
+          16,
+          1,
+          2
+        });
+    body.write(1);
+    body.writeBytes(
+        ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(startTimeSec).array());
+    body.write(sport);
+    for (int value : new int[] {elapsedMs, movingMs, distanceCm})
+      body.writeBytes(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array());
+    body.write(avgHr);
+
+    byte[] data = body.toByteArray(), bytes = new byte[14 + data.length + 2];
+    var buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+    buffer
+        .put((byte) 14)
+        .put((byte) 0x10)
+        .putShort((short) 2100)
+        .putInt(data.length)
+        .put(new byte[] {'.', 'F', 'I', 'T'});
+    buffer.putShort((short) crc(bytes, 12));
+    buffer.put(data).putShort((short) crc(bytes, bytes.length - 2));
+    return bytes;
   }
 
   private static byte[] fit() {

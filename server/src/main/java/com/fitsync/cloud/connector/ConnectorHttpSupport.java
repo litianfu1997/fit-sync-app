@@ -8,6 +8,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.PushbackInputStream;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
@@ -25,8 +26,11 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.Base64;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
+import java.util.zip.GZIPInputStream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
@@ -96,7 +100,7 @@ abstract class ConnectorHttpSupport implements PlatformConnector {
   }
 
   /** 只重试明确返回未授权的那一个请求，防止已受理的上传被整条流水线重复执行。 */
-  ConnectorResult<JsonNode> call(
+  protected final ConnectorResult<JsonNode> call(
       Session session, String method, URI uri, byte[] body, String contentType) {
     ConnectorResult<JsonNode> first = callOnce(session, method, uri, body, contentType);
     if (first.status() != REQUIRES_LOGIN
@@ -110,7 +114,7 @@ abstract class ConnectorHttpSupport implements PlatformConnector {
     return callOnce(session, method, uri, body, contentType);
   }
 
-  private ConnectorResult<JsonNode> callOnce(
+  protected final ConnectorResult<JsonNode> callOnce(
       Session session, String method, URI uri, byte[] body, String contentType) {
     if (session == null || blank(session.accessToken())) return needsLogin();
     try {
@@ -166,10 +170,99 @@ abstract class ConnectorHttpSupport implements PlatformConnector {
   WireResponse send(HttpRequest request, int maxBytes) throws IOException, InterruptedException {
     HttpResponse<InputStream> response =
         client.send(request, HttpResponse.BodyHandlers.ofInputStream());
-    try (InputStream stream = response.body()) {
+    try (InputStream raw = response.body()) {
       long length = response.headers().firstValueAsLong("Content-Length").orElse(-1);
       if (length > maxBytes) throw new IOException("响应超过大小限制");
-      return new WireResponse(response.statusCode(), readBounded(stream, maxBytes));
+      String encoding = response.headers().firstValue("Content-Encoding").orElse("").trim().toLowerCase(Locale.ROOT);
+      if ("gzip".equals(encoding)) {
+        PushbackInputStream pb = new PushbackInputStream(raw, 1);
+        int first = pb.read();
+        if (first == -1) {
+          return new WireResponse(response.statusCode(), new byte[0], response.headers().map());
+        }
+        pb.unread(first);
+        try (InputStream gzip = new GZIPInputStream(pb)) {
+          return new WireResponse(response.statusCode(), readBounded(gzip, maxBytes), response.headers().map());
+        }
+      }
+      return new WireResponse(response.statusCode(), readBounded(raw, maxBytes), response.headers().map());
+    }
+  }
+
+  /** 有界二进制下载；文件与 JSON 分开限制，避免把网页错误响应无限读入内存。 */
+  ConnectorResult<FitDownload> downloadBytes(
+      HttpRequest request, String fileName) {
+    try {
+      WireResponse response = send(request, MAX_FIT_BYTES);
+      if (response.status() == 404 || response.status() == 410)
+        return fail(PERMANENT_FAILURE, "NO_ORIGINAL_FILE", "平台未保留该活动的原始 FIT 文件");
+      if (response.status() == 401 || response.status() == 403) return needsLogin();
+      if (response.status() == 408 || response.status() == 429 || response.status() >= 500)
+        return statusFailure(response.status(), "平台文件");
+      if (response.status() < 200 || response.status() >= 300)
+        return fail(PERMANENT_FAILURE, "HTTP_" + response.status(), "平台文件下载失败");
+      byte[] bytes = response.bytes();
+      byte[] fit = extractFit(bytes);
+      if (fit == null)
+        return fail(PERMANENT_FAILURE, "INVALID_FIT", "平台返回的内容不是有效的原始 FIT");
+      return ConnectorResult.success(new FitDownload(fit, safeFileName(fileName)));
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      return fail(RETRYABLE_FAILURE, "INTERRUPTED", "FIT 下载被中断");
+    } catch (Exception e) {
+      return fail(RETRYABLE_FAILURE, "FIT_DOWNLOAD_FAILED", "FIT 下载失败或超过大小限制");
+    }
+  }
+
+  static String cookie(String header, String name) {
+    if (header == null) return null;
+    for (String part : header.split(";")) {
+      String[] pair = part.trim().split("=", 2);
+      if (pair.length == 2 && pair[0].trim().equalsIgnoreCase(name) && !pair[1].isBlank())
+        return pair[1].trim().replaceAll("^\"|\"$", "");
+    }
+    return null;
+  }
+
+  /** 按 host 白名单校验，绝不把父域后缀混淆地址当成平台。 */
+  static boolean httpsHost(String raw, Set<String> allowedHosts) {
+    try {
+      URI uri = URI.create(raw);
+      String host = uri.getHost();
+      return "https".equalsIgnoreCase(uri.getScheme())
+          && host != null
+          && uri.getUserInfo() == null
+          && uri.getFragment() == null
+          && (uri.getPort() == -1 || uri.getPort() == 443)
+          && allowedHosts.contains(host.toLowerCase(Locale.ROOT));
+    } catch (RuntimeException e) {
+      return false;
+    }
+  }
+
+  static byte[] multipart(String boundary, List<Part> parts) throws IOException {
+    ByteArrayOutputStream output = new ByteArrayOutputStream();
+    for (Part part : parts) {
+      output.write(("--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + part.name + "\""
+          + (part.fileName == null ? "" : "; filename=\"" + part.fileName + "\"") + "\r\n")
+          .getBytes(StandardCharsets.UTF_8));
+      if (part.fileName != null)
+        output.write(("Content-Type: " + part.contentType + "\r\n").getBytes(StandardCharsets.UTF_8));
+      output.write("\r\n".getBytes(StandardCharsets.UTF_8));
+      output.write(part.content);
+      output.write("\r\n".getBytes(StandardCharsets.UTF_8));
+    }
+    output.write(("--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
+    return output.toByteArray();
+  }
+
+  record Part(String name, String fileName, String contentType, byte[] content) {
+    static Part field(String name, String value) {
+      return new Part(name, null, null, value.getBytes(StandardCharsets.UTF_8));
+    }
+
+    static Part file(String name, String fileName, byte[] content) {
+      return new Part(name, fileName, "application/octet-stream", content);
     }
   }
 
@@ -197,7 +290,7 @@ abstract class ConnectorHttpSupport implements PlatformConnector {
     }
   }
 
-  boolean trustedObjectUrl(String url) {
+  protected boolean trustedObjectUrl(String url) {
     try {
       URI uri = URI.create(url);
       return "https".equalsIgnoreCase(uri.getScheme())
@@ -313,7 +406,26 @@ abstract class ConnectorHttpSupport implements PlatformConnector {
       int offset,
       int checks) {}
 
-  record WireResponse(int status, byte[] bytes) {}
+  record WireResponse(int status, byte[] bytes, Map<String, List<String>> headers) {
+    WireResponse(int status, byte[] bytes) {
+      this(status, bytes, Map.of());
+    }
+
+    String header(String name) {
+      return headers.entrySet().stream()
+          .filter(entry -> entry.getKey().equalsIgnoreCase(name))
+          .flatMap(entry -> entry.getValue().stream())
+          .findFirst()
+          .orElse(null);
+    }
+
+    List<String> cookies() {
+      return headers.entrySet().stream()
+          .filter(entry -> entry.getKey().equalsIgnoreCase("Set-Cookie"))
+          .flatMap(entry -> entry.getValue().stream())
+          .toList();
+    }
+  }
 
   static byte[] readBounded(InputStream stream, int maxBytes) throws IOException {
     byte[] value = stream.readNBytes(maxBytes + 1);
@@ -443,6 +555,14 @@ abstract class ConnectorHttpSupport implements PlatformConnector {
   static Double distance(JsonNode root, String key) {
     double value = root.path(key).asDouble(0);
     return value > 0 ? value : null;
+  }
+
+  static Double distance(JsonNode root, String... keys) {
+    for (String key : keys) {
+      Double value = distance(root, key);
+      if (value != null) return value;
+    }
+    return null;
   }
 
   static <T> ConnectorResult<T> fail(ConnectorResult.Status status, String code, String message) {

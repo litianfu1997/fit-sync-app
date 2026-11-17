@@ -27,12 +27,22 @@ public record ConnectorResult<T>(
   }
 
   public static <T> ConnectorResult<T> processing(String token) {
-    return new ConnectorResult<>(Status.PROCESSING, null, null, "等待目标平台解析并确认活动", token, 60_000);
+    return processing(token, 60_000);
+  }
+
+  public static <T> ConnectorResult<T> processing(String token, long retryAfterMillis) {
+    return new ConnectorResult<>(
+        Status.PROCESSING, null, null, "等待目标平台解析并确认活动", token, Math.max(1_000, retryAfterMillis));
   }
 
   public static <T> ConnectorResult<T> failure(Status status, String code, String message) {
+    return failure(status, code, message, status == Status.RETRYABLE_FAILURE ? 60_000 : 0);
+  }
+
+  public static <T> ConnectorResult<T> failure(
+      Status status, String code, String message, long retryAfterMillis) {
     return new ConnectorResult<>(
-        status, null, code, message, null, status == Status.RETRYABLE_FAILURE ? 60_000 : 0);
+        status, null, code, message, null, Math.max(0, retryAfterMillis));
   }
 
   public <R> ConnectorResult<R> castFailure() {

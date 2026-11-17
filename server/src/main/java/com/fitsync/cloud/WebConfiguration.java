@@ -82,6 +82,7 @@ public class WebConfiguration implements WebMvcConfigurer {
                 || path.equals("/api/v1/auth/wechat")
                 || path.equals("/api/v1/auth/register")
                 || path.equals("/api/v1/auth/login")
+                || path.equals(StravaOAuthService.CALLBACK_PATH)
                 || challenge;
         if (path.startsWith("/api/v1/auth/") && !request.getMethod().equals("OPTIONS")) {
           long current = System.currentTimeMillis() / 60000;

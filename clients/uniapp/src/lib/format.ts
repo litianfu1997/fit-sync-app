@@ -13,6 +13,17 @@ export const platformInitials: Record<string, string> = {
   LOCAL: "本", ONELAP: "迈", XINGZHE: "行", GARMIN: "G",
   COROS: "C", IGPSPORT: "iG", STRAVA: "S",
 };
+export const sportNames: Record<string, string> = {
+  CYCLING: "骑行",
+  INDOOR_CYCLING: "室内骑行",
+  MTB: "山地骑行",
+  GRAVEL: "砾石骑行",
+  RUNNING: "跑步",
+  OTHER: "其他运动",
+  UNKNOWN: "骑行",
+};
+export const sportLabel = (sport?: string) =>
+  sportNames[sport || ""] || "骑行";
 export const km = (meters?: number | null) =>
   meters == null
     ? "—"
@@ -23,6 +34,12 @@ export function duration(seconds?: number | null) {
   return minutes >= 60
     ? `${Math.floor(minutes / 60)}小时${minutes % 60}分`
     : `${minutes}分钟`;
+}
+export function fileSize(bytes?: number | null) {
+  if (!bytes || bytes <= 0) return "";
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
 }
 export function date(value?: number) {
   if (!value) return "尚无记录";

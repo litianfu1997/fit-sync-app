@@ -1,11 +1,15 @@
 package com.fitsync.cloud;
 
 import jakarta.servlet.http.HttpServletRequest;
+import java.net.URI;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
+import org.springframework.web.util.HtmlUtils;
 
 @RestController
 @RequestMapping("/api/v1")
@@ -14,6 +18,7 @@ public class ApiController {
   private final DashboardService dashboards;
   private final ActivityService activities;
   private final AccountService accounts;
+  private final StravaOAuthService stravaOAuth;
   private final JobService jobs;
   private final String nativeAd;
 
@@ -22,12 +27,14 @@ public class ApiController {
       DashboardService dashboards,
       ActivityService activities,
       AccountService accounts,
+      StravaOAuthService stravaOAuth,
       JobService jobs,
       @Value("${fitsync.native-ad-unit-id:}") String nativeAd) {
     this.auth = auth;
     this.dashboards = dashboards;
     this.activities = activities;
     this.accounts = accounts;
+    this.stravaOAuth = stravaOAuth;
     this.jobs = jobs;
     this.nativeAd = nativeAd;
   }
@@ -40,12 +47,12 @@ public class ApiController {
   public Map<String, Object> config() {
     var platforms =
         List.of(
-            platform("COROS", "高驰 COROS", true),
-            platform("IGPSPORT", "iGPSPORT", true),
-            platform("ONELAP", "迈金", false),
-            platform("XINGZHE", "行者", false),
-            platform("GARMIN", "Garmin", false),
-            platform("STRAVA", "Strava", false));
+            platform("COROS", "高驰 COROS", "PASSWORD"),
+            platform("IGPSPORT", "iGPSPORT", "PASSWORD"),
+            platform("ONELAP", "迈金", "PASSWORD"),
+            platform("XINGZHE", "行者", "PASSWORD"),
+            platform("GARMIN", "Garmin 中国站", "PASSWORD"),
+            platform("STRAVA", "Strava", "OAUTH"));
     return Map.of(
         "wechatLoginEnabled",
         auth.wechatEnabled(),
@@ -55,6 +62,8 @@ public class ApiController {
         auth.passwordLoginEnabled(),
         "devLoginEnabled",
         auth.devEnabled(),
+        "stravaOAuthConfigured",
+        stravaOAuth.isConfigured(),
         "ads",
         Map.of(
             "enabled",
@@ -69,14 +78,14 @@ public class ApiController {
         platforms);
   }
 
-  private static Map<String, Object> platform(String code, String name, boolean supported) {
+  private static Map<String, Object> platform(String code, String name, String authMode) {
     return Map.of(
         "code",
         code,
         "name",
         name,
         "authMode",
-        supported ? "PASSWORD" : "UNAVAILABLE",
+        authMode,
         "experimental",
         true);
   }
@@ -199,9 +208,33 @@ public class ApiController {
   public Map<String, Object> activities(
       HttpServletRequest request,
       @RequestParam(defaultValue = "0") int page,
-      @RequestParam(defaultValue = "20") int size) {
+      @RequestParam(defaultValue = "20") int size,
+      @RequestParam(required = false) String query,
+      @RequestParam(defaultValue = "ALL") String filter,
+      @RequestParam(required = false) String platform,
+      @RequestParam(defaultValue = "NEWEST") String sort) {
     validatePage(page);
-    return activities.page(user(request), page, size);
+    return activities.page(user(request), page, size, query, filter, platform, sort);
+  }
+
+  public record PullActivities(
+      List<String> accountIds, List<String> platforms, Integer historyDays) {}
+
+  @PostMapping("/activities/pull")
+  public Map<String, Object> pullActivities(
+      HttpServletRequest request, @RequestBody(required = false) PullActivities body) {
+    var req = body == null ? new PullActivities(null, null, null) : body;
+    return jobs.pullFromPlatforms(
+        user(request),
+        req.accountIds(),
+        req.platforms(),
+        req.historyDays() == null ? 90 : req.historyDays());
+  }
+
+  @GetMapping("/activities/pull")
+  public Map<String, Object> pullStatus(
+      HttpServletRequest request, @RequestParam(required = false) List<String> jobIds) {
+    return jobs.pullStatus(user(request), jobIds);
   }
 
   @PostMapping(value = "/activities/import", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
@@ -215,6 +248,12 @@ public class ApiController {
   @GetMapping("/activities/{id}")
   public Map<String, Object> activity(HttpServletRequest request, @PathVariable String id) {
     return activities.detail(user(request), id);
+  }
+
+  @DeleteMapping("/activities/{id}")
+  public Map<String, Object> deleteActivity(HttpServletRequest request, @PathVariable String id) {
+    activities.delete(user(request), id);
+    return Map.of("success", true);
   }
 
   @GetMapping("/activities/{id}/file")
@@ -232,8 +271,8 @@ public class ApiController {
   @PostMapping("/activities/{id}/review")
   public Map<String, Object> review(
       HttpServletRequest request, @PathVariable String id, @RequestBody ActivityReview body) {
-    var result = activities.keepSeparate(user(request), id, body.decision());
-    jobs.plan(user(request), id);
+    var result = activities.review(user(request), id, body.decision());
+    jobs.plan(user(request), result.get("activityId").toString());
     return result;
   }
 
@@ -242,8 +281,80 @@ public class ApiController {
     return accounts.list(user(request));
   }
 
-  public record Connect(
-      String platform, String username, String password, boolean storeCredentials) {
+  public record StravaOAuthStart(
+      String clientId, String clientSecret, String redirectUri, String returnUrl) {
+    @Override
+    public String toString() {
+      return "StravaOAuthStart[凭据已隐藏]";
+    }
+  }
+
+  @PostMapping("/accounts/oauth/strava/start")
+  public Map<String, Object> startStravaOAuth(
+      HttpServletRequest request,
+      @RequestBody(required = false) StravaOAuthStart body) {
+    var req = body == null ? new StravaOAuthStart(null, null, null, null) : body;
+    return stravaOAuth.start(
+        user(request),
+        req.clientId(),
+        req.clientSecret(),
+        req.redirectUri(),
+        req.returnUrl(),
+        request);
+  }
+
+  @GetMapping("/accounts/oauth/strava/{challengeId}")
+  public Map<String, Object> pollStravaOAuth(
+      HttpServletRequest request, @PathVariable String challengeId) {
+    return stravaOAuth.status(user(request), challengeId);
+  }
+
+  @GetMapping(value = "/accounts/oauth/strava/callback", produces = MediaType.TEXT_HTML_VALUE)
+  public ResponseEntity<String> stravaOAuthCallback(
+      @RequestParam(required = false) String state,
+      @RequestParam(required = false) String code,
+      @RequestParam(required = false) String scope,
+      @RequestParam(required = false) String error) {
+    var outcome = stravaOAuth.completeCallback(state, code, scope, error);
+    if (outcome.returnUrl() != null) {
+      String sep = outcome.returnUrl().contains("?") ? "&" : "?";
+      String target =
+          outcome.returnUrl()
+              + sep
+              + "stravaOAuth="
+              + (outcome.ok() ? "success" : "error")
+              + (outcome.ok()
+                  ? ""
+                  : "&stravaOAuthMsg="
+                      + URLEncoder.encode(outcome.message(), StandardCharsets.UTF_8));
+      return ResponseEntity.status(HttpStatus.FOUND).location(URI.create(target)).build();
+    }
+    String title = outcome.ok() ? "Strava 授权成功" : "Strava 授权未完成";
+    String badgeColor = outcome.ok() ? "#15803d" : "#b91c1c";
+    String html =
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+            + "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            + "<title>"
+            + HtmlUtils.htmlEscape(title)
+            + " · FitSync</title></head>"
+            + "<body style=\"font-family:system-ui,-apple-system,sans-serif;background:#f4f5f7;padding:32px;color:#111827;\">"
+            + "<div style=\"max-width:460px;margin:48px auto;background:#fff;border-radius:10px;padding:28px;border:1px solid #e5e7eb;\">"
+            + "<h2 style=\"margin:0 0 12px;color:"
+            + badgeColor
+            + ";\">"
+            + HtmlUtils.htmlEscape(title)
+            + "</h2>"
+            + "<p style=\"margin:0 0 16px;line-height:1.6;color:#374151;\">"
+            + HtmlUtils.htmlEscape(outcome.message())
+            + "</p>"
+            + "<p style=\"margin:0;font-size:13px;color:#6b7280;\">现在可以关闭此网页并回到 FitSync 页面或微信小程序。</p>"
+            + "</div></body></html>";
+    return ResponseEntity.status(outcome.ok() ? HttpStatus.OK : HttpStatus.BAD_REQUEST)
+        .contentType(MediaType.TEXT_HTML)
+        .body(html);
+  }
+
+  public record Connect(String platform, String username, String password, boolean storeCredentials) {
     @Override
     public String toString() {
       return "Connect[凭据已隐藏]";
@@ -254,6 +365,20 @@ public class ApiController {
   public Map<String, Object> account(HttpServletRequest request, @RequestBody Connect body) {
     return accounts.connect(
         user(request), body.platform(), body.username(), body.password(), body.storeCredentials());
+  }
+
+  public record WebSessionConnect(
+      String platform, String displayName, Map<String, String> session) {
+    @Override
+    public String toString() {
+      return "WebSessionConnect[凭据已隐藏]";
+    }
+  }
+
+  @PostMapping("/accounts/web-session")
+  public Map<String, Object> webSessionAccount(
+      HttpServletRequest request, @RequestBody WebSessionConnect body) {
+    return accounts.connectWeb(user(request), body.platform(), body.displayName(), body.session());
   }
 
   @DeleteMapping("/accounts/{id}")

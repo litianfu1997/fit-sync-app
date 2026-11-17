@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { go } from "../lib/api";
+import { go, session } from "../lib/api";
 import { theme, themeStyle } from "../lib/theme";
 const props = defineProps<{ active: string; title: string; subtitle?: string }>();
 const tabs = [
@@ -10,8 +10,19 @@ const tabs = [
   { id: "jobs", label: "任务", icon: "jobs" },
   { id: "settings", label: "设置", icon: "settings" },
 ];
-const primaryTabs = tabs.filter((tab) => ["overview", "activities", "settings"].includes(tab.id));
-const workspaceTabs = tabs.filter((tab) => ["overview", "sync", "jobs"].includes(tab.id));
+/** 未登录时页面只展示登录入口，导航不应出现。 */
+const signedIn = computed(() => !!session.token);
+const navTabs = computed(() => (signedIn.value ? tabs : []));
+const primaryTabs = computed(() =>
+  signedIn.value
+    ? tabs.filter((tab) => ["overview", "activities", "settings"].includes(tab.id))
+    : [],
+);
+const workspaceTabs = computed(() =>
+  signedIn.value
+    ? tabs.filter((tab) => ["overview", "sync", "jobs"].includes(tab.id))
+    : [],
+);
 const inWorkspace = computed(() => ["overview", "sync", "jobs"].includes(props.active));
 const primaryActive = computed(() => inWorkspace.value ? "overview" : props.active);
 const miniHeaderStyle: Record<string, string> = {};
@@ -30,7 +41,11 @@ function iconFor(icon: string, selected: boolean) {
 }
 </script>
 <template>
-  <view class="app-shell" :class="{ 'theme-dark': theme.dark }" :style="themeStyle">
+  <view
+    class="app-shell"
+    :class="{ 'theme-dark': theme.dark, 'guest-mode': !signedIn }"
+    :style="themeStyle"
+  >
     <view class="desktop-sidebar">
       <view class="brand"
         ><image class="brand-mark" src="/static/logo.svg" /><view
@@ -39,7 +54,7 @@ function iconFor(icon: string, selected: boolean) {
         ></view
       >
       <button
-        v-for="tab in tabs"
+        v-for="tab in navTabs"
         :key="tab.id"
         class="side-nav"
         :class="{ 'side-nav-active': active === tab.id }"
@@ -67,7 +82,7 @@ function iconFor(icon: string, selected: boolean) {
               subtitle
             }}</text></view
           ><slot name="action" /></view>
-        <view v-if="inWorkspace" class="workspace-tabs">
+        <view v-if="inWorkspace && workspaceTabs.length" class="workspace-tabs">
           <button v-for="tab in workspaceTabs" :key="tab.id" :class="{ selected: active === tab.id }" @click="go(tab.id)">{{ tab.label }}</button>
         </view>
         <slot /></view>

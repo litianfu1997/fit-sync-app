@@ -33,9 +33,9 @@ npm.cmd ci
 npm.cmd run dev:h5
 ```
 
-打开 [本地网页](http://127.0.0.1:5173)。H5 的 `/api` 经 Vite 代理到 Java 服务。可直接用用户名密码**注册**正式业务账号（Web 与小程序通用），也可选择本地开发登录：后者每次登录会新建一个独立用户，页面刷新保留同一会话，但仅用于开发，不是正式账号找回机制。
+打开 [本地网页](http://127.0.0.1:5273)（端口由 `clients/uniapp/vite.config.ts` 的 `server.port` 决定）。H5 的 `/api` 经 Vite 代理到 Java 服务。可直接用用户名密码**注册**正式业务账号（Web 与小程序通用），也可选择本地开发登录：后者每次登录会新建一个独立用户，页面刷新保留同一会话，但仅用于开发，不是正式账号找回机制。
 
-如果本机 5173 端口不可用，可执行 `npm.cmd run dev:h5 -- --port 4180`，并在启动 Java 前设置 `FITSYNC_CORS_ORIGINS=http://127.0.0.1:4180,http://localhost:4180`。变更后重启服务；跨域错误不能通过放开所有来源或关闭鉴权来解决。
+后端 CORS 白名单必须包含页面来源，否则登录/注册会返回 `403 Invalid CORS request`（`GET /api/v1/config` 同样失败）。本地默认已放行 5273 与 5173。若改用其他端口，例如 `npm.cmd run dev:h5 -- --port 4180`，要在启动 Java 前设置 `FITSYNC_CORS_ORIGINS=http://127.0.0.1:4180,http://localhost:4180`。变更后重启服务；跨域错误不能通过放开所有来源或关闭鉴权来解决。
 
 已有构建产物时，`cloud.ps1 -Task run -SkipBuild ...` 可跳过构建。也可按[后端说明](../server/README.md)直接启动 JAR。
 
@@ -49,7 +49,14 @@ python scripts/generate-sample-fit.py
 
 生成 `.cache/samples/sample-ride.fit`，不包含任何真实账号或私人路线。登录后进入「活动」选择文件并导入，可查看指标、轨迹并下载原始 FIT；再次导入同一文件应提示已有记录，不新增活动。
 
-「同步中心」可连接 COROS 或 iGPSPORT 中国站账号，开启托管凭据前需明确勾选授权。真实凭据仅提交给自己的 Java 服务，前端不持久化密码。无账号时可以验证活动导入和查询，但不能据此判断远端同步已成功。
+「同步中心」可连接六平台：COROS、iGPSPORT 中国站使用账号密码并明确勾选授权；迈金、行者、Garmin 中国站和 Strava 使用网页会话。网页会话有两种导入方式：
+
+- **自动（桌面 Chrome／Edge）**：安装 [FitSync 会话助手扩展](../clients/browser-extension/README.md)，在网页点「弹窗登录并自动读取」。扩展弹出平台官方登录窗口，你完成人工登录和验证码后，扩展读取 Cookie 并提交，窗口自动关闭。
+- **手动**：在浏览器登录平台，从开发者工具复制 Cookie（迈金另需 token，Garmin 可补充 CSRF/SSO Cookie），确认交由当前 FitSync 云服务加密保存。
+
+无论哪种方式，会话值都不会写入 FitSync 网页的存储、URL 或日志。使用扩展时需把扩展 Origin（`chrome-extension://<扩展ID>`）加入 `FITSYNC_CORS_ORIGINS`，否则会收到 `403 Invalid CORS request`。
+
+Garmin 登录页由 Cloudflare Turnstile 保护，账号密码不能交给云端自动登录；二次认证和验证码必须在平台官方页面由本人完成。GitHub stub／集成测试不能替代真实账号验证，首次部署应先用少量活动验证拉取、下载、上传与续期。无账号时可以验证活动导入和查询，但不能据此判断远端同步已成功。
 
 疑似重复活动会暂停自动投递。可在详情查看候选，明确确认「保留为独立活动」后恢复投递；本版尚未实现跨活动人工合并。
 

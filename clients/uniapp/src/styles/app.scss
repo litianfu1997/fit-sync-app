@@ -168,8 +168,9 @@ image { display: block; flex-shrink: 0; }
 .activity-row { width: 100%; min-height: 72px; display: flex; align-items: center; gap: 12px; padding: 16px 0; text-align: left; border-bottom: 1px solid var(--fit-border); border-radius: 0; }
 .activity-row:last-child { border-bottom: 0; }
 .activity-row:hover .activity-title { color: var(--fit-primary); }
-.ride-icon { width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; border-radius: 4px; background: var(--fit-surface-variant); flex-shrink: 0; }
+.ride-icon { width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; border-radius: 4px; background: var(--fit-surface-variant); color: var(--fit-muted); flex-shrink: 0; }
 .ride-icon image { width: 24px; height: 24px; }
+.ride-thumb { width: 36px; height: 36px; display: block; }
 .activity-info { min-width: 0; flex: 1; }
 .activity-title { display: block; font-size: 14px; font-weight: 500; line-height: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .activity-meta { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; font-size: 12px; color: var(--fit-muted); margin-top: 4px; }
@@ -210,6 +211,15 @@ image { display: block; flex-shrink: 0; }
 .password-login .tiny { text-align: center; }
 .login-note { color: var(--fit-muted); font-size: 12px; text-align: center; }
 .login-form .text-button { align-self: center; }
+/* 未登录时只展示登录入口：收起侧边导航与移动标签栏，品牌移到页面顶部。 */
+.guest-mode .desktop-sidebar, .guest-mode .mobile-tabs { display: none; }
+.guest-mode .main-wrap { margin-left: 0; padding: 32px 32px 0; }
+.guest-mode .page-content, .guest-mode .page-footer { max-width: 960px; }
+.guest-mode .page-footer { border-top: 0; }
+.guest-mode .mobile-brand { display: flex; align-items: center; gap: 8px; max-width: 960px; margin: 0 auto 24px; }
+.guest-mode .mobile-brand .brand-mark { width: 32px; height: 32px; border-radius: 6px; }
+.guest-mode .mobile-brand .brand-name { font-size: 22px; line-height: 28px; }
+.guest-mode .mobile-brand .mobile-tag { margin-left: auto; font-size: 12px; color: var(--fit-muted); }
 .input { width: 100%; height: 48px; min-height: 48px; background: var(--fit-surface); border: 1px solid var(--fit-outline); border-radius: 4px; padding: 12px; color: var(--fit-on-surface); font-size: 14px; }
 .input:focus { border-color: var(--fit-primary); }
 .input::placeholder { color: var(--fit-muted); }
@@ -234,6 +244,57 @@ image { display: block; flex-shrink: 0; }
 .info-notice { color: var(--fit-info); background: var(--fit-info-container); border-color: var(--fit-info); justify-content: flex-start; }
 .info-notice image { width: 24px; height: 24px; }
 .info-notice text { flex: 1; }
+.web-session-guide { flex-direction: column; align-items: stretch; gap: 6px; grid-column: 1 / -1; }
+.web-session-guide text { flex: none; line-height: 1.55; }
+.web-session-guide .guide-step { padding-left: 4px; }
+.extension-panel { display: flex; flex-direction: column; gap: 10px; grid-column: 1 / -1; padding: 14px 16px; border: 1px solid var(--fit-border); border-radius: 6px; background: var(--fit-surface-variant); }
+.extension-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.extension-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.extension-actions .btn { text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }
+.session-textarea { height: 92px; min-height: 92px; line-height: 1.5; }
+.session-field-wide { grid-column: 1 / -1; }
+.otp-input-row { display: flex; gap: 8px; align-items: center; }
+.otp-input-row .input { flex: 1; min-width: 0; }
+.activities-entry-grid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(280px, 1fr); gap: 24px; align-items: start; }
+.activities-entry-grid > .card { margin-bottom: 0; }
+.activities-entry-grid .import-card { flex-direction: column; align-items: stretch; gap: 16px; }
+.activities-entry-grid .import-card > .btn { width: 100%; }
+.pull-section { margin-top: 16px; }
+.pull-section .field-label { margin-bottom: 8px; }
+.pull-empty { display: flex; flex-direction: column; gap: 12px; align-items: flex-start; padding-top: 4px; }
+.pull-actions { margin-top: 20px; }
+.pull-progress-list { margin-top: 16px; padding: 12px; border: 1px solid var(--fit-border); border-radius: 6px; background: var(--fit-surface-low); display: flex; flex-direction: column; gap: 8px; }
+.pull-progress-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.pull-progress-info { flex: 1; min-width: 0; }
+.compact-notice { margin-top: 16px; margin-bottom: 0; }
+.filter-toolbar { padding: 12px 16px; margin-bottom: 16px; display: flex; flex-direction: column; gap: 12px; }
+.search-row { display: flex; gap: 8px; align-items: center; }
+.search-input { flex: 1; min-width: 0; height: 44px; min-height: 44px; }
+.filter-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.filter-chips, .filter-right { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.filter-chip {
+  min-height: 36px;
+  padding: 6px 12px;
+  border-radius: 4px;
+  border: 1px solid var(--fit-border);
+  background: var(--fit-surface-low);
+  color: var(--fit-muted);
+  font-size: 13px;
+  line-height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.filter-chip.selected {
+  background: var(--fit-primary-container);
+  border-color: var(--fit-primary);
+  color: var(--fit-on-primary-container);
+  font-weight: 500;
+}
+.destination-chip.expired { border-color: var(--fit-warning); }
+.connected-hint-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+.copy-account-left { display: flex; align-items: center; gap: 12px; min-width: 0; flex: 1; }
+.danger-zone { display: flex; justify-content: center; margin: 8px 0 24px; }
 .import-card { display: flex; justify-content: space-between; align-items: center; gap: 24px; }
 .import-copy { display: flex; gap: 16px; align-items: center; }
 .feature-icon { width: 48px; height: 48px; background: var(--fit-primary-container); border-radius: 4px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
@@ -258,7 +319,26 @@ image { display: block; flex-shrink: 0; }
 .track-caption { display: block; padding: 12px; color: var(--fit-muted); font-size: 12px; text-align: center; }
 .detail-stats .stat-card { min-height: 120px; }
 .platform-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
-.platform-tile { display: flex; align-items: center; gap: 12px; padding: 12px; border: 1px solid var(--fit-border); border-radius: 4px; background: var(--fit-surface); }
+.platform-tile {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--fit-border);
+  border-radius: 4px;
+  background: var(--fit-surface);
+  cursor: pointer;
+  transition: border-color .18s, background-color .18s, box-shadow .18s;
+}
+.platform-tile:hover {
+  border-color: var(--fit-primary);
+  background: var(--fit-surface-variant);
+}
+.platform-tile.active {
+  border-color: var(--fit-primary);
+  background: var(--fit-primary-container);
+  box-shadow: 0 0 0 1px var(--fit-primary);
+}
 .platform-monogram { width: 36px; height: 36px; border-radius: 4px; background: var(--fit-surface-variant); color: var(--fit-muted); display: flex; align-items: center; justify-content: center; font-weight: 700; flex-shrink: 0; }
 @mixin platform-avatar($brand) {
   background: rgba($brand, .14);
@@ -347,6 +427,8 @@ image { display: block; flex-shrink: 0; }
   .desktop-sidebar { width: 200px; }
   .main-wrap { margin-left: 200px; padding: 32px 24px 0; }
   .overview-columns { grid-template-columns: 1fr; gap: 0; }
+  .activities-entry-grid { grid-template-columns: 1fr; gap: 0; }
+  .activities-entry-grid > .card { margin-bottom: 24px; }
   .getting-started { display: none; }
   .platform-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .settings-columns { grid-template-columns: 1fr; gap: 0; }
@@ -380,6 +462,8 @@ image { display: block; flex-shrink: 0; }
   .distance { font-size: 20px; }
   .chevron { display: none; }
   .login-card { padding: 0; grid-template-columns: 1fr; }
+  .guest-mode .main-wrap { padding: 0 16px; }
+  .guest-mode .page-footer { padding-bottom: 24px; }
   .login-art { padding: 24px; border-right: 0; border-bottom: 1px solid var(--fit-border); }
   .login-logo { width: 40px; height: 40px; margin-bottom: 20px; }
   .login-title { font-size: 24px; line-height: 30px; }
