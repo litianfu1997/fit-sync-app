@@ -5,8 +5,10 @@ import { onLoad } from "@dcloudio/uni-app";
 import AppShell from "../../components/AppShell.vue";
 import SessionGate from "../../components/SessionGate.vue";
 import LoadState from "../../components/LoadState.vue";
-import TrackPreview from "../../components/TrackPreview.vue";
+import TrackMap from "../../components/TrackMap.vue";
+import SeriesChart from "../../components/SeriesChart.vue";
 import NativeAd from "../../components/NativeAd.vue";
+import { filterValidPoints } from "../../lib/geo";
 import {
   api,
   apiBase,
@@ -14,6 +16,7 @@ import {
   detail,
   go,
   messageOf,
+  openMap,
   session,
   toast,
 } from "../../lib/api";
@@ -54,6 +57,18 @@ const platformsLabel = computed(() => {
     : [ride.sourcePlatform || "LOCAL"];
   return [...new Set(list)].map((p) => platformName(p)).join(" · ");
 });
+
+const trackPoints = computed(() => filterValidPoints(activity.value?.track));
+const speedSeries = computed(() =>
+  (activity.value?.profile || [])
+    .map((p) => (p.speedMps != null && Number.isFinite(p.speedMps) ? p.speedMps * 3.6 : null))
+    .filter((v): v is number => v !== null && v >= 0),
+);
+const altitudeSeries = computed(() =>
+  (activity.value?.profile || [])
+    .map((p) => (p.altitudeMeters != null && Number.isFinite(p.altitudeMeters) ? p.altitudeMeters : null))
+    .filter((v): v is number => v !== null),
+);
 
 function copyForAccount(account: Account) {
   return activity.value?.copies?.find(
@@ -321,12 +336,20 @@ async function download() {
           ><view class="card route-card"
             ><view class="card-heading"
               ><text class="section-title">沿途轨迹</text
-              ><text class="muted"
-                >{{ activity.track?.length || 0 }} 个采样点</text
+              ><view v-if="trackPoints.length > 0" class="route-heading-meta"
+                ><text class="muted tiny">{{ trackPoints.length }} 个采样点</text
+                ><button class="text-button" @click="openMap(activity.id)">
+                  全屏查看
+                </button></view
+              ><text v-else class="muted"
+                >0 个采样点</text
               ></view
-            ><TrackPreview
-              v-if="activity.track && activity.track.length > 1"
-              :points="activity.track"
+            ><TrackMap
+              v-if="trackPoints.length > 0"
+              :points="trackPoints"
+              :interactive="false"
+              height="200px"
+              @tap="openMap(activity.id)"
             /><view v-else class="empty-state compact"
               ><image
                 class="empty-icon"
@@ -334,6 +357,20 @@ async function download() {
               /><text class="muted"
                 >这份活动未包含可显示的 GPS 轨迹</text
               ></view
+            ><view v-if="speedSeries.length >= 2 || altitudeSeries.length >= 2" class="profile-charts"
+              ><SeriesChart
+                v-if="speedSeries.length >= 2"
+                title="速度"
+                unit="km/h"
+                :values="speedSeries"
+                tone="info"
+              /><SeriesChart
+                v-if="altitudeSeries.length >= 2"
+                title="海拔"
+                unit="m"
+                :values="altitudeSeries"
+                tone="muted"
+              /></view
             ></view
           ><view v-if="accounts.length" class="card"
             ><view class="card-heading"

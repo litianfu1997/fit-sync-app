@@ -394,7 +394,7 @@ const selectedPlatformFilterIndex = computed(() =>
                   >拉取已连接账号的原始 FIT 存入云端，跨平台重复记录自动合并。</text
                 ></view
               ></view
-            ><button class="text-button" @click="go('sync')">
+            ><button class="text-button entry-heading-action" @click="go('sync')">
               管理账号 ›
             </button></view
           ><template v-if="pullableAccounts.length"
@@ -487,33 +487,53 @@ const selectedPlatformFilterIndex = computed(() =>
                     ? "当前已连接的 Strava OAuth 账号不支持导出原始 FIT。连接 COROS、iGPSPORT、迈金、行者或 Garmin 后，即可一键去重拉取到云端。"
                     : "还没有连接支持拉取的运动平台。连接后即可直接把历史活动与原始 FIT 拉取去重并保存到云端。"
                 }}</text
-              ><button class="btn primary" @click="openConnect()">
-                去连接运动平台
-              </button></view
+              ><view class="pull-actions"
+                ><button class="btn primary full" @click="openConnect()">
+                  去连接运动平台
+                </button></view
+              ></view
             ></template
           ></view
         ><view class="card import-card"
-          ><view class="import-copy"
-            ><view class="feature-icon"
-              ><image
-                :src="`/static/upload${theme.dark ? '-dark' : ''}.svg`" /></view
-            ><view
-              ><text class="section-title">导入本地 FIT 文件</text
-              ><text class="muted"
-                >上传原始 FIT 到云端，自动校验并与已有记录去重合并。</text
-              ><text class="tiny muted"
-                ><!-- #ifdef MP-WEIXIN -->从微信聊天中选择 .fit 文件<!-- #endif --><!-- #ifdef H5 -->选择电脑或手机上的
-                .fit 文件<!-- #endif --></text
+          ><view class="card-heading"
+            ><view class="import-copy"
+              ><view class="feature-icon"
+                ><image
+                  :src="`/static/upload${theme.dark ? '-dark' : ''}.svg`" /></view
+              ><view
+                ><text class="section-title">导入本地 FIT 文件</text
+                ><text class="muted"
+                  >上传原始 FIT 到云端，自动校验并与已有记录去重合并。</text
+                ></view
               ></view
             ></view
-          ><button
-            class="btn secondary"
-            :disabled="importing"
-            :loading="importing"
-            @click="importFile"
-          >
-            {{ importing ? "正在导入…" : "导入 FIT 文件" }}
-          </button></view
+          ><view class="import-specs"
+            ><view class="import-spec-row"
+              ><text class="import-spec-label">文件来源</text
+              ><text class="tiny muted"
+                ><!-- #ifdef MP-WEIXIN -->从微信聊天中选择 .fit 文件<!-- #endif --><!-- #ifdef H5 -->选择电脑或手机本地的 .fit 文件<!-- #endif --></text
+              ></view
+            ><view class="import-spec-row"
+              ><text class="import-spec-label">自动校验</text
+              ><text class="tiny muted"
+                >校验 FIT 文件头与轨迹完整性，自动写入云端档案</text
+              ></view
+            ><view class="import-spec-row"
+              ><text class="import-spec-label">指纹去重</text
+              ><text class="tiny muted"
+                >按文件指纹与轨迹时间窗合并同场活动，避免重复保存</text
+              ></view
+            ></view
+          ><view class="import-actions"
+            ><button
+              class="btn secondary full"
+              :disabled="importing"
+              :loading="importing"
+              @click="importFile"
+            >
+              {{ importing ? "正在导入…" : "导入 FIT 文件" }}
+            </button></view
+          ></view
         ></view
       ><view v-if="importError" class="notice error-notice">{{
         importError

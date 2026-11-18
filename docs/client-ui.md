@@ -27,7 +27,7 @@
 
 正文采用 14–15px、辅助信息 11–12px，主要数据 30–42px，数字启用等宽排版。字体栈优先使用设备已有的 MiSans，其后使用系统中文字体；本次不把 Android 约 17MB 的三份字库放入小程序包。字号、字重和行高对齐 [Type.kt](../app/src/main/java/com/fitsync/app/ui/theme/Type.kt)。
 
-首页及活动详情使用原生端相同的深炭至暗橙 Hero 渐变；轨迹预览使用中性底和 1.5px 路线。Logo 复用 Android [ic_launcher.xml](../app/src/main/res/drawable/ic_launcher.xml) 的路径。
+首页及活动详情使用原生端相同的深炭至暗橙 Hero 渐变；沿途轨迹卡片与全屏地图页对齐 Android `TrackMap`（H5 采用 OpenStreetMap 栅格瓦片叠加主色路线与蓝/红起终点标记，离线回退中性底 `#E6EAEF` / `#232C37`；微信小程序使用原生 `<map>` 组件并自动完成 WGS-84 至 GCJ-02 坐标转换），详情页并在地图下方展示速度（蓝）与海拔（灰）趋势图。Logo 复用 Android [ic_launcher.xml](../app/src/main/res/drawable/ic_launcher.xml) 的路径。
 
 手机主导航为「概览 / 活动 / 设置」。概览、同步和任务之间通过二级导航切换；桌面保留直接侧栏入口。小程序与 H5 使用同一套组件、样式和主题，不改变原有同步流程。
 

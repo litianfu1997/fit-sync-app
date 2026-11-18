@@ -3,7 +3,6 @@ import type { Config, LoginResult, User } from "./types";
 import { themeColors } from "./theme";
 
 const TOKEN_KEY = "fitsync.session.v1";
-const BASE_KEY = "fitsync.server.v1";
 export const session = reactive({
   token: String(uni.getStorageSync(TOKEN_KEY) || ""),
   user: null as User | null,
@@ -11,22 +10,28 @@ export const session = reactive({
   configError: "",
   connecting: false,
 });
+const LOCAL_HTTP_URL =
+  /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i;
+
 export function apiBase(): string {
-  return String(
-    uni.getStorageSync(BASE_KEY) || import.meta.env.VITE_API_BASE_URL || "/api",
-  ).replace(/\/+$/, "");
+  let fallback = "/api";
+  // #ifdef MP-WEIXIN
+  if (import.meta.env.DEV) fallback = "http://127.0.0.1:8080/api";
+  // #endif
+  return String(import.meta.env.VITE_API_BASE_URL || fallback).replace(
+    /\/+$/,
+    "",
+  );
 }
 export function validateBase(value: string): string {
   const base = value.trim().replace(/\/+$/, "");
   if (!base || (!/^https?:\/\/[^\s?#]+$/i.test(base) && base !== "/api"))
-    throw new Error("请填写完整 API 地址，例如 https://你的域名/api");
-  if (
-    base.startsWith("http://") &&
-    !/^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i.test(base)
-  )
+    throw new Error("API 地址配置无效，请检查构建配置");
+  if (base.startsWith("http://") && !LOCAL_HTTP_URL.test(base))
     throw new Error("平台授权需要 HTTPS；HTTP 仅允许连接本机开发服务");
   // #ifdef MP-WEIXIN
-  if (!base.startsWith("https://"))
+  const allowLocalHttp = import.meta.env.DEV && LOCAL_HTTP_URL.test(base);
+  if (!base.startsWith("https://") && !allowLocalHttp)
     throw new Error("微信小程序需要 HTTPS API 地址，并在微信后台配置合法域名");
   // #endif
   return base;
@@ -35,14 +40,6 @@ export function clearSession() {
   session.token = "";
   session.user = null;
   uni.removeStorageSync(TOKEN_KEY);
-}
-export function saveBase(value: string) {
-  const base = validateBase(value);
-  if (base !== apiBase()) {
-    clearSession();
-    session.config = null;
-  }
-  uni.setStorageSync(BASE_KEY, base);
 }
 export class ApiError extends Error {
   constructor(
@@ -99,7 +96,7 @@ export function api<T>(
           new ApiError(
             timedOut
               ? "平台响应超时，请稍后重试；若已收到验证码邮件，请重新点击获取验证码后再提交。"
-              : "无法连接服务器。请检查服务器地址、网络或 HTTPS 合法域名配置。",
+              : "无法连接云服务，请检查网络后重试。",
           ),
         );
       },
@@ -258,4 +255,7 @@ export function go(page: string) {
 }
 export function detail(id: string) {
   uni.navigateTo({ url: `/pages/activity/index?id=${encodeURIComponent(id)}` });
+}
+export function openMap(id: string) {
+  uni.navigateTo({ url: `/pages/map/index?id=${encodeURIComponent(id)}` });
 }

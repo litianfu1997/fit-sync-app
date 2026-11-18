@@ -43,7 +43,11 @@ function iconFor(icon: string, selected: boolean) {
 <template>
   <view
     class="app-shell"
-    :class="{ 'theme-dark': theme.dark, 'guest-mode': !signedIn }"
+    :class="{
+      'theme-dark': theme.dark,
+      'guest-mode': !signedIn,
+      'guest-auth': !signedIn && active !== 'settings',
+    }"
     :style="themeStyle"
   >
     <view class="desktop-sidebar">

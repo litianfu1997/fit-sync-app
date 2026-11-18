@@ -13,6 +13,10 @@
       "style": { "navigationBarTitleText": "活动详情" }
     },
     {
+      "path": "pages/map/index",
+      "style": { "navigationBarTitleText": "轨迹地图" }
+    },
+    {
       "path": "pages/sync/index",
       "style": { "navigationBarTitleText": "同步中心" }
     },

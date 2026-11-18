@@ -6,7 +6,6 @@ import RewardSupport from "../../components/RewardSupport.vue";
 import { theme, setThemeMode, syncPageTheme, type ThemeMode } from "../../lib/theme";
 import {
   api,
-  apiBase,
   bindWechat,
   changePassword as changePasswordApi,
   clearSession,
@@ -15,7 +14,6 @@ import {
   initialize,
   messageOf,
   patchSessionUser,
-  saveBase,
   session,
   setPassword as setPasswordApi,
   toast,
@@ -26,10 +24,6 @@ const themeOptions: { value: ThemeMode; label: string }[] = [
   { value: "light", label: "浅色" },
   { value: "dark", label: "深色" },
 ];
-const base = ref(apiBase()),
-  saving = ref(false),
-  error = ref(""),
-  success = ref("");
 const webCode = ref(""),
   confirmingWeb = ref(false),
   webError = ref(""),
@@ -154,32 +148,6 @@ onShow(() => {
   void initialize();
   profileName.value = session.user?.displayName || "";
 });
-async function save() {
-  saving.value = true;
-  error.value = "";
-  success.value = "";
-  try {
-    const changed = base.value.trim().replace(/\/+$/, "") !== apiBase();
-    if (
-      changed &&
-      session.token &&
-      !(await confirm(
-        "切换服务器",
-        "切换服务器将清除本机登录状态，连接后需要重新登录。确认切换？",
-      ))
-    )
-      return;
-    saveBase(base.value);
-    await initialize(true);
-    if (session.configError) throw new Error(session.configError);
-    success.value = "服务器连接成功。";
-    toast("服务器设置已保存");
-  } catch (reason) {
-    error.value = messageOf(reason);
-  } finally {
-    saving.value = false;
-  }
-}
 async function logout() {
   if (
     !(await confirm(
@@ -202,7 +170,7 @@ async function logout() {
   <AppShell
     active="settings"
     title="设置"
-    subtitle="管理外观、账号与云端连接"
+    subtitle="管理外观与账号"
     ><view class="settings-columns"
       ><view
         ><view class="card profile-card"
@@ -219,7 +187,7 @@ async function logout() {
                 ? session.user?.username
                   ? "账号 @" + session.user.username
                   : "尚未设置登录用户名"
-                : "配置服务器后，前往概览登录"
+                : "前往概览登录后管理账号与同步"
             }}</text></view
           ><button
             v-if="session.token"
@@ -368,53 +336,6 @@ async function logout() {
               :aria-pressed="theme.mode === option.value"
               @click="setThemeMode(option.value)"
             >{{ option.label }}</button></view></view
-        ><view class="card"
-          ><view class="card-heading"
-            ><view
-              ><text class="section-title">服务器连接</text
-              ><text class="muted"
-                >小程序与网页使用同一个 FitSync 云服务。</text
-              ></view
-            ><text
-              class="tag"
-              :class="
-                session.configError
-                  ? 'amber'
-                  : session.config
-                    ? 'success'
-                    : 'neutral'
-              "
-              >{{
-                session.configError
-                  ? "连接异常"
-                  : session.config
-                    ? "已连接"
-                    : "待连接"
-              }}</text
-            ></view
-          ><view class="form-field"
-            ><text class="field-label">API 地址</text
-            ><input
-              v-model="base"
-              class="input"
-              placeholder="https://你的域名/api"
-              :disabled="saving"
-            /><text class="tiny muted"
-              ><!-- #ifdef H5 -->本地开发使用 /api，由 Vite 转发到 Java
-              服务；生产环境配置同源代理或 HTTPS 地址。<!-- #endif --><!-- #ifdef MP-WEIXIN -->请填写
-              HTTPS API 地址，并在微信后台配置 request、uploadFile、downloadFile
-              合法域名。<!-- #endif --></text
-            ></view
-          ><text v-if="error" class="error-text">{{ error }}</text
-          ><text v-if="success" class="success-text">{{ success }}</text
-          ><button
-            class="btn primary"
-            :loading="saving"
-            :disabled="saving"
-            @click="save"
-          >
-            保存并测试连接
-          </button></view
         ><!-- #ifdef MP-WEIXIN -->
         <view
           v-if="session.token && session.config?.webLoginEnabled"

@@ -68,6 +68,11 @@ export interface ActivityCopy {
   platform: PlatformCode;
   accountId?: string;
 }
+export interface ProfilePoint {
+  seconds: number;
+  speedMps?: number;
+  altitudeMeters?: number;
+}
 export interface Activity {
   id: string;
   title: string;
@@ -87,6 +92,7 @@ export interface Activity {
   elevationGain?: number;
   warnings?: string[];
   track?: { lat: number; lon: number }[];
+  profile?: ProfilePoint[];
   copies?: ActivityCopy[];
   variants?: ActivityVariant[];
 }
