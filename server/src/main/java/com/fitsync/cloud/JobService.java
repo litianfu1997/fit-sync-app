@@ -1,6 +1,7 @@
 package com.fitsync.cloud;
 
 import com.fitsync.cloud.connector.*;
+import com.fitsync.fitcore.*;
 import jakarta.annotation.PreDestroy;
 import java.time.Duration;
 import java.util.*;
@@ -28,6 +29,12 @@ public class JobService {
   private final ExecutorService pullExecutor;
   private static final long LEASE = Duration.ofMinutes(15).toMillis();
   private static final int MAX_PULL_PAGES = 20;
+  private static final int MAX_CONFIRM_LOOKUP_PAGES = 15;
+  private static final int MAX_CONFIRM_DOWNLOADS = 10;
+  private static final long CONFIRM_START_TOLERANCE_MS = 2 * 60_000L;
+  private static final long CONFIRM_DOWNLOAD_START_TOLERANCE_MS = 15 * 60_000L;
+  private static final double CONFIRM_DISTANCE_TOLERANCE_METERS = 100.0;
+  private static final double CONFIRM_DISTANCE_TOLERANCE_RATIO = 0.005;
   private static final Set<String> PERMANENT_REMOTE_SKIP_CODES =
       Set.of(
           "NO_ORIGINAL_FILE",
@@ -84,13 +91,26 @@ public class JobService {
                     "enabled",
                     row.get("enabled"),
                     "includeHistory",
-                    row.get("include_history")))
+                    row.get("include_history"),
+                    "sportTypes",
+                    SportTypes.decodeForRule(CloudStore.str(row, "sport_types"))))
         .toList();
   }
 
   @Transactional
   public synchronized Map<String, Object> rule(
       String user, String source, String destination, boolean enabled, boolean history) {
+    return rule(user, source, destination, enabled, history, null);
+  }
+
+  @Transactional
+  public synchronized Map<String, Object> rule(
+      String user,
+      String source,
+      String destination,
+      boolean enabled,
+      boolean history,
+      List<String> rawSportTypes) {
     store.db.queryForObject("SELECT id FROM app_user WHERE id=? FOR UPDATE", String.class, user);
     var target = store.owned("platform_account", destination, user);
     if (!source.equals("LOCAL")) {
@@ -103,43 +123,65 @@ public class JobService {
           == 0) throw ApiException.bad("请先连接来源平台");
     }
     if (source.equals(target.get("platform"))) throw ApiException.bad("来源和目标不能相同");
+    List<String> normalizedTypes = SportTypes.normalizeSelection(rawSportTypes);
     var rows =
         store.db.queryForList(
-            "SELECT id FROM sync_rule WHERE user_id=? AND source_platform=? AND"
+            "SELECT id,sport_types FROM sync_rule WHERE user_id=? AND source_platform=? AND"
                 + " destination_account_id=?",
             user,
             source,
             destination);
     String id = rows.isEmpty() ? CloudStore.id() : CloudStore.str(rows.getFirst(), "id");
-    if (rows.isEmpty())
+    String storedSportTypes;
+    if (rows.isEmpty()) {
+      storedSportTypes = SportTypes.encodeForRule(normalizedTypes);
       store.db.update(
           "INSERT INTO"
-              + " sync_rule(id,user_id,source_platform,destination_account_id,enabled,include_history,created_at)"
-              + " VALUES(?,?,?,?,?,?,?)",
+              + " sync_rule(id,user_id,source_platform,destination_account_id,enabled,include_history,sport_types,created_at)"
+              + " VALUES(?,?,?,?,?,?,?,?)",
           id,
           user,
           source,
           destination,
           enabled,
           history,
+          storedSportTypes,
           System.currentTimeMillis());
-    else
+    } else if (rawSportTypes != null) {
+      storedSportTypes = SportTypes.encodeForRule(normalizedTypes);
+      store.db.update(
+          "UPDATE sync_rule SET enabled=?,include_history=?,sport_types=? WHERE id=? AND user_id=?",
+          enabled,
+          history,
+          storedSportTypes,
+          id,
+          user);
+    } else {
+      storedSportTypes = CloudStore.str(rows.getFirst(), "sport_types");
       store.db.update(
           "UPDATE sync_rule SET enabled=?,include_history=? WHERE id=? AND user_id=?",
           enabled,
           history,
           id,
           user);
+    }
+    List<String> effectiveSportTypes = SportTypes.decodeForRule(storedSportTypes);
+    Set<String> allowedSportTypes =
+        storedSportTypes == null ? null : SportTypes.expandAllowed(effectiveSportTypes);
     if (enabled && history) {
       for (var activity :
           store.db.queryForList(
-              "SELECT a.id FROM activity a WHERE a.user_id=? AND a.needs_review=FALSE AND"
-                  + " (a.source_platform=? OR EXISTS(SELECT 1 FROM platform_copy p JOIN"
+              "SELECT a.id,a.sport_type FROM activity a WHERE a.user_id=? AND a.needs_review=FALSE"
+                  + " AND (a.source_platform=? OR EXISTS(SELECT 1 FROM platform_copy p JOIN"
                   + " platform_account c ON c.id=p.account_id WHERE p.activity_id=a.id AND"
                   + " p.user_id=a.user_id AND c.platform=?))",
               user,
               source,
-              source)) delivery(user, CloudStore.str(activity, "id"), destination, id);
+              source)) {
+        if (SportTypes.matchesActivity(CloudStore.str(activity, "sport_type"), allowedSportTypes)) {
+          delivery(user, CloudStore.str(activity, "id"), destination, id);
+        }
+      }
     }
     return Map.of(
         "id",
@@ -151,7 +193,9 @@ public class JobService {
         "enabled",
         enabled,
         "includeHistory",
-        history);
+        history,
+        "sportTypes",
+        effectiveSportTypes);
   }
 
   public void deleteRule(String user, String id) {
@@ -162,8 +206,19 @@ public class JobService {
   @Transactional
   public Map<String, Object> pullFromPlatforms(
       String user, List<String> accountIds, List<String> platforms, int historyDays) {
+    return pullFromPlatforms(user, accountIds, platforms, historyDays, null);
+  }
+
+  @Transactional
+  public Map<String, Object> pullFromPlatforms(
+      String user,
+      List<String> accountIds,
+      List<String> platforms,
+      int historyDays,
+      List<String> rawSportTypes) {
     store.db.queryForObject("SELECT id FROM app_user WHERE id=? FOR UPDATE", String.class, user);
     if (historyDays < 1 || historyDays > 365) throw ApiException.bad("回填范围为 1 至 365 天");
+    List<String> sportTypes = SportTypes.normalizeSelection(rawSportTypes);
     var allAccounts =
         store.db.queryForList(
             "SELECT * FROM platform_account WHERE user_id=? ORDER BY platform", user);
@@ -244,7 +299,7 @@ public class JobService {
           dispatchIds.add(jobId);
         }
       } else {
-        jobId = pull(user, accountId, historyDays, List.of(), null);
+        jobId = pull(user, accountId, historyDays, List.of(), null, sportTypes);
         status = "PENDING";
         dispatchIds.add(jobId);
       }
@@ -427,8 +482,21 @@ public class JobService {
       List<String> destinations,
       List<String> activityIds,
       int historyDays) {
+    return sync(user, source, destinations, activityIds, historyDays, null);
+  }
+
+  @Transactional
+  public Map<String, Object> sync(
+      String user,
+      String source,
+      List<String> destinations,
+      List<String> activityIds,
+      int historyDays,
+      List<String> rawSportTypes) {
     store.db.queryForObject("SELECT id FROM app_user WHERE id=? FOR UPDATE", String.class, user);
     if (historyDays < 1 || historyDays > 365) throw ApiException.bad("回填范围为 1 至 365 天");
+    List<String> sportTypes = SportTypes.normalizeSelection(rawSportTypes);
+    Set<String> allowedSportTypes = SportTypes.expandAllowed(sportTypes);
     if (destinations == null) destinations = List.of();
     if (destinations.size() > 6) throw ApiException.bad("目标账号数量无效");
     for (String target : destinations) store.owned("platform_account", target, user);
@@ -436,20 +504,31 @@ public class JobService {
     String sourceAccount = null;
     if (selected) {
       if (activityIds.size() > 100) throw ApiException.bad("每次最多选择 100 条活动");
-      for (String activity : activityIds) store.owned("activity", activity, user);
+      List<String> filteredIds = new ArrayList<>(activityIds.size());
+      for (String activity : activityIds) {
+        var row = store.owned("activity", activity, user);
+        if (SportTypes.matchesActivity(CloudStore.str(row, "sport_type"), allowedSportTypes)) {
+          filteredIds.add(activity);
+        }
+      }
+      activityIds = filteredIds;
     } else if ("LOCAL".equals(source)) {
+      var localRows =
+          store.db.queryForList(
+              "SELECT id,sport_type FROM activity WHERE user_id=? AND source_platform='LOCAL' AND"
+                  + " needs_review=FALSE ORDER BY start_time DESC LIMIT 101",
+              user);
+      if (localRows.isEmpty()) throw ApiException.bad("请先导入 FIT 文件");
+      if (localRows.size() > 100) throw ApiException.bad("本地活动超过 100 条，请从活动列表选择分批同步");
       activityIds =
-          store
-              .db
-              .queryForList(
-                  "SELECT id FROM activity WHERE user_id=? AND source_platform='LOCAL' AND"
-                      + " needs_review=FALSE ORDER BY start_time DESC LIMIT 101",
-                  user)
-              .stream()
+          localRows.stream()
+              .filter(
+                  row ->
+                      SportTypes.matchesActivity(
+                          CloudStore.str(row, "sport_type"), allowedSportTypes))
               .map(row -> CloudStore.str(row, "id"))
               .toList();
-      if (activityIds.isEmpty()) throw ApiException.bad("请先导入 FIT 文件");
-      if (activityIds.size() > 100) throw ApiException.bad("本地活动超过 100 条，请从活动列表选择分批同步");
+      if (activityIds.isEmpty()) throw ApiException.bad("本地活动库中没有符合所选活动类型的活动");
       selected = true;
     } else {
       var sourceAcc =
@@ -467,7 +546,7 @@ public class JobService {
     // 目标预拉取先入队；所有拉取完成前不投递，减少跨平台循环。对纯 OAuth 不可导出原文件的目标跳过以节省 API 配额。
     for (String target : destinations) {
       if (!shouldSkipPull(user, target)) {
-        String pullId = pull(user, target, historyDays, List.of(), null);
+        String pullId = pull(user, target, historyDays, List.of(), null, null);
         ids.add(pullId);
         pullIds.add(pullId);
       }
@@ -481,7 +560,7 @@ public class JobService {
         }
       }
     } else {
-      String pullId = pull(user, sourceAccount, historyDays, destinations, null);
+      String pullId = pull(user, sourceAccount, historyDays, destinations, null, sportTypes);
       ids.add(pullId);
       pullIds.add(pullId);
     }
@@ -492,6 +571,7 @@ public class JobService {
   public void plan(String user, String activityId) {
     var activity = store.owned("activity", activityId, user);
     if (Boolean.TRUE.equals(activity.get("needs_review"))) return;
+    String sportType = CloudStore.str(activity, "sport_type");
     for (var rule :
         store.db.queryForList(
             "SELECT r.* FROM sync_rule r WHERE r.user_id=? AND r.enabled=TRUE AND"
@@ -501,6 +581,12 @@ public class JobService {
             user,
             activity.get("source_platform"),
             activityId)) {
+      String storedRuleTypes = CloudStore.str(rule, "sport_types");
+      Set<String> allowed =
+          storedRuleTypes == null
+              ? null
+              : SportTypes.expandAllowed(SportTypes.decodeForRule(storedRuleTypes));
+      if (!SportTypes.matchesActivity(sportType, allowed)) continue;
       if (Boolean.TRUE.equals(rule.get("include_history"))
           || CloudStore.number(activity, "start_time") >= CloudStore.number(rule, "created_at"))
         delivery(
@@ -513,6 +599,16 @@ public class JobService {
 
   private String pull(
       String user, String account, int days, List<String> destinations, String stableKey) {
+    return pull(user, account, days, destinations, stableKey, null);
+  }
+
+  private String pull(
+      String user,
+      String account,
+      int days,
+      List<String> destinations,
+      String stableKey,
+      List<String> sportTypes) {
     var a = store.owned("platform_account", account, user);
     long now = System.currentTimeMillis();
     long since =
@@ -524,6 +620,7 @@ public class JobService {
     Map<String, Object> payload = new LinkedHashMap<>();
     payload.put("since", since);
     payload.put("destinations", destinations);
+    if (sportTypes != null) payload.put("sportTypes", sportTypes);
     payload.put("cursor", null);
     payload.put("fetched", 0L);
     payload.put("existingSkipped", 0L);
@@ -744,6 +841,7 @@ public class JobService {
         || CloudStore.number(job, "next_run_at") > now) return;
     if (job.get("lease_until") instanceof Number lease && lease.longValue() > now) return;
     if (job.get("kind").equals("DELIVERY")
+        && !"CONFIRMING".equals(previous)
         && store.db.queryForObject(
                 "SELECT COUNT(*) FROM sync_job WHERE user_id=? AND kind='PULL' AND status IN"
                     + " ('PENDING','RETRY','RUNNING')",
@@ -855,6 +953,7 @@ public class JobService {
             ? CloudStore.number(payload, "skippedNoFit")
             : CloudStore.number(payload, "skipped");
     long pages = CloudStore.number(payload, "pages");
+    Set<String> allowedSportTypes = extractAllowedSportTypes(payload);
 
     for (int page = 0; page < MAX_PULL_PAGES; page++) {
       var result = connector.listActivities(session, since, cursor);
@@ -877,11 +976,15 @@ public class JobService {
       pages++;
       var remotes = result.value().items();
       fetched += remotes.size();
+      reconcileConfirmingFromRemotes(user, accountId, remotes);
       Set<String> knownRemoteIds = findKnownRemoteIds(user, accountId, remotes);
 
       for (var remote : remotes) {
         if (knownRemoteIds.contains(remote.remoteActivityId())) {
           existingSkipped++;
+          continue;
+        }
+        if (!SportTypes.matchesRemote(platform, remote, allowedSportTypes)) {
           continue;
         }
         var downloaded = connector.downloadFit(session, remote);
@@ -941,8 +1044,11 @@ public class JobService {
           default -> imported++;
         }
         String activity = importedResult.get("activityId").toString();
+        String activitySport = Objects.toString(importedResult.get("sportType"), null);
+        markDeliveryConfirmedForActivity(user, activity, accountId);
         plan(user, activity);
-        if (payload.get("destinations") instanceof List<?> destinations)
+        if (payload.get("destinations") instanceof List<?> destinations
+            && SportTypes.matchesActivity(activitySport, allowedSportTypes))
           for (Object target : destinations) delivery(user, activity, target.toString());
       }
 
@@ -975,6 +1081,9 @@ public class JobService {
       heartbeat(jobId, accountId);
 
       if (!hasMore) {
+        if (payload.get("destinations") instanceof List<?> destinations && !destinations.isEmpty()) {
+          planPullDestinationsForExisting(user, platform, destinations, allowedSportTypes, since);
+        }
         store.db.update(
             "UPDATE platform_account SET last_sync_at=?,last_error=NULL,status='CONNECTED' WHERE"
                 + " id=? AND user_id=?",
@@ -991,6 +1100,44 @@ public class JobService {
     }
 
     finish(job, "PENDING", "已拉取 " + pages + " 页，继续拉取剩余活动", 0);
+  }
+
+  private static Set<String> extractAllowedSportTypes(Map<String, Object> payload) {
+    Object raw = payload.get("sportTypes");
+    if (!(raw instanceof List<?> list) || list.isEmpty()) return null;
+    List<String> tokens = new ArrayList<>(list.size());
+    for (Object item : list) {
+      if (item != null && !item.toString().isBlank()) tokens.add(item.toString());
+    }
+    return tokens.isEmpty() ? null : SportTypes.expandAllowed(tokens);
+  }
+
+  private void planPullDestinationsForExisting(
+      String user,
+      String sourcePlatform,
+      List<?> destinations,
+      Set<String> allowedSportTypes,
+      long sinceEpochMs) {
+    for (var activity :
+        store.db.queryForList(
+            "SELECT a.id,a.sport_type FROM activity a WHERE a.user_id=? AND a.needs_review=FALSE"
+                + " AND a.start_time>=? AND (a.source_platform=? OR EXISTS(SELECT 1 FROM"
+                + " platform_copy p JOIN platform_account c ON c.id=p.account_id WHERE"
+                + " p.activity_id=a.id AND p.user_id=a.user_id AND c.platform=?))",
+            user,
+            sinceEpochMs,
+            sourcePlatform,
+            sourcePlatform)) {
+      if (!SportTypes.matchesActivity(CloudStore.str(activity, "sport_type"), allowedSportTypes)) {
+        continue;
+      }
+      String activityId = CloudStore.str(activity, "id");
+      for (Object target : destinations) {
+        if (target != null && !target.toString().isBlank()) {
+          delivery(user, activityId, target.toString());
+        }
+      }
+    }
   }
 
   private void savePullProgress(
@@ -1163,8 +1310,18 @@ public class JobService {
       finish(job, "WAITING_USER", "上次上传结果未知，请在目标平台核对，系统不会重复上传", 0);
       return;
     }
-    if (token != null) result = connector.checkUpload(session, token);
-    else {
+    if (token != null) {
+      result = connector.checkUpload(session, token);
+      if (result != null
+          && (result.status() == ConnectorResult.Status.PROCESSING
+              || (result.status() == ConnectorResult.Status.REQUIRES_USER_ACTION
+                  && "CONFIRMATION_REQUIRED".equals(result.code())))
+          && !connector.skipPullAsDestination(session)) {
+        ConnectorResult<UploadResult> reconciled =
+            confirmByActivityLookup(user, job, accountId, connector, session);
+        if (reconciled != null) result = reconciled;
+      }
+    } else {
       // 在任何远端 POST 前持久化不确定标记；进程崩溃后只能核对，不得重传。
       if (store.db.update(
               "UPDATE sync_job SET confirmation_json='UPLOAD_STARTED' WHERE id=? AND lease_owner=?",
@@ -1255,4 +1412,445 @@ public class JobService {
         job.get("id"),
         worker);
   }
+
+  private void markDeliveryConfirmedForActivity(String user, String activityId, String accountId) {
+    if (activityId == null || accountId == null) return;
+    long now = System.currentTimeMillis();
+    store.db.update(
+        "UPDATE sync_job SET status='SUCCEEDED',message=?,next_run_at=?,updated_at=? WHERE"
+            + " user_id=? AND account_id=? AND activity_id=? AND kind='DELIVERY' AND"
+            + " status='CONFIRMING' AND lease_owner IS NULL",
+        "目标平台已存在该活动",
+        now,
+        now,
+        user,
+        accountId,
+        activityId);
+  }
+
+  private void reconcileConfirmingFromRemotes(
+      String user, String accountId, List<RemoteActivity> remotes) {
+    if (remotes == null || remotes.isEmpty()) return;
+    List<ConfirmCandidate> candidates = loadConfirmCandidates(user, accountId, null);
+    if (candidates.isEmpty()) return;
+    Set<String> claimed = loadClaimedRemoteIds(user, accountId);
+    List<RemoteActivity> available =
+        remotes.stream()
+            .filter(r -> r != null && r.remoteActivityId() != null && !claimed.contains(r.remoteActivityId()))
+            .toList();
+    if (available.isEmpty()) return;
+    List<ConfirmMatch> matches = findHighConfidencePendingMatches(available, candidates);
+    applyConfirmMatches(user, accountId, null, matches);
+  }
+
+  private ConnectorResult<UploadResult> confirmByActivityLookup(
+      String user,
+      Map<String, Object> currentJob,
+      String accountId,
+      PlatformConnector connector,
+      Session session) {
+    String currentJobId = CloudStore.str(currentJob, "id");
+    List<ConfirmCandidate> allCandidates = loadConfirmCandidates(user, accountId, currentJobId);
+    if (allCandidates.isEmpty()) return null;
+
+    Set<String> claimedRemoteIds = loadClaimedRemoteIds(user, accountId);
+    long earliestStart = Long.MAX_VALUE;
+    for (ConfirmCandidate c : allCandidates) {
+      if (c.startTimeEpochMs() != null && c.startTimeEpochMs() < earliestStart) {
+        earliestStart = c.startTimeEpochMs();
+      }
+    }
+    long sinceEpochMs =
+        earliestStart == Long.MAX_VALUE
+            ? 0L
+            : Math.max(0L, earliestStart - Duration.ofDays(1).toMillis());
+    long stopBeforeEpochMs =
+        earliestStart == Long.MAX_VALUE
+            ? 0L
+            : earliestStart - Duration.ofDays(2).toMillis();
+
+    List<ConfirmCandidate> remaining = new ArrayList<>(allCandidates);
+    List<RemoteActivity> collectedRemotes = new ArrayList<>();
+    Set<String> seenRemoteIds = new HashSet<>();
+    String cursor = null;
+    int consecutiveOlderPages = 0;
+    String matchedRemoteForCurrent = null;
+
+    for (int page = 0; page < MAX_CONFIRM_LOOKUP_PAGES && !remaining.isEmpty(); page++) {
+      ConnectorResult<ActivityPage> pageResult =
+          connector.listActivities(session, sinceEpochMs, cursor);
+      if (pageResult == null) return null;
+      if (pageResult.status() == ConnectorResult.Status.REQUIRES_LOGIN) {
+        return pageResult.castFailure();
+      }
+      if (pageResult.status() != ConnectorResult.Status.SUCCESS || pageResult.value() == null) {
+        break;
+      }
+      List<RemoteActivity> items = pageResult.value().items();
+      if (items == null || items.isEmpty()) break;
+
+      boolean allOlderThanWindow = earliestStart != Long.MAX_VALUE;
+      long minStartOnPage = Long.MAX_VALUE;
+      for (RemoteActivity remote : items) {
+        if (remote == null || remote.remoteActivityId() == null) continue;
+        Long rs = remote.startTimeEpochMs();
+        if (rs == null || rs >= stopBeforeEpochMs) {
+          allOlderThanWindow = false;
+        }
+        if (rs != null && rs < minStartOnPage) {
+          minStartOnPage = rs;
+        }
+        if (!claimedRemoteIds.contains(remote.remoteActivityId())
+            && seenRemoteIds.add(remote.remoteActivityId())) {
+          collectedRemotes.add(remote);
+        }
+      }
+
+      List<ConfirmMatch> stage1 = findHighConfidencePendingMatches(collectedRemotes, remaining);
+      if (!stage1.isEmpty()) {
+        String resolvedCurrent = applyConfirmMatches(user, accountId, currentJobId, stage1);
+        if (resolvedCurrent != null) matchedRemoteForCurrent = resolvedCurrent;
+        Set<String> matchedJobs = new HashSet<>();
+        for (ConfirmMatch m : stage1) {
+          matchedJobs.add(m.candidate().jobId());
+          claimedRemoteIds.add(m.remote().remoteActivityId());
+        }
+        remaining.removeIf(c -> matchedJobs.contains(c.jobId()));
+        collectedRemotes.removeIf(r -> claimedRemoteIds.contains(r.remoteActivityId()));
+      }
+
+      if (remaining.isEmpty()
+          && earliestStart != Long.MAX_VALUE
+          && minStartOnPage < earliestStart - Duration.ofHours(2).toMillis()) {
+        break;
+      }
+      consecutiveOlderPages = allOlderThanWindow ? consecutiveOlderPages + 1 : 0;
+      if (consecutiveOlderPages >= 2) break;
+
+      String nextCursor = pageResult.value().nextCursor();
+      if (!pageResult.value().hasMore()
+          || nextCursor == null
+          || Objects.equals(cursor, nextCursor)) {
+        break;
+      }
+      cursor = nextCursor;
+    }
+
+    if (!remaining.isEmpty() && !collectedRemotes.isEmpty()) {
+      ConnectorResult<List<ConfirmMatch>> stage2 =
+          matchByDownloadedFit(user, collectedRemotes, remaining, connector, session);
+      if (stage2.status() == ConnectorResult.Status.REQUIRES_LOGIN) {
+        return stage2.castFailure();
+      }
+      if (stage2.status() == ConnectorResult.Status.SUCCESS
+          && stage2.value() != null
+          && !stage2.value().isEmpty()) {
+        String resolvedCurrent =
+            applyConfirmMatches(user, accountId, currentJobId, stage2.value());
+        if (resolvedCurrent != null) matchedRemoteForCurrent = resolvedCurrent;
+      }
+    }
+
+    return matchedRemoteForCurrent == null
+        ? null
+        : ConnectorResult.success(new UploadResult(matchedRemoteForCurrent));
+  }
+
+  private ConnectorResult<List<ConfirmMatch>> matchByDownloadedFit(
+      String user,
+      List<RemoteActivity> remotes,
+      List<ConfirmCandidate> candidates,
+      PlatformConnector connector,
+      Session session) {
+    List<ConfirmCandidate> unmatched = new ArrayList<>(candidates);
+    List<ConfirmMatch> matches = new ArrayList<>();
+    int downloads = 0;
+    FitDeduplicator deduplicator = new FitDeduplicator();
+
+    for (RemoteActivity remote : remotes) {
+      if (unmatched.isEmpty() || downloads >= MAX_CONFIRM_DOWNLOADS) break;
+      if (!isPlausibleFitCandidate(remote, unmatched, remotes.size())) continue;
+      downloads++;
+      ConnectorResult<FitDownload> file = connector.downloadFit(session, remote);
+      if (file == null) continue;
+      if (file.status() == ConnectorResult.Status.REQUIRES_LOGIN) {
+        return file.castFailure();
+      }
+      if (file.status() != ConnectorResult.Status.SUCCESS
+          || file.value() == null
+          || file.value().bytes() == null) {
+        continue;
+      }
+      byte[] downloadedBytes = file.value().bytes();
+      String remoteSha;
+      try {
+        remoteSha = FitParser.sha256(FitParser.normalize(downloadedBytes));
+      } catch (Exception ignored) {
+        remoteSha = null;
+      }
+      ConfirmCandidate matched = null;
+      if (remoteSha != null) {
+        for (ConfirmCandidate c : unmatched) {
+          if (remoteSha.equals(c.sha256())) {
+            matched = c;
+            break;
+          }
+        }
+      }
+      if (matched == null) {
+        matched = matchByFitDeduplicator(user, downloadedBytes, unmatched, deduplicator);
+      }
+      if (matched != null) {
+        matches.add(new ConfirmMatch(remote, matched));
+        unmatched.remove(matched);
+      }
+    }
+    return ConnectorResult.success(matches);
+  }
+
+  private ConfirmCandidate matchByFitDeduplicator(
+      String user,
+      byte[] downloadedBytes,
+      List<ConfirmCandidate> unmatched,
+      FitDeduplicator deduplicator) {
+    List<DedupCandidate> dedupCandidates = new ArrayList<>();
+    Map<Long, ConfirmCandidate> byLocalId = new HashMap<>();
+    for (ConfirmCandidate c : unmatched) {
+      if (c.startTimeEpochMs() == null) continue;
+      List<TrackPoint> track = List.of();
+      if (c.variantId() != null) {
+        var rows =
+            store.db.queryForList(
+                "SELECT metadata_json FROM activity_variant WHERE id=? AND user_id=?",
+                c.variantId(),
+                user);
+        if (!rows.isEmpty()) {
+          String rawMeta = CloudStore.str(rows.getFirst(), "metadata_json");
+          if (rawMeta != null && !rawMeta.isBlank()) {
+            try {
+              track = ActivityService.decodeTrackPoints(store.decode(rawMeta).get("track"));
+            } catch (Exception ignored) {
+            }
+          }
+        }
+      }
+      long localId = dedupCandidates.size() + 1L;
+      byLocalId.put(localId, c);
+      dedupCandidates.add(
+          new DedupCandidate(
+              localId,
+              c.sportType(),
+              c.startTimeEpochMs(),
+              c.elapsedSeconds(),
+              c.movingSeconds(),
+              c.distanceMeters(),
+              track));
+    }
+    if (dedupCandidates.isEmpty()) return null;
+    try {
+      DedupMatch decision = deduplicator.decide(downloadedBytes, dedupCandidates);
+      if ("AUTO_MERGE".equals(decision.action()) && decision.matchedCanonicalId() != null) {
+        return byLocalId.get(decision.matchedCanonicalId());
+      }
+    } catch (Exception ignored) {
+    }
+    return null;
+  }
+
+  private static boolean isPlausibleFitCandidate(
+      RemoteActivity remote, List<ConfirmCandidate> candidates, int totalRemotes) {
+    Long remoteStart = remote.startTimeEpochMs();
+    if (remoteStart == null) return totalRemotes <= 10;
+    for (ConfirmCandidate c : candidates) {
+      if (c.startTimeEpochMs() == null) continue;
+      if (Math.abs(remoteStart - c.startTimeEpochMs()) <= CONFIRM_DOWNLOAD_START_TOLERANCE_MS) {
+        Double ld = c.distanceMeters();
+        Double rd = remote.distanceMeters();
+        if (ld != null && ld > 0.0 && rd != null && rd > 0.0) {
+          if (Math.abs(ld - rd) <= Math.max(1000.0, ld * 0.2)) return true;
+        } else {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private String applyConfirmMatches(
+      String user, String accountId, String currentJobId, List<ConfirmMatch> matches) {
+    String currentMatchedRemoteId = null;
+    long now = System.currentTimeMillis();
+    for (ConfirmMatch match : matches) {
+      String remoteId = match.remote().remoteActivityId();
+      ConfirmCandidate candidate = match.candidate();
+      if (currentJobId != null && currentJobId.equals(candidate.jobId())) {
+        currentMatchedRemoteId = remoteId;
+      } else {
+        activities.mapCopy(user, candidate.activityId(), accountId, remoteId);
+        store.db.update(
+            "UPDATE sync_job SET status='SUCCEEDED',message=?,next_run_at=?,updated_at=? WHERE"
+                + " id=? AND user_id=? AND status='CONFIRMING' AND lease_owner IS NULL",
+            "活动已在目标平台确认",
+            now,
+            now,
+            candidate.jobId(),
+            user);
+      }
+    }
+    return currentMatchedRemoteId;
+  }
+
+  private List<ConfirmCandidate> loadConfirmCandidates(
+      String user, String accountId, String includeJobId) {
+    String sql =
+        includeJobId == null
+            ? "SELECT j.id AS job_id,j.activity_id,j.payload_json,a.title,a.start_time,"
+                + "a.distance_meters,a.elapsed_seconds,a.moving_seconds,a.sport_type,"
+                + "a.primary_variant_id,v.sha256 AS primary_sha256 FROM sync_job j JOIN activity"
+                + " a ON a.id=j.activity_id AND a.user_id=j.user_id LEFT JOIN activity_variant"
+                + " v ON v.id=a.primary_variant_id AND v.user_id=j.user_id WHERE j.user_id=? AND"
+                + " j.account_id=? AND j.kind='DELIVERY' AND j.status='CONFIRMING' AND"
+                + " j.lease_owner IS NULL ORDER BY j.created_at ASC"
+            : "SELECT j.id AS job_id,j.activity_id,j.payload_json,a.title,a.start_time,"
+                + "a.distance_meters,a.elapsed_seconds,a.moving_seconds,a.sport_type,"
+                + "a.primary_variant_id,v.sha256 AS primary_sha256 FROM sync_job j JOIN activity"
+                + " a ON a.id=j.activity_id AND a.user_id=j.user_id LEFT JOIN activity_variant"
+                + " v ON v.id=a.primary_variant_id AND v.user_id=j.user_id WHERE j.user_id=? AND"
+                + " j.account_id=? AND j.kind='DELIVERY' AND (j.id=? OR (j.status='CONFIRMING'"
+                + " AND j.lease_owner IS NULL)) ORDER BY j.created_at ASC";
+    List<Map<String, Object>> rows =
+        includeJobId == null
+            ? store.db.queryForList(sql, user, accountId)
+            : store.db.queryForList(sql, user, accountId, includeJobId);
+    List<ConfirmCandidate> result = new ArrayList<>(rows.size());
+    for (var row : rows) {
+      String jobId = CloudStore.str(row, "job_id");
+      String activityId = CloudStore.str(row, "activity_id");
+      if (jobId == null || activityId == null) continue;
+      Map<String, Object> payload = Map.of();
+      String rawPayload = CloudStore.str(row, "payload_json");
+      if (rawPayload != null && !rawPayload.isBlank()) {
+        try {
+          payload = store.decode(rawPayload);
+        } catch (Exception ignored) {
+        }
+      }
+      String variantId =
+          payload.get("variantId") != null
+              ? payload.get("variantId").toString()
+              : CloudStore.str(row, "primary_variant_id");
+      String sha256 =
+          payload.get("sha256") != null
+              ? payload.get("sha256").toString()
+              : CloudStore.str(row, "primary_sha256");
+      Long startTime =
+          row.get("start_time") instanceof Number n ? n.longValue() : null;
+      Double distance =
+          row.get("distance_meters") instanceof Number n ? n.doubleValue() : null;
+      Integer elapsed =
+          row.get("elapsed_seconds") instanceof Number n ? n.intValue() : null;
+      Integer moving =
+          row.get("moving_seconds") instanceof Number n ? n.intValue() : null;
+      result.add(
+          new ConfirmCandidate(
+              jobId,
+              activityId,
+              variantId,
+              sha256,
+              CloudStore.str(row, "title"),
+              startTime,
+              distance,
+              elapsed,
+              moving,
+              CloudStore.str(row, "sport_type")));
+    }
+    return result;
+  }
+
+  private Set<String> loadClaimedRemoteIds(String user, String accountId) {
+    Set<String> claimed = new HashSet<>();
+    for (var row :
+        store.db.queryForList(
+            "SELECT remote_id FROM platform_copy WHERE user_id=? AND account_id=?",
+            user,
+            accountId)) {
+      String rid = CloudStore.str(row, "remote_id");
+      if (rid != null) claimed.add(rid);
+    }
+    return claimed;
+  }
+
+  static List<ConfirmMatch> findHighConfidencePendingMatches(
+      List<RemoteActivity> remotes, List<ConfirmCandidate> candidates) {
+    List<ConfirmMatch> edges = new ArrayList<>();
+    for (RemoteActivity remote : remotes) {
+      for (ConfirmCandidate candidate : candidates) {
+        if (isHighConfidencePendingMatch(remote, candidate)) {
+          edges.add(new ConfirmMatch(remote, candidate));
+        }
+      }
+    }
+    if (edges.isEmpty()) return List.of();
+    Map<String, Integer> remoteCounts = new HashMap<>();
+    Map<String, Integer> candidateCounts = new HashMap<>();
+    for (ConfirmMatch edge : edges) {
+      remoteCounts.merge(edge.remote().remoteActivityId(), 1, Integer::sum);
+      candidateCounts.merge(edge.candidate().jobId(), 1, Integer::sum);
+    }
+    return edges.stream()
+        .filter(
+            e ->
+                remoteCounts.getOrDefault(e.remote().remoteActivityId(), 0) == 1
+                    && candidateCounts.getOrDefault(e.candidate().jobId(), 0) == 1)
+        .toList();
+  }
+
+  private static boolean isHighConfidencePendingMatch(
+      RemoteActivity remote, ConfirmCandidate candidate) {
+    if (remote == null
+        || remote.remoteActivityId() == null
+        || remote.remoteActivityId().isBlank()) {
+      return false;
+    }
+    String externalId = remote.metadata().get("external_id");
+    if (candidate.sha256() != null
+        && ("fitsync-" + candidate.sha256() + ".fit").equals(externalId)) {
+      return true;
+    }
+    Long remoteStart = remote.startTimeEpochMs();
+    if (remoteStart == null || candidate.startTimeEpochMs() == null) return false;
+    if (Math.abs(remoteStart - candidate.startTimeEpochMs()) > CONFIRM_START_TOLERANCE_MS) {
+      return false;
+    }
+    Double localDist = candidate.distanceMeters();
+    Double remoteDist = remote.distanceMeters();
+    if (localDist != null && localDist > 0.0 && remoteDist != null && remoteDist > 0.0) {
+      double tolerance =
+          Math.max(CONFIRM_DISTANCE_TOLERANCE_METERS, localDist * CONFIRM_DISTANCE_TOLERANCE_RATIO);
+      return Math.abs(localDist - remoteDist) <= tolerance;
+    }
+    String localTitle = normalizeConfirmTitle(candidate.title());
+    String remoteTitle = normalizeConfirmTitle(remote.name());
+    return localTitle != null && localTitle.equals(remoteTitle);
+  }
+
+  private static String normalizeConfirmTitle(String value) {
+    if (value == null) return null;
+    String normalized = value.trim().toLowerCase(Locale.ROOT).replaceAll("\\s+", " ");
+    return normalized.length() >= 3 ? normalized : null;
+  }
+
+  record ConfirmCandidate(
+      String jobId,
+      String activityId,
+      String variantId,
+      String sha256,
+      String title,
+      Long startTimeEpochMs,
+      Double distanceMeters,
+      Integer elapsedSeconds,
+      Integer movingSeconds,
+      String sportType) {}
+
+  record ConfirmMatch(RemoteActivity remote, ConfirmCandidate candidate) {}
 }

@@ -24,6 +24,26 @@ export const sportNames: Record<string, string> = {
 };
 export const sportLabel = (sport?: string) =>
   sportNames[sport || ""] || "骑行";
+export const sportCategoryOptions = [
+  { code: "CYCLING", label: "骑行" },
+  { code: "RUNNING", label: "跑步" },
+  { code: "OTHER", label: "其他" },
+] as const;
+export function sportTypesSummary(sportTypes?: string[]): string {
+  if (!sportTypes || !sportTypes.length) return "全部类型";
+  const mapped = new Set<string>();
+  for (const raw of sportTypes) {
+    const token = String(raw || "").toUpperCase();
+    if (["CYCLING", "INDOOR_CYCLING", "MTB", "GRAVEL"].includes(token)) mapped.add("CYCLING");
+    else if (token === "RUNNING") mapped.add("RUNNING");
+    else if (["OTHER", "UNKNOWN"].includes(token)) mapped.add("OTHER");
+  }
+  const labels = sportCategoryOptions
+    .filter((opt) => mapped.has(opt.code))
+    .map((opt) => opt.label);
+  if (!labels.length || labels.length === sportCategoryOptions.length) return "全部类型";
+  return labels.length === 1 ? `仅${labels[0]}` : labels.join("、");
+}
 export const km = (meters?: number | null) =>
   meters == null
     ? "—"

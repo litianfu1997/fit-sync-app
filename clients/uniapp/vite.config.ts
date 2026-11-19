@@ -3,7 +3,9 @@ import uni from "@dcloudio/vite-plugin-uni";
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
+  const isH5 = (process.env.UNI_PLATFORM || "h5") === "h5";
   return {
+    publicDir: isH5 ? "public" : undefined,
     plugins: [uni()],
     server: {
       port: 5273,

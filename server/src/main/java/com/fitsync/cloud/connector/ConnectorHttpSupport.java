@@ -530,12 +530,15 @@ abstract class ConnectorHttpSupport implements PlatformConnector {
       return OffsetDateTime.parse(raw).toInstant().toEpochMilli();
     } catch (RuntimeException ignored) {
     }
-    try {
-      return LocalDateTime.parse(raw, DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
-          .atZone(CHINA)
-          .toInstant()
-          .toEpochMilli();
-    } catch (RuntimeException ignored) {
+    for (DateTimeFormatter formatter :
+        List.of(
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"),
+            DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss"),
+            DateTimeFormatter.ISO_LOCAL_DATE_TIME)) {
+      try {
+        return LocalDateTime.parse(raw, formatter).atZone(CHINA).toInstant().toEpochMilli();
+      } catch (RuntimeException ignored) {
+      }
     }
     try {
       return LocalDate.parse(raw.replace('.', '-')).atStartOfDay(CHINA).toInstant().toEpochMilli();

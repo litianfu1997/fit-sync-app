@@ -61,7 +61,15 @@ public class ActivityService {
     if (!existing.isEmpty()) {
       String activity = CloudStore.str(existing.getFirst(), "activity_id");
       mapCopy(user, activity, accountId, remoteId);
-      return Map.of("activityId", activity, "duplicate", true, "dedupAction", "DUPLICATE_FILE");
+      return Map.of(
+          "activityId",
+          activity,
+          "duplicate",
+          true,
+          "dedupAction",
+          "DUPLICATE_FILE",
+          "sportType",
+          parsed.sportType());
     }
     String activityId, candidateId;
     boolean review = false;
@@ -201,7 +209,9 @@ public class ActivityService {
         "dedupAction",
         match.action(),
         "needsReview",
-        review);
+        review,
+        "sportType",
+        nextSport);
   }
 
   public void mapCopy(String user, String activity, String account, String remote) {
@@ -752,7 +762,7 @@ public class ActivityService {
     }
   }
 
-  private static List<TrackPoint> decodeTrackPoints(Object raw) {
+  static List<TrackPoint> decodeTrackPoints(Object raw) {
     var track = new ArrayList<TrackPoint>();
     if (raw instanceof List<?> points) {
       for (Object point : points) {

@@ -6,6 +6,7 @@ export type PlatformCode =
   | "IGPSPORT"
   | "STRAVA"
   | "LOCAL";
+export type SportCategory = "CYCLING" | "RUNNING" | "OTHER";
 export interface PlatformInfo {
   code: PlatformCode;
   name: string;
@@ -111,6 +112,7 @@ export interface Rule {
   destinationAccountId: string;
   enabled: boolean;
   includeHistory: boolean;
+  sportTypes?: string[];
 }
 export interface Job {
   id: string;

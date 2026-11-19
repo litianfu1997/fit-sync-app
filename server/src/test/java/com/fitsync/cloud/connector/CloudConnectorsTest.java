@@ -816,6 +816,103 @@ class CloudConnectorsTest {
     assertTrue(res.value().attribute("cookie").contains("_strava4_session=gz-auth"));
   }
 
+  @Test
+  void onelapCheckUploadInspectsSecondHalfOfPageInsteadOfSkipping() throws Exception {
+    StubClient http = new StubClient();
+    byte[] targetFit = fitWithByte(11);
+    byte[] otherFit = fitWithByte(99);
+    Session session = new Session("ol-jwt", "u1", null, null, false);
+    OnelapConnector connector = onelap(http);
+
+    http.reply(200, "{\"code\":200,\"data\":{\"accepted\":true}}");
+    ConnectorResult<UploadResult> upload = connector.uploadFit(session, targetFit, "ride.fit");
+    assertEquals(PROCESSING, upload.status());
+
+    StringBuilder rowsJson = new StringBuilder("[");
+    for (int i = 1; i <= 10; i++) {
+      if (i > 1) rowsJson.append(',');
+      rowsJson
+          .append("{\"id\":\"rec-")
+          .append(i)
+          .append("\",\"name\":\"Ride ")
+          .append(i)
+          .append("\",\"fit_url\":\"https://files.onelap.cn/")
+          .append(i)
+          .append(".fit\"}");
+    }
+    rowsJson.append("]");
+    String listBody = "{\"code\":200,\"data\":{\"list\":" + rowsJson + "}}";
+
+    http.reply(200, listBody);
+    for (int i = 1; i <= 5; i++) http.reply(200, otherFit);
+    ConnectorResult<UploadResult> firstCheck =
+        connector.checkUpload(session, upload.confirmationToken());
+    assertEquals(PROCESSING, firstCheck.status());
+
+    http.reply(200, listBody);
+    http.reply(200, otherFit);
+    http.reply(200, otherFit);
+    http.reply(200, targetFit);
+    ConnectorResult<UploadResult> secondCheck =
+        connector.checkUpload(session, firstCheck.confirmationToken());
+    assertEquals(SUCCESS, secondCheck.status());
+    assertEquals("rec-8", secondCheck.value().remoteActivityId());
+  }
+
+  @Test
+  void onelapListAndDownloadSupportNestedRidingRecordAndLegacyWebConfirmation() throws Exception {
+    StubClient http = new StubClient();
+    Session session = new Session("ol-jwt", "u1", null, null, false);
+    OnelapConnector connector = onelap(http);
+
+    http.reply(
+        200,
+        "{\"code\":200,\"data\":{\"list\":[{\"id\":42,\"name\":\"Mahdha 虚拟骑行\","
+            + "\"start_riding_time\":\"2026-11-19 15:39:00\",\"distance_km\":12.5,"
+            + "\"ridingRecord\":{\"fitUrl\":\"https://files.onelap.cn/activities/42.fit\"}}]}}");
+    ConnectorResult<ActivityPage> page = connector.listActivities(session, 0, null);
+    assertEquals(SUCCESS, page.status());
+    assertEquals(1, page.value().items().size());
+    RemoteActivity remote = page.value().items().getFirst();
+    assertEquals("42", remote.remoteActivityId());
+    assertEquals(12_500.0, remote.distanceMeters());
+    assertEquals("https://files.onelap.cn/activities/42.fit", remote.downloadUrl());
+
+    byte[] expectedFit = fitWithByte(42);
+    http.reply(
+        200,
+        "{\"code\":200,\"data\":\"https://files.onelap.cn/signed/42.fit\"}",
+        Map.of("Content-Type", List.of("application/json;charset=UTF-8")));
+    http.reply(200, expectedFit);
+    ConnectorResult<FitDownload> downloaded = connector.downloadFit(session, remote);
+    assertEquals(SUCCESS, downloaded.status());
+    assertArrayEquals(expectedFit, downloaded.value().bytes());
+
+    String legacyJson =
+        "{\"platform\":\"ONELAP\",\"sha256\":\""
+            + ConnectorHttpSupport.hash("SHA-256", expectedFit)
+            + "\",\"hint\":\"1\",\"submittedAt\":"
+            + CLOCK.millis()
+            + "}";
+    String legacyToken =
+        Base64.getUrlEncoder()
+            .withoutPadding()
+            .encodeToString(legacyJson.getBytes(StandardCharsets.UTF_8));
+    http.reply(
+        200,
+        "{\"code\":200,\"data\":{\"list\":[{\"id\":42,\"ridingRecord\":{\"fitUrl\":\"42.fit\"}}]}}");
+    http.reply(200, expectedFit);
+    ConnectorResult<UploadResult> legacyChecked = connector.checkUpload(session, legacyToken);
+    assertEquals(SUCCESS, legacyChecked.status());
+    assertEquals("42", legacyChecked.value().remoteActivityId());
+  }
+
+  private static byte[] fitWithByte(int marker) {
+    byte[] value = fit();
+    value[12] = (byte) marker;
+    return value;
+  }
+
   private static OnelapConnector onelap(StubClient http) {
     return new OnelapConnector(http, URI.create("https://otm.onelap.cn"), CLOCK);
   }

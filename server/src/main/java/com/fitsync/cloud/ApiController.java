@@ -218,17 +218,21 @@ public class ApiController {
   }
 
   public record PullActivities(
-      List<String> accountIds, List<String> platforms, Integer historyDays) {}
+      List<String> accountIds,
+      List<String> platforms,
+      Integer historyDays,
+      List<String> sportTypes) {}
 
   @PostMapping("/activities/pull")
   public Map<String, Object> pullActivities(
       HttpServletRequest request, @RequestBody(required = false) PullActivities body) {
-    var req = body == null ? new PullActivities(null, null, null) : body;
+    var req = body == null ? new PullActivities(null, null, null, null) : body;
     return jobs.pullFromPlatforms(
         user(request),
         req.accountIds(),
         req.platforms(),
-        req.historyDays() == null ? 90 : req.historyDays());
+        req.historyDays() == null ? 90 : req.historyDays(),
+        req.sportTypes());
   }
 
   @GetMapping("/activities/pull")
@@ -407,7 +411,8 @@ public class ApiController {
       String sourcePlatform,
       String destinationAccountId,
       boolean enabled,
-      boolean includeHistory) {}
+      boolean includeHistory,
+      List<String> sportTypes) {}
 
   @PostMapping("/rules")
   public Map<String, Object> rule(HttpServletRequest request, @RequestBody Rule body) {
@@ -417,7 +422,8 @@ public class ApiController {
         body.sourcePlatform().toUpperCase(Locale.ROOT),
         body.destinationAccountId(),
         body.enabled(),
-        body.includeHistory());
+        body.includeHistory(),
+        body.sportTypes());
   }
 
   @DeleteMapping("/rules/{id}")
@@ -430,7 +436,8 @@ public class ApiController {
       String sourcePlatform,
       List<String> destinationAccountIds,
       List<String> activityIds,
-      Integer historyDays) {}
+      Integer historyDays,
+      List<String> sportTypes) {}
 
   @PostMapping("/sync")
   public Map<String, Object> sync(HttpServletRequest request, @RequestBody Sync body) {
@@ -439,7 +446,8 @@ public class ApiController {
         body.sourcePlatform(),
         body.destinationAccountIds(),
         body.activityIds(),
-        body.historyDays() == null ? 90 : body.historyDays());
+        body.historyDays() == null ? 90 : body.historyDays(),
+        body.sportTypes());
   }
 
   @GetMapping("/jobs")

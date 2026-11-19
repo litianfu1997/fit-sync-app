@@ -190,14 +190,19 @@ public final class OnelapConnector extends WebSessionConnector {
       if (rows == null) return fail(RETRYABLE_FAILURE, "INVALID_ACTIVITY_LIST", "迈金活动列表格式已变化");
       List<RemoteActivity> items = new ArrayList<>();
       for (JsonNode row : rows) {
-        String id = text(row, "workout_id", "ride_record_id", "record_id", "jilu_id", "id");
+        String id = nestedText(row, "workout_id", "ride_record_id", "record_id", "jilu_id", "id");
         if (blank(id)) continue;
-        Long start = startTime(row, "start_riding_time", "start_time", "startTime", "start_date", "timestamp", "create_time");
+        Long start = nestedStartTime(row, "start_riding_time", "start_time", "startTime", "start_date", "timestamp", "create_time");
         if (start != null && start < sinceEpochMs) continue;
-        String fit = text(row, "fit_url", "fitUrl", "file_url", "download_url");
+        String fit = nestedText(row, "fit_url", "fitUrl", "file_url", "download_url");
         Map<String, String> metadata = fit == null ? Map.of() : Map.of("fit_url", fit);
-        items.add(new RemoteActivity(id, start, text(row, "name", "title", "record_name"),
-            distance(row, "distance"), fit, metadata));
+        Double dist = nestedDistance(row, "distance", "distance_meter", "total_distance");
+        if (dist == null) {
+          Double km = nestedDistance(row, "distance_km");
+          if (km != null) dist = km * 1000.0;
+        }
+        items.add(new RemoteActivity(id, start, nestedText(row, "name", "title", "record_name"),
+            dist, fit, metadata));
       }
       boolean more = rows.size() >= PAGE_SIZE;
       return ConnectorResult.success(new ActivityPage(items, Integer.toString(page + 1), more));
@@ -214,8 +219,7 @@ public final class OnelapConnector extends WebSessionConnector {
       ConnectorResult<JsonNode> detail = callOnelap(session, "GET",
           api("/api/otm/ride_record/analysis/" + q(activity.remoteActivityId())), null, null);
       if (detail.status() != SUCCESS) return detail.castFailure();
-      fit = text(detail.value(), "fitUrl", "fit_url", "file_url", "download_url");
-      if (blank(fit)) fit = text(detail.value().path("data"), "fitUrl", "fit_url", "file_url", "download_url");
+      fit = nestedText(detail.value(), "fitUrl", "fit_url", "file_url", "download_url");
       if (blank(fit)) return fail(PERMANENT_FAILURE, "NO_ORIGINAL_FILE", "迈金未返回 FIT 下载地址");
     }
     String encoded = Base64.getEncoder().encodeToString(fit.getBytes(java.nio.charset.StandardCharsets.UTF_8));
@@ -232,8 +236,7 @@ public final class OnelapConnector extends WebSessionConnector {
     if (type != null && type.toLowerCase().contains("json")) {
       try {
         JsonNode root = JSON.readTree(value.bytes());
-        String url = text(root, "url", "fit_url", "download_url");
-        if (blank(url)) url = text(root.path("data"), "url", "fit_url", "download_url");
+        String url = nestedText(root, "url", "fit_url", "download_url", "data");
         if (blank(url)) return fail(PERMANENT_FAILURE, "NO_ORIGINAL_FILE", "迈金未返回 FIT 文件");
         return downloadObject(url, "onelap_" + activity.remoteActivityId() + ".fit");
       } catch (Exception e) {
@@ -266,8 +269,8 @@ public final class OnelapConnector extends WebSessionConnector {
     }
   }
 
-  private ConnectorResult<UploadResult> pendingUpload(byte[] fitBytes, String sha) {
-    return ConnectorResult.processing(pendingToken(fitBytes, sha));
+  private ConnectorResult<UploadResult> pendingUpload(byte[] fitBytes) {
+    return ConnectorResult.processing(pendingToken(fitBytes, "1"));
   }
 
   @Override
@@ -283,20 +286,19 @@ public final class OnelapConnector extends WebSessionConnector {
         ConnectorResult<JsonNode> result = callOnelap(session, "POST", api("/api/otm/ride_record/upload/fit"), body,
             "multipart/form-data; boundary=" + boundary);
         if (result.status() == RETRYABLE_FAILURE || result.status() == REQUIRES_USER_ACTION)
-          return pendingUpload(fitBytes, sha);
+          return pendingUpload(fitBytes);
         if (result.status() != SUCCESS) return result.castFailure();
         JsonNode root = result.value();
-        String id = text(root, "id", "record_id", "ride_record_id", "jilu_id");
-        if (blank(id)) id = text(root.path("data"), "id", "record_id", "ride_record_id", "jilu_id");
+        String id = nestedText(root, "id", "record_id", "ride_record_id", "jilu_id");
         if (!blank(id)) return ConnectorResult.success(new UploadResult(id));
         String message = text(root, "message", "msg", "detail", "error");
         if (message != null && (message.contains("没有上传文件") || message.contains("没有文件上传"))) {
           last = fail(PERMANENT_FAILURE, "ONELAP_FILE_FIELD_REJECTED", "迈金未识别上传文件字段");
           continue;
         }
-        return pendingUpload(fitBytes, sha);
+        return pendingUpload(fitBytes);
       } catch (Exception e) {
-        return pendingUpload(fitBytes, sha);
+        return pendingUpload(fitBytes);
       }
     }
     return last == null ? fail(PERMANENT_FAILURE, "ONELAP_UPLOAD_REJECTED", "迈金拒绝 FIT 上传") : last;
@@ -331,6 +333,63 @@ public final class OnelapConnector extends WebSessionConnector {
       return callOnce(session, method, uri, body, contentType);
     }
     return first;
+  }
+
+  private static final List<String> NESTED_KEYS =
+      List.of("data", "ridingRecord", "riding_record", "rideRecord", "record", "activity", "detail");
+
+  private static String nestedText(JsonNode root, String... keys) {
+    return nestedText(root, 0, keys);
+  }
+
+  private static String nestedText(JsonNode root, int depth, String... keys) {
+    if (root == null || !root.isObject() || depth > 3) return null;
+    String direct = text(root, keys);
+    if (direct != null) return direct;
+    for (String container : NESTED_KEYS) {
+      JsonNode child = root.path(container);
+      if (child.isObject()) {
+        String nested = nestedText(child, depth + 1, keys);
+        if (nested != null) return nested;
+      }
+    }
+    return null;
+  }
+
+  private static Long nestedStartTime(JsonNode root, String... keys) {
+    return nestedStartTime(root, 0, keys);
+  }
+
+  private static Long nestedStartTime(JsonNode root, int depth, String... keys) {
+    if (root == null || !root.isObject() || depth > 3) return null;
+    Long direct = startTime(root, keys);
+    if (direct != null) return direct;
+    for (String container : NESTED_KEYS) {
+      JsonNode child = root.path(container);
+      if (child.isObject()) {
+        Long nested = nestedStartTime(child, depth + 1, keys);
+        if (nested != null) return nested;
+      }
+    }
+    return null;
+  }
+
+  private static Double nestedDistance(JsonNode root, String... keys) {
+    return nestedDistance(root, 0, keys);
+  }
+
+  private static Double nestedDistance(JsonNode root, int depth, String... keys) {
+    if (root == null || !root.isObject() || depth > 3) return null;
+    Double direct = distance(root, keys);
+    if (direct != null) return direct;
+    for (String container : NESTED_KEYS) {
+      JsonNode child = root.path(container);
+      if (child.isObject()) {
+        Double nested = nestedDistance(child, depth + 1, keys);
+        if (nested != null) return nested;
+      }
+    }
+    return null;
   }
 
   private static JsonNode array(JsonNode root, String... keys) {

@@ -7,9 +7,16 @@ import SessionGate from "../../components/SessionGate.vue";
 import LoadState from "../../components/LoadState.vue";
 import { api, apiBase, confirm, go, messageOf, session, toast } from "../../lib/api";
 import { useLoad } from "../../lib/page";
-import { date, platformName, platformInitials, statusLabel } from "../../lib/format";
+import {
+  date,
+  platformName,
+  platformInitials,
+  sportCategoryOptions,
+  sportTypesSummary,
+  statusLabel,
+} from "../../lib/format";
 import { platformLoginHints } from "../../lib/web-session";
-import type { Account, PlatformCode, Rule } from "../../lib/types";
+import type { Account, PlatformCode, Rule, SportCategory } from "../../lib/types";
 const accounts = ref<Account[]>([]),
   rules = ref<Rule[]>([]),
   connecting = ref(false),
@@ -39,6 +46,8 @@ const connectablePlatforms = computed(
 );
 const source = ref<PlatformCode>("LOCAL"),
   destinationIds = ref<string[]>([]),
+  syncSportTypes = ref<SportCategory[]>(["CYCLING", "RUNNING", "OTHER"]),
+  syncSportTouched = ref(false),
   historyDays = ref("90"),
   syncing = ref(false),
   syncError = ref(""),
@@ -86,6 +95,8 @@ onUnmounted(() => {
 });
 const ruleSource = ref<PlatformCode>("LOCAL"),
   ruleDestination = ref(""),
+  ruleSportTypes = ref<SportCategory[]>(["CYCLING", "RUNNING", "OTHER"]),
+  ruleSportTouched = ref(false),
   includeHistory = ref(false),
   savingRule = ref(false),
   ruleBusy = ref(""),
@@ -106,8 +117,22 @@ const sourceOptions = computed(() => [
 const destinationAccounts = computed(() =>
   accounts.value.filter((a) => a.platform !== source.value),
 );
+const selectedDestinationAccounts = computed(() =>
+  accounts.value.filter((a) => destinationIds.value.includes(a.id)),
+);
+const hasOnelapDestination = computed(() =>
+  selectedDestinationAccounts.value.some((a) => a.platform === "ONELAP"),
+);
+const onlyOnelapDestination = computed(
+  () =>
+    selectedDestinationAccounts.value.length > 0 &&
+    selectedDestinationAccounts.value.every((a) => a.platform === "ONELAP"),
+);
 const ruleDestinations = computed(() =>
   accounts.value.filter((a) => a.platform !== ruleSource.value),
+);
+const ruleDestinationIsOnelap = computed(
+  () => accountPlatform(ruleDestination.value) === "ONELAP",
 );
 const selectedSource = computed(() =>
   sourceOptions.value.findIndex((p) => p.code === source.value),
@@ -118,6 +143,18 @@ const selectedRuleSource = computed(() =>
 const selectedRuleDestination = computed(() =>
   ruleDestinations.value.findIndex((a) => a.id === ruleDestination.value),
 );
+function applyDefaultSyncSportTypes() {
+  if (syncSportTouched.value) return;
+  syncSportTypes.value = onlyOnelapDestination.value
+    ? ["CYCLING"]
+    : ["CYCLING", "RUNNING", "OTHER"];
+}
+function applyDefaultRuleSportTypes() {
+  if (ruleSportTouched.value) return;
+  ruleSportTypes.value = ruleDestinationIsOnelap.value
+    ? ["CYCLING"]
+    : ["CYCLING", "RUNNING", "OTHER"];
+}
 const { loading, error, reload } = useLoad(async () => {
   const [a, r] = await Promise.all([
     api<Account[]>("/accounts"),
@@ -130,21 +167,44 @@ const { loading, error, reload } = useLoad(async () => {
   );
   if (!ruleDestinations.value.some((x) => x.id === ruleDestination.value))
     ruleDestination.value = ruleDestinations.value[0]?.id || "";
+  applyDefaultSyncSportTypes();
+  applyDefaultRuleSportTypes();
 });
 function chooseSource(index: number) {
   source.value = sourceOptions.value[index].code;
   destinationIds.value = destinationIds.value.filter((id) =>
     destinationAccounts.value.some((a) => a.id === id),
   );
+  applyDefaultSyncSportTypes();
 }
 function chooseRuleSource(index: number) {
   ruleSource.value = sourceOptions.value[index].code;
   ruleDestination.value = ruleDestinations.value[0]?.id || "";
+  applyDefaultRuleSportTypes();
+}
+function chooseRuleDestination(index: number) {
+  const next = ruleDestinations.value[index];
+  if (!next) return;
+  ruleDestination.value = next.id;
+  applyDefaultRuleSportTypes();
 }
 function toggleDestination(id: string) {
   destinationIds.value = destinationIds.value.includes(id)
     ? destinationIds.value.filter((x) => x !== id)
     : [...destinationIds.value, id];
+  applyDefaultSyncSportTypes();
+}
+function toggleSyncSportType(code: SportCategory) {
+  syncSportTouched.value = true;
+  syncSportTypes.value = syncSportTypes.value.includes(code)
+    ? syncSportTypes.value.filter((x) => x !== code)
+    : [...syncSportTypes.value, code];
+}
+function toggleRuleSportType(code: SportCategory) {
+  ruleSportTouched.value = true;
+  ruleSportTypes.value = ruleSportTypes.value.includes(code)
+    ? ruleSportTypes.value.filter((x) => x !== code)
+    : [...ruleSportTypes.value, code];
 }
 function clearOAuthPoll() {
   if (oauthPollTimer) {
@@ -325,6 +385,10 @@ async function sync() {
     syncError.value = "从本地活动库投递时，请至少选择一个目标平台";
     return;
   }
+  if (!selectedMode.value && !syncSportTypes.value.length) {
+    syncError.value = "请至少选择一种活动类型";
+    return;
+  }
   syncing.value = true;
   try {
     const result = await api<{ jobIds: string[] }>(
@@ -334,6 +398,7 @@ async function sync() {
         sourcePlatform: source.value,
         destinationAccountIds: destinationIds.value,
         historyDays: days,
+        ...(!selectedMode.value ? { sportTypes: syncSportTypes.value } : {}),
         ...(activityIds.value.length ? { activityIds: activityIds.value } : {}),
       },
       true,
@@ -356,6 +421,10 @@ async function saveRule() {
     ruleError.value = "请先连接目标平台账号";
     return;
   }
+  if (!ruleSportTypes.value.length) {
+    ruleError.value = "请至少选择一种活动类型";
+    return;
+  }
   savingRule.value = true;
   try {
     await api<Rule>("/rules", "POST", {
@@ -363,6 +432,7 @@ async function saveRule() {
       destinationAccountId: ruleDestination.value,
       enabled: true,
       includeHistory: includeHistory.value,
+      sportTypes: ruleSportTypes.value,
     });
     toast("自动同步规则已保存");
     await reload();
@@ -662,6 +732,37 @@ const accountPlatform = (id: string) =>
               ><text v-else class="muted"
                 >请先连接一个不同的目标平台。</text
               ></view
+            ><view v-if="!selectedMode" class="form-field"
+              ><text class="field-label"
+                >活动类型<text class="tiny muted">（可多选）</text></text
+              ><view class="destination-options"
+                ><button
+                  v-for="opt in sportCategoryOptions"
+                  :key="opt.code"
+                  class="destination-chip"
+                  :class="{ checked: syncSportTypes.includes(opt.code) }"
+                  :disabled="syncing"
+                  @click="toggleSyncSportType(opt.code)"
+                >
+                  <text class="check-square">{{
+                    syncSportTypes.includes(opt.code) ? "✓" : ""
+                  }}</text
+                  >{{ opt.label }}
+                </button></view
+              ><text v-if="!syncSportTypes.length" class="tiny danger block"
+                >请至少选择一种活动类型。</text
+              ><text
+                v-else-if="
+                  hasOnelapDestination &&
+                  syncSportTypes.some((t) => t !== 'CYCLING')
+                "
+                class="tiny muted"
+                >提示：迈金一般仅支持骑行类活动，非骑行记录可能会被忽略或上传失败。</text
+              ><text v-else-if="hasOnelapDestination" class="tiny muted"
+                >迈金一般仅支持骑行类活动，当前仅同步骑行记录。</text
+              ><text v-else class="tiny muted"
+                >默认包含全部类型，可按需只勾选骑行或跑步。</text
+              ></view
             ><view class="form-field"
               ><text class="field-label">拉取历史范围（天）</text
               ><input
@@ -708,9 +809,14 @@ const accountPlatform = (id: string) =>
                   {{
                     platformName(accountPlatform(rule.destinationAccountId))
                   }}</text
-                ><text class="tiny muted">{{
-                  rule.includeHistory ? "包含已有活动" : "仅规则创建后的新活动"
-                }}</text></view
+                ><text class="tiny muted"
+                  >{{ sportTypesSummary(rule.sportTypes) }} ·
+                  {{
+                    rule.includeHistory
+                      ? "包含已有活动"
+                      : "仅规则创建后的新活动"
+                  }}</text
+                ></view
               ><switch
                 :color="themeColors.primary"
                 :checked="rule.enabled"
@@ -740,10 +846,7 @@ const accountPlatform = (id: string) =>
                 range-key="displayName"
                 :value="Math.max(0, selectedRuleDestination)"
                 :disabled="!ruleDestinations.length"
-                @change="
-                  ruleDestination =
-                    ruleDestinations[Number($event.detail.value)].id
-                "
+                @change="chooseRuleDestination(Number($event.detail.value))"
                 ><view class="input select-input"
                   >{{
                     ruleDestinations.length
@@ -751,6 +854,35 @@ const accountPlatform = (id: string) =>
                       : "请先连接目标平台"
                   }}<text>⌄</text></view
                 ></picker
+              ><view class="rule-sport-field"
+                ><text class="field-label"
+                  >活动类型<text class="tiny muted">（可多选）</text></text
+                ><view class="destination-options"
+                  ><button
+                    v-for="opt in sportCategoryOptions"
+                    :key="opt.code"
+                    class="destination-chip"
+                    :class="{ checked: ruleSportTypes.includes(opt.code) }"
+                    :disabled="savingRule"
+                    @click="toggleRuleSportType(opt.code)"
+                  >
+                    <text class="check-square">{{
+                      ruleSportTypes.includes(opt.code) ? "✓" : ""
+                    }}</text
+                    >{{ opt.label }}
+                  </button></view
+                ><text v-if="!ruleSportTypes.length" class="tiny danger block"
+                  >请至少选择一种活动类型。</text
+                ><text
+                  v-else-if="
+                    ruleDestinationIsOnelap &&
+                    ruleSportTypes.some((t) => t !== 'CYCLING')
+                  "
+                  class="tiny muted"
+                  >提示：迈金一般仅支持骑行类活动。</text
+                ><text v-else-if="ruleDestinationIsOnelap" class="tiny muted"
+                  >迈金一般仅支持骑行类活动，已默认仅同步骑行。</text
+                ></view
               ><checkbox-group
                 @change="
                   includeHistory = $event.detail.value.includes('history')

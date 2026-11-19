@@ -196,12 +196,12 @@ abstract class WebSessionConnector extends ConnectorHttpSupport {
 
   /** 网页会话上传确认不依赖外部 UID，仍以文件 SHA-256 防错配。 */
   protected final String webConfirmation(byte[] fit, String hint) throws Exception {
-    return encodeWebConfirmation(platform(), hash("SHA-256", fit), hint, clock.millis());
+    return encodeWebConfirmation(platform(), hash("SHA-256", fit), hint, clock.millis(), 0);
   }
 
   /**
-   * 网页平台只返回“已受理”时的确认流程：分页检查最近活动，只下载少量候选并比对
-   * SHA-256，命中才记录真实远端 ID；未命中则推进游标，绝不重新 POST 文件。
+   * 网页平台只返回“已受理”时的确认流程：分页检查最近活动，按页内偏移逐批核对避免漏掉后半页，
+   * 比对 SHA-256 命中才记录真实远端 ID；未命中则推进游标，绝不重新 POST 文件。
    */
   @Override
   public ConnectorResult<UploadResult> checkUpload(Session session, String confirmationToken) {
@@ -230,22 +230,28 @@ abstract class WebSessionConnector extends ConnectorHttpSupport {
       String cursor = cursorFromHint(token.hint());
       ConnectorResult<ActivityPage> pageResult = listActivities(session, 0, cursor);
       if (pageResult.status() != SUCCESS) return pageResult.castFailure();
+      List<RemoteActivity> items = pageResult.value().items();
       int inspected = 0;
-      for (RemoteActivity candidate : pageResult.value().items()) {
-        if (inspected >= 5) break;
+      int offset = Math.max(0, token.offset());
+      for (; offset < items.size() && inspected < 5; offset++) {
+        RemoteActivity candidate = items.get(offset);
         inspected++;
         ConnectorResult<FitDownload> file = downloadFit(session, candidate);
         if (file.status() == REQUIRES_LOGIN) return file.castFailure();
         if (file.status() == SUCCESS && token.sha256().equals(hash("SHA-256", file.value().bytes())))
           return ConnectorResult.success(new UploadResult(candidate.remoteActivityId()));
       }
-      String next =
-          pageResult.value().hasMore() && pageResult.value().nextCursor() != null
-              ? pageResult.value().nextCursor()
-              : "1";
+      String next = cursor == null ? "1" : cursor;
+      if (offset >= items.size()) {
+        next =
+            pageResult.value().hasMore() && pageResult.value().nextCursor() != null
+                ? pageResult.value().nextCursor()
+                : "1";
+        offset = 0;
+      }
       return ConnectorResult.processing(
           encodeWebConfirmation(
-              platform(), token.sha256(), next, token.submittedAt()));
+              platform(), token.sha256(), next, token.submittedAt(), offset));
     } catch (Exception e) {
       return invalidConfirmation();
     }
@@ -265,10 +271,12 @@ abstract class WebSessionConnector extends ConnectorHttpSupport {
   }
 
   private static String encodeWebConfirmation(
-      String platform, String sha256, String hint, long submittedAt) throws Exception {
+      String platform, String sha256, String hint, long submittedAt, int offset) throws Exception {
     return java.util.Base64.getUrlEncoder().withoutPadding()
-        .encodeToString(JSON.writeValueAsString(new WebConfirmation(platform, sha256, hint, submittedAt))
-            .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        .encodeToString(
+            JSON.writeValueAsString(
+                    new WebConfirmation(platform, sha256, hint, submittedAt, Math.max(0, offset)))
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8));
   }
 
   protected final String pendingToken(byte[] fit, String hint) {
@@ -279,5 +287,6 @@ abstract class WebSessionConnector extends ConnectorHttpSupport {
     }
   }
 
-  record WebConfirmation(String platform, String sha256, String hint, long submittedAt) {}
+  record WebConfirmation(
+      String platform, String sha256, String hint, long submittedAt, int offset) {}
 }

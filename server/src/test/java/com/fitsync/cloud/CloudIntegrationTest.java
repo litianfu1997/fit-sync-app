@@ -1277,6 +1277,264 @@ class CloudIntegrationTest {
         .andExpect(status().isNotFound());
   }
 
+  @Test
+  void manualSyncAndRulesFilterBySportTypesEndToEnd() throws Exception {
+    Login login = login();
+    PlatformConnector garmin = mock(PlatformConnector.class);
+    PlatformConnector onelap = mock(PlatformConnector.class);
+    doReturn(garmin).when(accounts).connector("GARMIN");
+    doReturn(onelap).when(accounts).connector("ONELAP");
+    when(garmin.login(anyString(), anyString(), anyBoolean()))
+        .thenReturn(ConnectorResult.success(new Session("g-tok", "g-1", "g@ex.com", "pw", true)));
+    when(onelap.login(anyString(), anyString(), anyBoolean()))
+        .thenReturn(ConnectorResult.success(new Session("o-tok", "o-1", "o@ex.com", "pw", true)));
+
+    String garminResp =
+        mvc.perform(
+                post("/api/v1/accounts")
+                    .header("Authorization", "Bearer " + login.token())
+                    .contentType("application/json")
+                    .content(
+                        "{\"platform\":\"GARMIN\",\"username\":\"g@ex.com\",\"password\":\"pw\",\"storeCredentials\":true}"))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    String onelapResp =
+        mvc.perform(
+                post("/api/v1/accounts")
+                    .header("Authorization", "Bearer " + login.token())
+                    .contentType("application/json")
+                    .content(
+                        "{\"platform\":\"ONELAP\",\"username\":\"o@ex.com\",\"password\":\"pw\",\"storeCredentials\":true}"))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    String garminAcc = store.json.readTree(garminResp).get("id").asText();
+    String onelapAcc = store.json.readTree(onelapResp).get("id").asText();
+
+    int recentSec = (int) ((System.currentTimeMillis() - 631_065_600_000L) / 1000L) - 7200;
+    long recentMs = 631_065_600_000L + recentSec * 1000L;
+    byte[] garminNewRide = rideFit(recentSec, 2, 3_600_000, 3_500_000, 3_000_000, 145, 1);
+    byte[] garminAmbiguousRun = rideFit(recentSec + 600, 1, 1_800_000, 1_750_000, 800_000, 155, 1);
+    byte[] garminKnownRide = rideFit(recentSec - 3600, 2, 2_400_000, 2_300_000, 2_000_000, 142, 1);
+    byte[] garminKnownRun = rideFit(recentSec - 7200, 1, 1_500_000, 1_450_000, 500_000, 152, 1);
+
+    // 预先存在两条已从 Garmin 拉取到云端、尚未投递到迈金的活动（一条骑行、一条跑步）。
+    var existingRideRes =
+        activities.importFit(
+            login.user(), garminKnownRide, "GARMIN", garminAcc, "g-old-ride", "旧骑行");
+    var existingRunRes =
+        activities.importFit(
+            login.user(), garminKnownRun, "GARMIN", garminAcc, "g-old-run", "旧跑步");
+    String existingRideId = existingRideRes.get("activityId").toString();
+    String existingRunId = existingRunRes.get("activityId").toString();
+
+    when(onelap.listActivities(any(), anyLong(), any()))
+        .thenReturn(ConnectorResult.success(new ActivityPage(List.of(), null, false)));
+    when(garmin.listActivities(any(), anyLong(), any()))
+        .thenReturn(
+            ConnectorResult.success(
+                new ActivityPage(
+                    List.of(
+                        new RemoteActivity(
+                            "g-old-ride",
+                            recentMs - 3_600_000,
+                            "旧骑行",
+                            20000.0,
+                            null,
+                            Map.of("sport_type", "road_biking")),
+                        new RemoteActivity(
+                            "g-old-run",
+                            recentMs - 7_200_000,
+                            "旧跑步",
+                            5000.0,
+                            null,
+                            Map.of("sport_type", "running")),
+                        new RemoteActivity(
+                            "g-new-ride",
+                            recentMs,
+                            "周末公路骑行",
+                            30000.0,
+                            null,
+                            Map.of("sport_type", "road_biking")),
+                        new RemoteActivity(
+                            "g-new-run",
+                            recentMs + 300_000,
+                            "晨间路跑",
+                            10000.0,
+                            null,
+                            Map.of("sport_type", "running")),
+                        new RemoteActivity(
+                            "g-unknown-run",
+                            recentMs + 600_000,
+                            "未分类跑",
+                            8000.0,
+                            null,
+                            Map.of("sport_type", "uncategorized"))),
+                    null,
+                    false)));
+    when(garmin.downloadFit(any(), argThat(a -> a != null && "g-new-ride".equals(a.remoteActivityId()))))
+        .thenReturn(ConnectorResult.success(new FitDownload(garminNewRide, "g-new-ride.fit")));
+    when(garmin.downloadFit(
+            any(), argThat(a -> a != null && "g-unknown-run".equals(a.remoteActivityId()))))
+        .thenReturn(
+            ConnectorResult.success(new FitDownload(garminAmbiguousRun, "g-unknown-run.fit")));
+    when(onelap.uploadFit(any(), any(), any()))
+        .thenReturn(ConnectorResult.success(new UploadResult("onelap-1")), ConnectorResult.success(new UploadResult("onelap-2")));
+
+    // 校验空活动类型与无效活动类型均返回 400。
+    mvc.perform(
+            post("/api/v1/sync")
+                .header("Authorization", "Bearer " + login.token())
+                .contentType("application/json")
+                .content(
+                    store.encode(
+                        Map.of(
+                            "sourcePlatform",
+                            "GARMIN",
+                            "destinationAccountIds",
+                            List.of(onelapAcc),
+                            "historyDays",
+                            90,
+                            "sportTypes",
+                            List.of()))))
+        .andExpect(status().isBadRequest());
+
+    String syncJson =
+        mvc.perform(
+                post("/api/v1/sync")
+                    .header("Authorization", "Bearer " + login.token())
+                    .contentType("application/json")
+                    .content(
+                        store.encode(
+                            Map.of(
+                                "sourcePlatform",
+                                "GARMIN",
+                                "destinationAccountIds",
+                                List.of(onelapAcc),
+                                "historyDays",
+                                90,
+                                "sportTypes",
+                                List.of("CYCLING")))))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    for (var idNode : store.json.readTree(syncJson).get("jobIds")) {
+      jobs.runOne(idNode.asText());
+    }
+    // 跑完所有生成的 DELIVERY 任务。
+    for (var deliveryJob :
+        store.db.queryForList(
+            "SELECT id FROM sync_job WHERE user_id=? AND kind='DELIVERY'", login.user())) {
+      jobs.runOne(CloudStore.str(deliveryJob, "id"));
+    }
+
+    // 清晰的 running 活动不会下载 FIT；uncategorized 下载后经 FitParser 判定为 RUNNING，也不投递到迈金。
+    verify(garmin, never())
+        .downloadFit(any(), argThat(a -> a != null && "g-new-run".equals(a.remoteActivityId())));
+    verify(garmin, times(1))
+        .downloadFit(any(), argThat(a -> a != null && "g-new-ride".equals(a.remoteActivityId())));
+    verify(garmin, times(1))
+        .downloadFit(
+            any(), argThat(a -> a != null && "g-unknown-run".equals(a.remoteActivityId())));
+
+    // 只有两场骑行（旧骑行 + 新骑行）生成并完成了对迈金的投递；跑步活动未投递。
+    var deliveredIds =
+        store.db.queryForList(
+                "SELECT activity_id FROM sync_job WHERE user_id=? AND kind='DELIVERY' AND"
+                    + " account_id=?",
+                login.user(),
+                onelapAcc)
+            .stream()
+            .map(r -> CloudStore.str(r, "activity_id"))
+            .collect(java.util.stream.Collectors.toSet());
+    assertEquals(2, deliveredIds.size());
+    assertTrue(deliveredIds.contains(existingRideId));
+    assertFalse(deliveredIds.contains(existingRunId));
+
+    // 本地源手动同步同样按 sportTypes 过滤。
+    byte[] localRide = rideFit(recentSec - 10800, 2, 1_800_000, 1_750_000, 1_500_000, 138, 1);
+    byte[] localRun = rideFit(recentSec - 14400, 1, 1_200_000, 1_150_000, 400_000, 150, 1);
+    String localRideId =
+        activities.importFit(login.user(), localRide, "LOCAL", null, null, "本地骑行")
+            .get("activityId")
+            .toString();
+    String localRunId =
+        activities.importFit(login.user(), localRun, "LOCAL", null, null, "本地跑步")
+            .get("activityId")
+            .toString();
+    mvc.perform(
+            post("/api/v1/sync")
+                .header("Authorization", "Bearer " + login.token())
+                .contentType("application/json")
+                .content(
+                    store.encode(
+                        Map.of(
+                            "sourcePlatform",
+                            "LOCAL",
+                            "destinationAccountIds",
+                            List.of(onelapAcc),
+                            "historyDays",
+                            90,
+                            "sportTypes",
+                            List.of("CYCLING")))))
+        .andExpect(status().isOk());
+    var localDelivered =
+        store.db.queryForList(
+                "SELECT activity_id FROM sync_job WHERE user_id=? AND kind='DELIVERY' AND"
+                    + " account_id=?",
+                login.user(),
+                onelapAcc)
+            .stream()
+            .map(r -> CloudStore.str(r, "activity_id"))
+            .collect(java.util.stream.Collectors.toSet());
+    assertTrue(localDelivered.contains(localRideId));
+    assertFalse(localDelivered.contains(localRunId));
+
+    // 自动同步规则支持 sportTypes，并在开关切换时保留原配置、仅投递匹配类型的活动。
+    mvc.perform(
+            post("/api/v1/rules")
+                .header("Authorization", "Bearer " + login.token())
+                .contentType("application/json")
+                .content(
+                    store.encode(
+                        Map.of(
+                            "sourcePlatform",
+                            "LOCAL",
+                            "destinationAccountId",
+                            garminAcc,
+                            "enabled",
+                            true,
+                            "includeHistory",
+                            true,
+                            "sportTypes",
+                            List.of("CYCLING")))))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.sportTypes.length()").value(1))
+        .andExpect(jsonPath("$.sportTypes[0]").value("CYCLING"));
+    var ruleDelivered =
+        store.db.queryForList(
+                "SELECT activity_id FROM sync_job WHERE user_id=? AND kind='DELIVERY' AND"
+                    + " account_id=?",
+                login.user(),
+                garminAcc)
+            .stream()
+            .map(r -> CloudStore.str(r, "activity_id"))
+            .collect(java.util.stream.Collectors.toSet());
+    assertEquals(Set.of(localRideId), ruleDelivered);
+
+    // 未传 sportTypes 更新 enabled 时保留规则原有的 CYCLING 限制。
+    jobs.rule(login.user(), "LOCAL", garminAcc, false, true);
+    mvc.perform(get("/api/v1/rules").header("Authorization", "Bearer " + login.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$[0].enabled").value(false))
+        .andExpect(jsonPath("$[0].sportTypes.length()").value(1))
+        .andExpect(jsonPath("$[0].sportTypes[0]").value("CYCLING"));
+  }
+
   private static byte[] rideFit(
       int startTimeSec,
       int sport,
@@ -1410,6 +1668,190 @@ class CloudIntegrationTest {
     buffer.putShort((short) crc(bytes, 12));
     buffer.put(data).putShort((short) crc(bytes, bytes.length - 2));
     return bytes;
+  }
+
+  @Test
+  void confirmingDeliveriesReconcileBatchWhenPlatformReencodesOrOmitsOriginalFit()
+      throws Exception {
+    Login login = login();
+    String account = account(login);
+    long fitEpochOffsetMs = 631_065_600_000L;
+    byte[] fitA = rideFit(100_000, 2, 3600_000, 3500_000, 3250_000, 145, 1);
+    byte[] fitB = rideFit(200_000, 2, 1800_000, 1750_000, 1800_000, 140, 1);
+    byte[] fitC = rideFit(300_000, 2, 2400_000, 2300_000, 2100_000, 142, 1);
+    String actA =
+        activities
+            .importFit(login.user(), fitA, "LOCAL", null, null, "Mahdha 虚拟骑行")
+            .get("activityId")
+            .toString();
+    String actB =
+        activities
+            .importFit(login.user(), fitB, "LOCAL", null, null, "Dubai 虚拟骑行")
+            .get("activityId")
+            .toString();
+    String actC =
+        activities
+            .importFit(login.user(), fitC, "LOCAL", null, null, "Dubai 虚拟骑行")
+            .get("activityId")
+            .toString();
+    String jobA = jobs.delivery(login.user(), actA, account);
+    String jobB = jobs.delivery(login.user(), actB, account);
+    String jobC = jobs.delivery(login.user(), actC, account);
+
+    when(connector.uploadFit(any(), any(), any()))
+        .thenReturn(
+            ConnectorResult.processing("token-a"),
+            ConnectorResult.processing("token-b"),
+            ConnectorResult.processing("token-c"));
+    jobs.runOne(jobA);
+    jobs.runOne(jobB);
+    jobs.runOne(jobC);
+    assertEquals(
+        "CONFIRMING", store.one("SELECT status FROM sync_job WHERE id=?", jobA).get("status"));
+
+    // 模拟另一个有重试中的 PULL 任务，不应阻塞已进入 CONFIRMING 的确认检查。
+    store.db.update(
+        "INSERT INTO"
+            + " sync_job(id,user_id,kind,status,account_id,activity_id,idempotency_key,payload_json,attempt_count,next_run_at,created_at,updated_at)"
+            + " VALUES(?,?,'PULL','RETRY',?,NULL,?,?,1,?,?,?)",
+        CloudStore.id(),
+        login.user(),
+        account,
+        "pull-retry:" + CloudStore.id(),
+        "{}",
+        System.currentTimeMillis() + 60_000,
+        System.currentTimeMillis(),
+        System.currentTimeMillis());
+
+    store.db.update("UPDATE sync_job SET next_run_at=0 WHERE id IN (?,?,?)", jobA, jobB, jobC);
+    when(connector.checkUpload(any(), eq("token-a")))
+        .thenReturn(ConnectorResult.processing("token-a-next"));
+    when(connector.listActivities(any(), anyLong(), isNull()))
+        .thenReturn(
+            ConnectorResult.success(
+                new ActivityPage(
+                    List.of(
+                        new RemoteActivity(
+                            "onelap-c",
+                            fitEpochOffsetMs + 300_000L * 1000L,
+                            "Dubai 虚拟骑行",
+                            21_000.0,
+                            null,
+                            Map.of())),
+                    "2",
+                    true)));
+    when(connector.listActivities(any(), anyLong(), eq("2")))
+        .thenReturn(
+            ConnectorResult.success(
+                new ActivityPage(
+                    List.of(
+                        new RemoteActivity(
+                            "onelap-b",
+                            fitEpochOffsetMs + 200_000L * 1000L,
+                            "Dubai 虚拟骑行",
+                            18_000.0,
+                            null,
+                            Map.of()),
+                        new RemoteActivity(
+                            "onelap-a",
+                            fitEpochOffsetMs + 100_000L * 1000L,
+                            "Mahdha 虚拟骑行",
+                            32_500.0,
+                            null,
+                            Map.of())),
+                    "3",
+                    false)));
+
+    jobs.runOne(jobA);
+
+    assertEquals(
+        "SUCCEEDED", store.one("SELECT status FROM sync_job WHERE id=?", jobA).get("status"));
+    assertEquals(
+        "SUCCEEDED", store.one("SELECT status FROM sync_job WHERE id=?", jobB).get("status"));
+    assertEquals(
+        "SUCCEEDED", store.one("SELECT status FROM sync_job WHERE id=?", jobC).get("status"));
+    assertEquals(
+        "onelap-a",
+        store
+            .one(
+                "SELECT remote_id FROM platform_copy WHERE user_id=? AND activity_id=? AND"
+                    + " account_id=?",
+                login.user(),
+                actA,
+                account)
+            .get("remote_id"));
+    assertEquals(
+        "onelap-b",
+        store
+            .one(
+                "SELECT remote_id FROM platform_copy WHERE user_id=? AND activity_id=? AND"
+                    + " account_id=?",
+                login.user(),
+                actB,
+                account)
+            .get("remote_id"));
+    assertEquals(
+        "onelap-c",
+        store
+            .one(
+                "SELECT remote_id FROM platform_copy WHERE user_id=? AND activity_id=? AND"
+                    + " account_id=?",
+                login.user(),
+                actC,
+                account)
+            .get("remote_id"));
+    verify(connector, never()).downloadFit(any(), any());
+  }
+
+  @Test
+  void confirmingDeliveryReconcilesReencodedFitViaDeduplicatorAutoMerge() throws Exception {
+    Login login = login();
+    String account = account(login);
+    long fitEpochOffsetMs = 631_065_600_000L;
+    byte[] uploaded = rideFit(400_000, 2, 3600_000, 3500_000, 2500_000, 145, 1);
+    byte[] reencoded = rideFit(400_005, 2, 3600_000, 3500_000, 2500_000, 146, 2);
+    String act =
+        activities
+            .importFit(login.user(), uploaded, "LOCAL", null, null, "Villanueva 虚拟骑行")
+            .get("activityId")
+            .toString();
+    String job = jobs.delivery(login.user(), act, account);
+
+    when(connector.uploadFit(any(), any(), any()))
+        .thenReturn(ConnectorResult.processing("token-reencoded"));
+    jobs.runOne(job);
+    store.db.update("UPDATE sync_job SET next_run_at=0 WHERE id=?", job);
+
+    RemoteActivity remoteWithoutSummary =
+        new RemoteActivity(
+            "onelap-reencoded",
+            fitEpochOffsetMs + 400_000L * 1000L,
+            "未命名",
+            null,
+            "https://files.onelap.cn/reencoded.fit",
+            Map.of());
+    when(connector.checkUpload(any(), eq("token-reencoded")))
+        .thenReturn(ConnectorResult.processing("token-reencoded-2"));
+    when(connector.listActivities(any(), anyLong(), isNull()))
+        .thenReturn(
+            ConnectorResult.success(new ActivityPage(List.of(remoteWithoutSummary), "2", false)));
+    when(connector.downloadFit(any(), eq(remoteWithoutSummary)))
+        .thenReturn(ConnectorResult.success(new FitDownload(reencoded, "reencoded.fit")));
+
+    jobs.runOne(job);
+
+    assertEquals(
+        "SUCCEEDED", store.one("SELECT status FROM sync_job WHERE id=?", job).get("status"));
+    assertEquals(
+        "onelap-reencoded",
+        store
+            .one(
+                "SELECT remote_id FROM platform_copy WHERE user_id=? AND activity_id=? AND"
+                    + " account_id=?",
+                login.user(),
+                act,
+                account)
+            .get("remote_id"));
   }
 
   private static int crc(byte[] bytes, int count) {
