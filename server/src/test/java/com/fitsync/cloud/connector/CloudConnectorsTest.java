@@ -509,8 +509,154 @@ class CloudConnectorsTest {
     assertEquals("connect-csrf-1", session.attribute("csrf"));
     assertTrue(session.attribute("ssoCookie").contains("CASTGC=TGT-999"));
     assertTrue(session.attribute("cookie").contains("JWT_WEB=jwt-web-1"));
-    assertTrue(body(http.requests.get(1)).contains("_csrf=form-csrf-1"));
+    String postBody = body(http.requests.get(1));
+    assertTrue(postBody.contains("_csrf=form-csrf-1"));
+    assertTrue(postBody.contains("embed=false"));
+    assertFalse(postBody.contains("locale=zh-CN"));
+    assertFalse(postBody.contains("clientId="));
+    assertFalse(postBody.contains("service="));
     assertEquals(3, http.requests.size());
+  }
+
+  @Test
+  void garminLoginKeepsJwtWebWhenSameResponseClearsLegacyDomainCookie() throws Exception {
+    for (List<String> setCookies :
+        List.of(
+            List.of(
+                "JWT_WEB=jwt-web-1; Path=/",
+                "JWT_WEB=; Max-Age=0; Domain=.connect.garmin.cn; Path=/",
+                "SESSION=s1; Path=/"),
+            List.of(
+                "JWT_WEB=; Max-Age=0; Domain=.connect.garmin.cn; Path=/",
+                "JWT_WEB=jwt-web-2; Path=/",
+                "SESSION=s2; Path=/"))) {
+      StubClient http = new StubClient();
+      http.reply(
+          200,
+          "<form><input type=\"hidden\" name=\"_csrf\" value=\"form-csrf-1\"></form>",
+          Map.of("Set-Cookie", List.of("GARMIN-SSO=sso1; Path=/")));
+      http.reply(
+          302,
+          "",
+          Map.of(
+              "Location", List.of("https://connect.garmin.cn/app/?ticket=ST-12345"),
+              "Set-Cookie", List.of("CASTGC=TGT-999; Path=/")));
+      http.reply(
+          200,
+          "<html><meta name=\"csrf-token\" content=\"connect-csrf-1\"></html>",
+          Map.of("Set-Cookie", setCookies));
+      ConnectorResult<Session> logged =
+          garmin(http).login("garmin@example.com", "garmin-pass", true);
+      assertEquals(SUCCESS, logged.status());
+      String expectedJwt = setCookies.stream().filter(s -> s.contains("jwt-web-")).findFirst().get();
+      String jwtValue = expectedJwt.split(";", 2)[0].split("=", 2)[1];
+      assertEquals(jwtValue, logged.value().accessToken());
+      assertTrue(logged.value().attribute("cookie").contains("JWT_WEB=" + jwtValue));
+    }
+    assertEquals(
+        "SESSION=s1",
+        WebSessionConnector.mergeCookies(
+            "JWT_WEB=old; SESSION=s1",
+            List.of("JWT_WEB=; Max-Age=0; Domain=.connect.garmin.cn; Path=/")));
+  }
+
+  @Test
+  void garminLoginFollowsSsoRedirectAndDetectsCloudflareChallenge() throws Exception {
+    StubClient http = new StubClient();
+    http.reply(
+        200,
+        "<form><input type=\"hidden\" name=\"_csrf\" value=\"form-csrf-1\"></form>",
+        Map.of("Set-Cookie", List.of("GARMIN-SSO=sso1; Path=/")));
+    http.reply(
+        302,
+        "",
+        Map.of(
+            "Location", List.of("https://connect.garmin.cn/modern/?ticket=ST-999"),
+            "Set-Cookie", List.of("CASTGC=TGT-999; Path=/")));
+    http.reply(
+        403,
+        "<html>Just a moment...</html>",
+        Map.of("cf-mitigated", List.of("challenge")));
+
+    ConnectorResult<Session> result =
+        garmin(http).login("garmin@example.com", "garmin-pass", true);
+    assertEquals(REQUIRES_USER_ACTION, result.status());
+    assertEquals("GARMIN_CAPTCHA", result.code());
+    assertEquals(3, http.requests.size());
+    assertEquals(
+        "https://connect.garmin.cn/modern/?ticket=ST-999",
+        http.requests.get(2).uri().toString());
+  }
+
+  @Test
+  void garminLoginInvalidCredentialsWithRecaptchaScriptIsAuthFailed() throws Exception {
+    StubClient http = new StubClient();
+    http.reply(
+        200,
+        "<form><input type=\"hidden\" name=\"_csrf\" value=\"form-csrf-1\"></form>");
+    http.reply(
+        401,
+        "<html><script src=\"/sso/js/reCaptchaUtil.js\"></script>"
+            + "<script>var isRecaptchaEnabled = null;</script>"
+            + "<div class=\"error\">Invalid sign in.</div></html>");
+    ConnectorResult<Session> result =
+        garmin(http).login("garmin@example.com", "wrong-pass", true);
+    assertEquals(PERMANENT_FAILURE, result.status());
+    assertEquals("GARMIN_AUTH_FAILED", result.code());
+  }
+
+  @Test
+  void garminLoginSharesParentDomainSsoCookiesWithConnectHost() throws Exception {
+    StubClient http = new StubClient();
+    http.reply(
+        200,
+        "<form><input type=\"hidden\" name=\"_csrf\" value=\"form-csrf-1\"></form>",
+        Map.of("Set-Cookie", List.of("SESSION=sso-sess-1; Domain=sso.garmin.cn; Path=/sso/")));
+    http.reply(
+        302,
+        "",
+        Map.of(
+            "Location", List.of("https://connect.garmin.cn/app/?ticket=ST-12345"),
+            "Set-Cookie",
+                List.of(
+                    "CASTGC=TGT-999; Domain=sso.garmin.cn; Path=/sso/",
+                    "GARMIN-SSO=1; Domain=.garmin.cn; Path=/",
+                    "GARMIN-SSO-GUID=guid-1; Domain=.garmin.cn; Path=/",
+                    "GARMIN-SSO-GUID=; Max-Age=0; Domain=sso.garmin.cn; Path=/")));
+    http.reply(
+        302,
+        "",
+        Map.of(
+            "Location", List.of("https://connect.garmin.cn/app/"),
+            "Set-Cookie", List.of("session=sess-1; Path=/")));
+    http.reply(
+        200,
+        "<html><meta name=\"csrf-token\" content=\"csrf-2\"></html>",
+        Map.of("Set-Cookie", List.of("JWT_WEB=jwt-2; Path=/")));
+
+    ConnectorResult<Session> logged =
+        garmin(http).login("garmin@example.com", "garmin-pass", true);
+    assertEquals(SUCCESS, logged.status());
+    Session session = logged.value();
+    assertEquals("jwt-2", session.accessToken());
+    assertEquals("csrf-2", session.attribute("csrf"));
+    assertEquals(4, http.requests.size());
+
+    String hop0Cookie = http.requests.get(2).headers().firstValue("Cookie").orElse("");
+    assertTrue(hop0Cookie.contains("GARMIN-SSO=1"));
+    assertTrue(hop0Cookie.contains("GARMIN-SSO-GUID=guid-1"));
+    assertFalse(hop0Cookie.contains("CASTGC"));
+
+    String hop1Cookie = http.requests.get(3).headers().firstValue("Cookie").orElse("");
+    assertTrue(hop1Cookie.contains("GARMIN-SSO=1"));
+    assertTrue(hop1Cookie.contains("GARMIN-SSO-GUID=guid-1"));
+    assertTrue(hop1Cookie.contains("session=sess-1"));
+    assertFalse(hop1Cookie.contains("CASTGC"));
+
+    String savedCookie = session.attribute("cookie");
+    assertTrue(savedCookie.contains("GARMIN-SSO-GUID=guid-1"));
+    assertTrue(savedCookie.contains("session=sess-1"));
+    assertTrue(savedCookie.contains("JWT_WEB=jwt-2"));
   }
 
   @Test

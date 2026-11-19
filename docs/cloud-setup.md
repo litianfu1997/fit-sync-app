@@ -89,6 +89,8 @@ Web 与小程序都支持用户名密码注册登录，同一账号跨端通用�
 | `WECHAT_APP_ID` / `WECHAT_APP_SECRET` | 同一真实小程序的配置 |
 | `WECHAT_NATIVE_AD_UNIT_ID` | 可选，审核获准的原生广告位 |
 | `FITSYNC_CORS_ORIGINS` | 明确允许的网页来源；同源网关无需任意开放 |
+| `STRAVA_CLIENT_ID` / `STRAVA_CLIENT_SECRET` | 可选，Strava 开发者应用凭据；配置后网页端自动隐藏手填输入框，直接使用开发者应用跳转官方 OAuth 授权 |
+| `STRAVA_REDIRECT_URI` | 可选，公网反向代理下建议显式指定 `https://你的域名/api/v1/accounts/oauth/strava/callback` |
 
 ```powershell
 docker compose --env-file .env.cloud up --build -d

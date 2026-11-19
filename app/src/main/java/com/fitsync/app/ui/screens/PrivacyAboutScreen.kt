@@ -1,11 +1,14 @@
 package com.fitsync.app.ui.screens
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Security
@@ -13,7 +16,11 @@ import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.unit.dp
+import com.fitsync.app.R
 import com.fitsync.app.ui.components.FitTopBar
 import com.fitsync.app.ui.theme.FitSpacing
 
@@ -59,12 +66,22 @@ fun PrivacyAboutScreen(onBack: () -> Unit) {
                 }
             }
             item {
-                Text(
-                    "FitSync 0.2.0",
+                Row(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = FitSpacing.xs, vertical = FitSpacing.sm),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(FitSpacing.sm),
+                ) {
+                    Image(
+                        painter = painterResource(R.drawable.ic_fitsync_logo),
+                        contentDescription = null,
+                        modifier = Modifier.size(28.dp),
+                    )
+                    Text(
+                        "FitSync 0.2.0",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
     }

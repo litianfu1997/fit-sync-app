@@ -52,7 +52,7 @@ function iconFor(icon: string, selected: boolean) {
   >
     <view class="desktop-sidebar">
       <view class="brand"
-        ><image class="brand-mark" src="/static/logo.svg" /><view
+        ><image class="brand-mark" src="/static/logo.png" /><view
           ><text class="brand-name">FitSync</text
           ><text class="brand-caption">跨平台活动同步</text></view
         ></view
@@ -73,7 +73,7 @@ function iconFor(icon: string, selected: boolean) {
     </view>
     <view class="main-wrap">
       <view class="mobile-brand" :style="miniHeaderStyle"
-        ><image class="brand-mark" src="/static/logo.svg" /><text
+        ><image class="brand-mark" src="/static/logo.png" /><text
           class="brand-name"
           >FitSync</text
         ><!-- #ifdef H5 --><text class="mobile-tag">云端同步</text><!-- #endif --></view

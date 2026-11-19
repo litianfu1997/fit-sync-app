@@ -18,9 +18,12 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Garmin Connect 中国站账号密码直接登录、网页会话、gc-api 双向同步及 SSO 静默续期。 */
 public final class GarminConnector extends WebSessionConnector {
+  private static final Logger LOG = LoggerFactory.getLogger(GarminConnector.class);
   private static final int PAGE_SIZE = 20;
   private static final String BASE = "https://connect.garmin.cn";
   private static final String GC_API = "https://connect.garmin.cn/gc-api";
@@ -35,6 +38,9 @@ public final class GarminConnector extends WebSessionConnector {
       "(?:[?&]ticket=|serviceTicketId[\"']?\\s*[:=]\\s*[\"'])(ST-[A-Za-z0-9._-]+)",
       Pattern.CASE_INSENSITIVE);
   private static final Pattern TICKET_GENERIC = Pattern.compile("[?&]ticket=([^\"'&\\s<\\\\;)]+)");
+  private static final Pattern RESPONSE_URL = Pattern.compile(
+      "[\"'](https?:(?:\\\\/|/){2}[^\"'\\s<>]*[?&]ticket=[^\"'\\s<>]+)[\"']",
+      Pattern.CASE_INSENSITIVE);
 
   public GarminConnector() {
     this(defaultClient(), URI.create(BASE), Clock.systemUTC());
@@ -83,12 +89,25 @@ public final class GarminConnector extends WebSessionConnector {
     ConnectorResult<WireResponse> pageResult = sendWeb(pageReq, "Garmin 登录页");
     if (pageResult.status() != SUCCESS) return pageResult.castFailure();
     WireResponse pageWire = pageResult.value();
-    if (pageWire.status() == 429 || pageWire.status() >= 500)
+    List<String> trace = new ArrayList<>();
+    trace.add("get " + stepTrace(signinUri, pageWire));
+    if (pageWire.status() == 429 || pageWire.status() >= 500) {
+      LOG.warn("Garmin 登录页异常: {}", String.join(" -> ", trace));
       return statusFailure(pageWire.status(), "Garmin 登录页");
-    if (pageWire.status() < 200 || pageWire.status() >= 300)
-      return fail(PERMANENT_FAILURE, "HTTP_" + pageWire.status(), "Garmin 登录页不可用");
-    String ssoCookie = mergeCookies(null, pageWire.cookies());
+    }
     String pageHtml = new String(pageWire.bytes(), StandardCharsets.UTF_8);
+    if (isCaptchaChallenge(pageWire, pageHtml)) {
+      LOG.warn("Garmin 登录页触发人机验证: {}", String.join(" -> ", trace));
+      return fail(REQUIRES_USER_ACTION, "GARMIN_CAPTCHA", "Garmin 登录触发了人机验证，请稍后再试");
+    }
+    if (pageWire.status() < 200 || pageWire.status() >= 300) {
+      LOG.warn("Garmin 登录页不可用: {}", String.join(" -> ", trace));
+      return fail(PERMANENT_FAILURE, "HTTP_" + pageWire.status(), "Garmin 登录页不可用");
+    }
+    String sharedDomain = sharedParentDomain(apiBase.getHost());
+    String ssoCookie = mergeCookies(null, pageWire.cookies());
+    String connectCookie =
+        nullToEmpty(mergeCookies(null, sharedDomainCookies(pageWire.cookies(), sharedDomain)));
     String formCsrf = extractFormCsrf(pageHtml);
     if (formCsrf == null) formCsrf = "";
 
@@ -96,10 +115,7 @@ public final class GarminConnector extends WebSessionConnector {
         "username=" + q(account)
             + "&password=" + q(password)
             + "&embed=false"
-            + "&_csrf=" + q(formCsrf)
-            + "&clientId=GarminConnect"
-            + "&service=" + q(service)
-            + "&locale=zh-CN";
+            + "&_csrf=" + q(formCsrf);
     HttpRequest.Builder postBuilder = HttpRequest.newBuilder(signinUri)
         .timeout(Duration.ofSeconds(60))
         .header("User-Agent", browserAgent(null))
@@ -112,28 +128,38 @@ public final class GarminConnector extends WebSessionConnector {
     ConnectorResult<WireResponse> postResult = sendWeb(postBuilder.build(), "Garmin 登录提交");
     if (postResult.status() != SUCCESS) return postResult.castFailure();
     WireResponse postWire = postResult.value();
+    trace.add("post " + stepTrace(signinUri, postWire));
     ssoCookie = mergeCookies(ssoCookie, postWire.cookies());
+    connectCookie = nullToEmpty(mergeCookies(
+        connectCookie, sharedDomainCookies(postWire.cookies(), sharedDomain)));
     String postBody = new String(postWire.bytes(), StandardCharsets.UTF_8);
     String ticket = extractTicket(postWire.header("Location"), postBody);
     if (blank(ticket)) {
-      if (postWire.status() == 429) return statusFailure(429, "Garmin 登录");
+      if (postWire.status() == 429 || postWire.status() >= 500) {
+        LOG.warn("Garmin 登录异常: {}", String.join(" -> ", trace));
+        return statusFailure(postWire.status(), "Garmin 登录");
+      }
+      if (isCaptchaChallenge(postWire, postBody)) {
+        LOG.warn("Garmin 登录触发人机验证: {}", String.join(" -> ", trace));
+        return fail(REQUIRES_USER_ACTION, "GARMIN_CAPTCHA", "Garmin 登录触发了人机验证，请稍后再试");
+      }
       String lower = postBody.toLowerCase(Locale.ROOT);
       if (lower.contains("mfa")
           || lower.contains("two-step")
           || lower.contains("two step")
           || lower.contains("verification")
-          || lower.contains("security code"))
+          || lower.contains("security code")) {
+        LOG.warn("Garmin 登录需要两步验证: {}", String.join(" -> ", trace));
         return fail(REQUIRES_USER_ACTION, "GARMIN_MFA_REQUIRED", "该 Garmin 账号开启了两步验证，请先关闭两步验证后再连接");
-      if (lower.contains("captcha") || lower.contains("cloudflare"))
-        return fail(REQUIRES_USER_ACTION, "GARMIN_CAPTCHA", "Garmin 登录触发了人机验证，请稍后再试");
+      }
+      LOG.warn("Garmin 登录失败: {}", String.join(" -> ", trace));
       return fail(PERMANENT_FAILURE, "GARMIN_AUTH_FAILED", "Garmin 中国站账号或密码错误");
     }
 
-    String current = apiBase.resolve("/app/?ticket=" + q(ticket)).toString();
-    String connectCookie = "";
+    Set<String> allowed = allowedHosts();
+    String current = extractExchangeUrl(postWire.header("Location"), postBody, signinUri, allowed, ticket);
     String jwt = null;
     String metaCsrf = null;
-    Set<String> allowed = allowedHosts();
     for (int hop = 0; hop < MAX_SSO_HOPS; hop++) {
       URI uri;
       try {
@@ -141,7 +167,10 @@ public final class GarminConnector extends WebSessionConnector {
       } catch (RuntimeException e) {
         break;
       }
-      if (!allowedHost(uri, allowed)) break;
+      if (!allowedHost(uri, allowed)) {
+        trace.add("hop" + hop + " blockedHost=" + safeUri(uri));
+        break;
+      }
       boolean ssoHost = "sso.garmin.cn".equalsIgnoreCase(uri.getHost());
       HttpRequest.Builder stepBuilder = HttpRequest.newBuilder(uri)
           .timeout(Duration.ofSeconds(60))
@@ -156,16 +185,30 @@ public final class GarminConnector extends WebSessionConnector {
       String hopCookie = ssoHost ? ssoCookie : connectCookie;
       if (!blank(hopCookie)) stepBuilder.header("Cookie", hopCookie);
       ConnectorResult<WireResponse> stepResult = sendWeb(stepBuilder.build(), "Garmin 会话换发");
-      if (stepResult.status() != SUCCESS) return stepResult.castFailure();
+      if (stepResult.status() != SUCCESS) {
+        trace.add("hop" + hop + " err=" + stepResult.code() + " url=" + safeUri(uri));
+        LOG.warn("Garmin 会话换发网络异常: {}", String.join(" -> ", trace));
+        return stepResult.castFailure();
+      }
       WireResponse stepWire = stepResult.value();
-      String merged = mergeCookies(hopCookie, stepWire.cookies());
-      if (ssoHost) ssoCookie = merged == null ? "" : merged;
-      else connectCookie = merged == null ? "" : merged;
-      String stepJwt = cookie(mergeCookies(null, stepWire.cookies()), "JWT_WEB");
-      if (stepJwt != null) jwt = stepJwt;
       String html = new String(stepWire.bytes(), StandardCharsets.UTF_8);
       String foundCsrf = extractCsrf(html);
       if (foundCsrf != null) metaCsrf = foundCsrf;
+      trace.add("hop" + hop + " " + stepTrace(uri, stepWire, foundCsrf != null));
+      String merged = mergeCookies(hopCookie, stepWire.cookies());
+      if (ssoHost) {
+        ssoCookie = nullToEmpty(merged);
+        connectCookie = nullToEmpty(mergeCookies(
+            connectCookie, sharedDomainCookies(stepWire.cookies(), sharedDomain)));
+      } else {
+        connectCookie = nullToEmpty(merged);
+        ssoCookie = nullToEmpty(mergeCookies(
+            ssoCookie, sharedDomainCookies(stepWire.cookies(), sharedDomain)));
+      }
+      String stepJwt = cookie(mergeCookies(null, stepWire.cookies()), "JWT_WEB");
+      if (stepJwt != null) jwt = stepJwt;
+      ConnectorResult<Session> blocked = checkExchangeBlock("Garmin 会话换发", stepWire, html, trace);
+      if (blocked != null) return blocked;
       String location = stepWire.header("Location");
       if (stepWire.status() >= 300 && stepWire.status() < 400 && location != null) {
         try {
@@ -174,6 +217,13 @@ public final class GarminConnector extends WebSessionConnector {
           break;
         }
         continue;
+      }
+      if (ssoHost && stepWire.status() >= 200 && stepWire.status() < 300) {
+        String nextTicket = extractTicket(null, html);
+        if (!blank(nextTicket)) {
+          current = extractExchangeUrl(null, html, uri, allowed, nextTicket);
+          continue;
+        }
       }
       break;
     }
@@ -189,15 +239,167 @@ public final class GarminConnector extends WebSessionConnector {
     Session session = new Session(jwt, null, account, password, storeCredentials, values);
     if (blank(jwt) && !blank(ssoCookie)) {
       if (blank(session.attribute("cookie"))) session.setAttribute("cookie", "");
-      ConnectorResult<Session> refreshed = refreshSession(session);
+      ConnectorResult<Session> refreshed = refreshSession(session, trace);
       if (refreshed.status() == SUCCESS) {
         jwt = session.accessToken();
+      } else if (refreshed.status() == REQUIRES_USER_ACTION
+          || refreshed.status() == RETRYABLE_FAILURE) {
+        return refreshed.castFailure();
       }
     }
     if (blank(jwt)) {
+      LOG.warn("Garmin 登录凭据换发未完成: {}", String.join(" -> ", trace));
       return fail(REQUIRES_USER_ACTION, "GARMIN_TICKET_EXCHANGE_FAILED", "Garmin 登录凭据换发未完成，请稍后重试");
     }
     return ConnectorResult.success(session);
+  }
+
+  private String extractExchangeUrl(
+      String location, String body, URI baseUri, Set<String> allowed, String ticket) {
+    if (!blank(location)) {
+      try {
+        URI resolved = baseUri.resolve(location.trim());
+        if (allowedHost(resolved, allowed) && hasTicketParam(resolved.toString())) {
+          return resolved.toString();
+        }
+      } catch (RuntimeException ignored) {
+      }
+    }
+    if (!blank(body)) {
+      Matcher m = RESPONSE_URL.matcher(body);
+      while (m.find()) {
+        String candidate = m.group(1).replace("\\/", "/");
+        try {
+          URI resolved = baseUri.resolve(candidate);
+          if (allowedHost(resolved, allowed) && hasTicketParam(resolved.toString())) {
+            return resolved.toString();
+          }
+        } catch (RuntimeException ignored) {
+        }
+      }
+    }
+    return apiBase.resolve("/app/?ticket=" + q(ticket)).toString();
+  }
+
+  private static boolean hasTicketParam(String url) {
+    return url != null && (url.contains("?ticket=") || url.contains("&ticket="));
+  }
+
+  private static boolean isCaptchaChallenge(WireResponse wire, String body) {
+    if (!blank(wire.header("cf-mitigated"))) return true;
+    String lower = body == null ? "" : body.toLowerCase(Locale.ROOT);
+    if (lower.contains("challenges.cloudflare")
+        || lower.contains("cf-turnstile")
+        || lower.contains("__cf_chl_")
+        || lower.contains("just a moment")) {
+      return true;
+    }
+    if ((wire.status() == 403 || wire.status() == 503) && lower.contains("cloudflare")) {
+      return true;
+    }
+    // 正常登录页固定引用 reCaptchaUtil.js，仅在明确启用验证码时才判为人机验证。
+    return lower.contains("isrecaptchaenabled = true")
+        || lower.contains("isrecaptchaenabled=true")
+        || lower.contains("g-recaptcha")
+        || lower.contains("hcaptcha");
+  }
+
+  private static ConnectorResult<Session> checkExchangeBlock(
+      String stage, WireResponse wire, String body, List<String> trace) {
+    if (wire.status() == 429) {
+      LOG.warn("{}被限流: {}", stage, String.join(" -> ", trace));
+      return statusFailure(429, stage);
+    }
+    if (isCaptchaChallenge(wire, body)) {
+      LOG.warn("{}触发 Cloudflare/人机验证: {}", stage, String.join(" -> ", trace));
+      return fail(
+          REQUIRES_USER_ACTION,
+          "GARMIN_CAPTCHA",
+          stage + "触发了 Cloudflare 人机验证，请稍后重试或改用浏览器会话导入");
+    }
+    return null;
+  }
+
+  private static String stepTrace(URI uri, WireResponse wire) {
+    return stepTrace(uri, wire, false);
+  }
+
+  private static String stepTrace(URI uri, WireResponse wire, boolean hasCsrf) {
+    StringBuilder sb = new StringBuilder();
+    sb.append("url=").append(safeUri(uri)).append(" status=").append(wire.status());
+    String loc = wire.header("Location");
+    if (!blank(loc)) sb.append(" loc=").append(safeUri(uri, loc));
+    String cf = wire.header("cf-mitigated");
+    if (!blank(cf)) sb.append(" cf=").append(cf);
+    if (hasCsrf) sb.append(" csrf=yes");
+    if (!wire.cookies().isEmpty()) sb.append(" cookies=").append(cookieSummary(wire.cookies()));
+    return sb.toString();
+  }
+
+  private static String safeUri(URI uri) {
+    if (uri == null) return "";
+    String scheme = uri.getScheme() == null ? "" : uri.getScheme();
+    String host = uri.getHost() == null ? "" : uri.getHost();
+    String path = uri.getRawPath() == null ? "" : uri.getRawPath();
+    return scheme.isEmpty() && host.isEmpty() ? path : scheme + "://" + host + path;
+  }
+
+  private static String safeUri(URI base, String raw) {
+    if (blank(raw)) return "";
+    try {
+      return safeUri(base == null ? URI.create(raw.trim()) : base.resolve(raw.trim()));
+    } catch (RuntimeException e) {
+      int qIdx = raw.indexOf('?');
+      return qIdx >= 0 ? raw.substring(0, qIdx) : raw;
+    }
+  }
+
+  private static String cookieSummary(List<String> setCookies) {
+    List<String> items = new ArrayList<>(setCookies.size());
+    for (String header : setCookies) {
+      String[] pair = header.split(";", 2)[0].split("=", 2);
+      if (pair.length != 2 || pair[0].isBlank()) continue;
+      String domain = cookieAttribute(header, "Domain");
+      String action = isCookieClear(pair[1], header) ? "clear" : "set";
+      items.add(pair[0].trim() + "(" + action + (domain != null ? "@" + domain : "") + ")");
+    }
+    return items.toString();
+  }
+
+  static String sharedParentDomain(String host) {
+    if (blank(host)) return null;
+    String lower = host.toLowerCase(Locale.ROOT);
+    return "garmin.cn".equals(lower) || lower.endsWith(".garmin.cn") ? "garmin.cn" : null;
+  }
+
+  static String cookieAttribute(String header, String attrName) {
+    if (blank(header) || blank(attrName)) return null;
+    String[] parts = header.split(";");
+    for (int i = 1; i < parts.length; i++) {
+      String[] kv = parts[i].trim().split("=", 2);
+      if (kv.length == 2 && kv[0].trim().equalsIgnoreCase(attrName)) {
+        String val = kv[1].trim();
+        if (!val.isEmpty()) return val;
+      }
+    }
+    return null;
+  }
+
+  static List<String> sharedDomainCookies(List<String> setCookies, String parentDomain) {
+    if (setCookies == null || setCookies.isEmpty() || blank(parentDomain)) return List.of();
+    String target = parentDomain.toLowerCase(Locale.ROOT);
+    List<String> matched = new ArrayList<>();
+    for (String header : setCookies) {
+      String domain = cookieAttribute(header, "Domain");
+      if (domain == null) continue;
+      String normalized = domain.replaceFirst("^\\.+", "").toLowerCase(Locale.ROOT);
+      if (target.equals(normalized)) matched.add(header);
+    }
+    return matched;
+  }
+
+  private static String nullToEmpty(String value) {
+    return value == null ? "" : value;
   }
 
   private static String extractFormCsrf(String html) {
@@ -507,6 +709,10 @@ public final class GarminConnector extends WebSessionConnector {
 
   /** 用 SSO Cookie 沿 CAS 链换发 JWT_WEB 与 CSRF；任何失败都回到重新登录。 */
   private ConnectorResult<Session> refreshSession(Session session) {
+    return refreshSession(session, new ArrayList<>());
+  }
+
+  private ConnectorResult<Session> refreshSession(Session session, List<String> trace) {
     String sso = session == null ? null : session.attribute("ssoCookie");
     if (blank(sso)) return needsLogin();
     String service = apiBase.resolve("/app/").toString();
@@ -516,6 +722,7 @@ public final class GarminConnector extends WebSessionConnector {
         + "/sso/signin?clientId=GarminConnect&service="
         + q(service)
         + "&embed=false";
+    String sharedDomain = sharedParentDomain(apiBase.getHost());
     String connectCookie = blank(session.attribute("cookie")) ? "" : session.attribute("cookie");
     String ssoCookie = sso;
     String jwt = null, csrf = null;
@@ -527,7 +734,10 @@ public final class GarminConnector extends WebSessionConnector {
       } catch (RuntimeException e) {
         break;
       }
-      if (!allowedHost(uri, refreshHosts)) break;
+      if (!allowedHost(uri, refreshHosts)) {
+        trace.add("refresh" + hop + " blockedHost=" + safeUri(uri));
+        break;
+      }
       boolean ssoHost = "sso.garmin.cn".equalsIgnoreCase(uri.getHost());
       String hopCookie = ssoHost ? ssoCookie : connectCookie;
       HttpRequest.Builder reqBuilder = HttpRequest.newBuilder(uri)
@@ -543,16 +753,30 @@ public final class GarminConnector extends WebSessionConnector {
       if (!blank(hopCookie)) reqBuilder.header("Cookie", hopCookie);
       HttpRequest request = reqBuilder.build();
       ConnectorResult<WireResponse> response = sendWeb(request, "Garmin 会话续期");
-      if (response.status() != SUCCESS) return response.castFailure();
+      if (response.status() != SUCCESS) {
+        trace.add("refresh" + hop + " err=" + response.code() + " url=" + safeUri(uri));
+        LOG.warn("Garmin 会话续期网络异常: {}", String.join(" -> ", trace));
+        return response.castFailure();
+      }
       WireResponse wire = response.value();
-      String merged = mergeCookies(ssoHost ? ssoCookie : connectCookie, wire.cookies());
-      if (ssoHost) ssoCookie = merged == null ? "" : merged;
-      else connectCookie = merged == null ? "" : merged;
-      String newJwt = cookie(mergeCookies(null, wire.cookies()), "JWT_WEB");
-      if (newJwt != null) jwt = newJwt;
       String body = new String(wire.bytes(), StandardCharsets.UTF_8);
       String found = extractCsrf(body);
       if (found != null) csrf = found;
+      trace.add("refresh" + hop + " " + stepTrace(uri, wire, found != null));
+      String merged = mergeCookies(hopCookie, wire.cookies());
+      if (ssoHost) {
+        ssoCookie = nullToEmpty(merged);
+        connectCookie = nullToEmpty(mergeCookies(
+            connectCookie, sharedDomainCookies(wire.cookies(), sharedDomain)));
+      } else {
+        connectCookie = nullToEmpty(merged);
+        ssoCookie = nullToEmpty(mergeCookies(
+            ssoCookie, sharedDomainCookies(wire.cookies(), sharedDomain)));
+      }
+      String newJwt = cookie(mergeCookies(null, wire.cookies()), "JWT_WEB");
+      if (newJwt != null) jwt = newJwt;
+      ConnectorResult<Session> blocked = checkExchangeBlock("Garmin 会话续期", wire, body, trace);
+      if (blocked != null) return blocked;
       String location = wire.header("Location");
       if (wire.status() >= 300 && wire.status() < 400 && location != null) {
         try {
@@ -565,13 +789,16 @@ public final class GarminConnector extends WebSessionConnector {
       if (ssoHost && wire.status() >= 200 && wire.status() < 300) {
         String ticket = extractTicket(null, body);
         if (!blank(ticket)) {
-          current = apiBase.resolve("/app/?ticket=" + q(ticket)).toString();
+          current = extractExchangeUrl(null, body, uri, refreshHosts, ticket);
           continue;
         }
       }
       break;
     }
-    if (jwt == null) return needsLogin();
+    if (jwt == null) {
+      LOG.warn("Garmin 会话续期未获取到 JWT_WEB: {}", String.join(" -> ", trace));
+      return needsLogin();
+    }
     if (csrf != null) session.setAttribute("csrf", csrf);
     session.setAttribute("ssoCookie", ssoCookie);
     session.setAttribute("cookie",

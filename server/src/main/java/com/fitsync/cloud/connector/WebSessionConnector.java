@@ -7,8 +7,10 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.time.Clock;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -155,12 +157,29 @@ abstract class WebSessionConnector extends ConnectorHttpSupport {
         if (pair.length == 2 && !pair[0].isBlank()) values.put(pair[0].trim(), pair[1].trim());
       }
     }
-    for (String header : setCookies) {
-      String[] pair = header.split(";", 2)[0].split("=", 2);
-      if (pair.length != 2 || pair[0].isBlank()) continue;
-      if (pair[1].isBlank() || header.matches("(?i).*Max-Age=0(?:;|$).*"))
-        values.remove(pair[0].trim());
-      else values.put(pair[0].trim(), pair[1].trim());
+    if (setCookies != null) {
+      Set<String> setInBatch = new HashSet<>();
+      for (String header : setCookies) {
+        String[] pair = header.split(";", 2)[0].split("=", 2);
+        if (pair.length == 2 && !pair[0].isBlank() && !isCookieClear(pair[1], header)) {
+          setInBatch.add(pair[0].trim().toLowerCase(Locale.ROOT));
+        }
+      }
+      for (String header : setCookies) {
+        String[] pair = header.split(";", 2)[0].split("=", 2);
+        if (pair.length != 2 || pair[0].isBlank()) continue;
+        String name = pair[0].trim();
+        String key = name.toLowerCase(Locale.ROOT);
+        if (isCookieClear(pair[1], header)) {
+          // 同一响应可能同时下发有效 Cookie 与旧域/根路径的 Max-Age=0 清理头，避免误删同批有效值。
+          if (!setInBatch.contains(key)) {
+            values.keySet().removeIf(existing -> existing.equalsIgnoreCase(name));
+          }
+        } else {
+          values.keySet().removeIf(existing -> existing.equalsIgnoreCase(name));
+          values.put(name, pair[1].trim());
+        }
+      }
     }
     if (values.isEmpty()) return null;
     StringBuilder result = new StringBuilder();
@@ -169,6 +188,10 @@ abstract class WebSessionConnector extends ConnectorHttpSupport {
       result.append(key).append('=').append(value);
     });
     return result.toString();
+  }
+
+  protected static boolean isCookieClear(String value, String header) {
+    return value.isBlank() || header.matches("(?i).*Max-Age\\s*=\\s*0(?:\\s*;|$).*");
   }
 
   /** 网页会话上传确认不依赖外部 UID，仍以文件 SHA-256 防错配。 */

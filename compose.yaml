@@ -28,6 +28,9 @@ services:
       WECHAT_APP_ID: ${WECHAT_APP_ID:?请设置微信 AppID}
       WECHAT_APP_SECRET: ${WECHAT_APP_SECRET:?请设置微信 AppSecret}
       WECHAT_NATIVE_AD_UNIT_ID: ${WECHAT_NATIVE_AD_UNIT_ID:-}
+      STRAVA_CLIENT_ID: ${STRAVA_CLIENT_ID:-}
+      STRAVA_CLIENT_SECRET: ${STRAVA_CLIENT_SECRET:-}
+      STRAVA_REDIRECT_URI: ${STRAVA_REDIRECT_URI:-}
     volumes:
       - fitsync_files:/data
     depends_on:

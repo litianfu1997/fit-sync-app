@@ -100,7 +100,7 @@ async function retry() {
   >
   <view v-else-if="!session.token" class="login-card card"
     ><view class="login-art"
-      ><image class="login-logo" src="/static/logo.svg" />
+      ><image class="login-logo" src="/static/logo.png" />
       <text class="login-title">FitSync</text>
       <text class="muted">跨平台 FIT 活动管理与自动同步。</text></view
     ><view class="login-form"
