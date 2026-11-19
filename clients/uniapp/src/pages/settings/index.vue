@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onUnmounted, ref } from "vue";
 import { onShow } from "@dcloudio/uni-app";
 import AppShell from "../../components/AppShell.vue";
 import RewardSupport from "../../components/RewardSupport.vue";
 import { theme, setThemeMode, syncPageTheme, type ThemeMode } from "../../lib/theme";
 import {
   api,
+  bindEmail as bindEmailApi,
   bindWechat,
   changePassword as changePasswordApi,
   clearSession,
@@ -14,11 +15,14 @@ import {
   initialize,
   messageOf,
   patchSessionUser,
+  sendEmailCode,
   session,
   setPassword as setPasswordApi,
+  startGoogleOAuth,
   toast,
   updateProfile,
 } from "../../lib/api";
+const EMAIL_RE = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
 const themeOptions: { value: ThemeMode; label: string }[] = [
   { value: "system", label: "跟随系统" },
   { value: "light", label: "浅色" },
@@ -36,13 +40,50 @@ const pwdUsername = ref(""),
   pwdError = ref(""),
   pwdSuccess = ref(""),
   pwdModal = ref(false);
+const emailModal = ref(false),
+  bindEmailAddr = ref(""),
+  bindEmailCode = ref(""),
+  sendingEmailCode = ref(false),
+  emailCooldown = ref(0),
+  bindingEmail = ref(false),
+  emailError = ref(""),
+  emailSuccess = ref("");
 const bindingWechat = ref(false),
   bindError = ref(""),
   bindSuccess = ref("");
+const bindingGoogle = ref(false),
+  googleBindError = ref(""),
+  googleBindSuccess = ref("");
+let emailCooldownTimer: ReturnType<typeof setInterval> | null = null;
 
 const hasPassword = computed(() => !!session.user?.hasPassword);
+const hasEmail = computed(() => !!session.user?.hasEmail);
+const hasGoogle = computed(() => !!session.user?.hasGoogle);
 const hasWechat = computed(() => !!session.user?.hasWechat);
+const emailAuthEnabled = computed(() => !!session.config?.emailAuthEnabled);
+const googleLoginEnabled = computed(() => !!session.config?.googleLoginEnabled);
 const wechatConfigured = computed(() => !!session.config?.wechatLoginEnabled);
+const accountIdentityText = computed(() => {
+  if (!session.token) return "前往概览登录后管理账号与同步";
+  const parts: string[] = [];
+  if (session.user?.email) parts.push(session.user.email);
+  if (session.user?.username) parts.push("@" + session.user.username);
+  return parts.length ? parts.join(" · ") : "尚未绑定邮箱或用户名";
+});
+const authStatusBadge = computed(() => {
+  if (hasPassword.value) return "已设密码";
+  if (hasGoogle.value) return "Google 登录";
+  if (hasEmail.value) return "已绑邮箱";
+  return "仅微信登录";
+});
+
+onUnmounted(() => {
+  if (emailCooldownTimer) {
+    clearInterval(emailCooldownTimer);
+    emailCooldownTimer = null;
+  }
+});
+
 function applyUser(user: typeof session.user) {
   if (!user) return;
   patchSessionUser(user);
@@ -62,6 +103,84 @@ async function saveProfile() {
     profileError.value = messageOf(reason);
   } finally {
     savingProfile.value = false;
+  }
+}
+function openEmailModal() {
+  emailError.value = "";
+  emailSuccess.value = "";
+  bindEmailAddr.value = "";
+  bindEmailCode.value = "";
+  emailModal.value = true;
+}
+function closeEmailModal() {
+  if (bindingEmail.value) return;
+  emailError.value = "";
+  emailModal.value = false;
+}
+function startEmailCooldown() {
+  if (emailCooldownTimer) clearInterval(emailCooldownTimer);
+  emailCooldown.value = 60;
+  emailCooldownTimer = setInterval(() => {
+    if (emailCooldown.value <= 1) {
+      emailCooldown.value = 0;
+      if (emailCooldownTimer) {
+        clearInterval(emailCooldownTimer);
+        emailCooldownTimer = null;
+      }
+      return;
+    }
+    emailCooldown.value -= 1;
+  }, 1000);
+}
+async function requestBindEmailCode() {
+  emailError.value = "";
+  const addr = bindEmailAddr.value.trim().toLowerCase();
+  if (!addr) return (emailError.value = "请输入邮箱地址");
+  if (addr.length > 160 || !EMAIL_RE.test(addr))
+    return (emailError.value = "邮箱格式不正确");
+  sendingEmailCode.value = true;
+  try {
+    await sendEmailCode(addr, "BIND");
+    startEmailCooldown();
+    toast("验证码已发送至邮箱，请查收");
+  } catch (reason) {
+    emailError.value = messageOf(reason);
+  } finally {
+    sendingEmailCode.value = false;
+  }
+}
+async function submitBindEmail() {
+  emailError.value = "";
+  const addr = bindEmailAddr.value.trim().toLowerCase();
+  const code = bindEmailCode.value.trim();
+  if (!addr) return (emailError.value = "请输入邮箱地址");
+  if (addr.length > 160 || !EMAIL_RE.test(addr))
+    return (emailError.value = "邮箱格式不正确");
+  if (!/^\d{6}$/.test(code))
+    return (emailError.value = "请输入 6 位数字验证码");
+  bindingEmail.value = true;
+  try {
+    applyUser(await bindEmailApi(addr, code));
+    emailModal.value = false;
+    bindEmailAddr.value = "";
+    bindEmailCode.value = "";
+    emailSuccess.value = "邮箱已绑定，现在可用邮箱登录并自动关联同邮箱 Google 账号。";
+    toast("邮箱绑定成功");
+  } catch (reason) {
+    emailError.value = messageOf(reason);
+  } finally {
+    bindingEmail.value = false;
+  }
+}
+async function bindGoogle() {
+  googleBindError.value = "";
+  googleBindSuccess.value = "";
+  bindingGoogle.value = true;
+  try {
+    await startGoogleOAuth("bind", "/pages/settings/index");
+  } catch (reason) {
+    googleBindError.value = messageOf(reason);
+    bindingGoogle.value = false;
   }
 }
 function openPasswordModal() {
@@ -87,10 +206,12 @@ async function savePassword() {
   if (pwd !== pwdConfirm.value) return (pwdError.value = "两次输入的密码不一致");
   if (!hasPassword.value) {
     const name = pwdUsername.value.trim();
-    if (name.length < 3 || name.length > 32)
-      return (pwdError.value = "用户名需为 3–32 个字符");
-    if (!/^[A-Za-z0-9_\u4e00-\u9fff-]+$/.test(name))
-      return (pwdError.value = "用户名只能包含中英文、数字、下划线或连字符");
+    if (name || !hasEmail.value) {
+      if (name.length < 3 || name.length > 32)
+        return (pwdError.value = "用户名需为 3–32 个字符");
+      if (!/^[A-Za-z0-9_\u4e00-\u9fff-]+$/.test(name))
+        return (pwdError.value = "用户名只能包含中英文、数字、下划线或连字符");
+    }
   } else if (!pwdOld.value) return (pwdError.value = "请输入原密码");
   savingPassword.value = true;
   try {
@@ -99,8 +220,9 @@ async function savePassword() {
       pwdSuccess.value = "密码已修改，其他设备上的会话不受影响。";
     } else {
       applyUser(await setPasswordApi(pwdUsername.value.trim(), pwd));
-      pwdSuccess.value =
-        "已设置用户名与密码，现在可在网页和小程序用此账号登录。";
+      pwdSuccess.value = hasEmail.value
+        ? "已设置登录密码，现在可使用邮箱或用户名加密码登录。"
+        : "已设置用户名与密码，现在可在网页和小程序用此账号登录。";
     }
     pwdUsername.value = "";
     pwdOld.value = "";
@@ -128,10 +250,19 @@ async function bind() {
     bindingWechat.value = false;
   }
 }
-onShow(() => {
+onShow(async () => {
   syncPageTheme();
-  void initialize();
+  await initialize();
   profileName.value = session.user?.displayName || "";
+  if (session.googleBindSuccess) {
+    session.googleBindSuccess = false;
+    googleBindSuccess.value = "Google 账号已绑定，可在网页端一键登录。";
+    toast("Google 账号绑定成功");
+  }
+  if (session.authNotice && session.token) {
+    googleBindError.value = session.authNotice;
+    session.authNotice = "";
+  }
 });
 async function logout() {
   if (
@@ -167,13 +298,7 @@ async function logout() {
               session.user?.displayName ||
               (session.token ? "我的骑行空间" : "尚未登录")
             }}</text
-            ><text class="muted">{{
-              session.token
-                ? session.user?.username
-                  ? "账号 @" + session.user.username
-                  : "尚未设置登录用户名"
-                : "前往概览登录后管理账号与同步"
-            }}</text></view
+            ><text class="muted">{{ accountIdentityText }}</text></view
           ><button
             v-if="session.token"
             class="text-button danger"
@@ -190,10 +315,10 @@ async function logout() {
             ><view
               ><text class="section-title">账号与登录方式</text
               ><text class="muted"
-                >用户名密码账号在网页和小程序通用；绑定微信后可一键登录同一账号。</text
+                >支持邮箱/用户名密码、Google（网页端）与微信（小程序）登录同一 FitSync 账号。</text
               ></view
             ><text class="tag" :class="hasPassword ? 'success' : 'amber'">{{
-              hasPassword ? "已设密码" : "仅微信登录"
+              authStatusBadge
             }}</text></view
           >
           <view class="form-field"
@@ -245,17 +370,72 @@ async function logout() {
           >
           <!-- #endif -->
 
+          <view v-if="hasEmail" class="info-notice notice"
+            ><text
+              >已绑定邮箱：{{ session.user?.email }}，可用于密码登录及关联同邮箱 Google 账号。</text
+            ></view
+          >
+          <view v-else-if="emailAuthEnabled" class="form-panel"
+            ><text class="section-title">绑定邮箱</text
+            ><text class="muted"
+              >绑定后可用邮箱与密码登录，并与同邮箱 Google 登录自动关联。</text
+            ><button class="btn primary" @click="openEmailModal">
+              绑定邮箱
+            </button></view
+          >
+          <text v-if="emailSuccess" class="success-text">{{ emailSuccess }}</text>
+
+          <!-- #ifdef H5 -->
+          <view v-if="googleLoginEnabled && !hasGoogle" class="form-panel"
+            ><text class="section-title">绑定 Google 账号</text
+            ><text class="muted"
+              >绑定后可在网页端使用 Google 一键登录当前账号，活动与同步规则保持不变。</text
+            ><text v-if="googleBindError" class="error-text">{{
+              googleBindError
+            }}</text
+            ><text v-if="googleBindSuccess" class="success-text">{{
+              googleBindSuccess
+            }}</text
+            ><button
+              class="btn secondary"
+              :loading="bindingGoogle"
+              :disabled="bindingGoogle"
+              @click="bindGoogle"
+            >
+              <image class="oauth-btn-icon" src="/static/google.svg" />
+              <text>绑定 Google 账号</text>
+            </button></view
+          >
+          <view v-else-if="hasGoogle" class="info-notice notice"
+            ><text>{{
+              googleBindSuccess || "当前账号已绑定 Google，可在网页端一键登录。"
+            }}</text></view
+          >
+          <!-- #endif -->
+
           <view class="form-panel"
             ><text class="section-title">{{
-              hasPassword ? "修改密码" : "设置登录用户名与密码"
+              hasPassword
+                ? "修改密码"
+                : hasEmail
+                  ? "设置登录密码"
+                  : "设置登录用户名与密码"
             }}</text
             ><text class="muted">{{
               hasPassword
                 ? "修改后，其他已登录设备仍保持在线；请牢记新密码。"
-                : "设置后即可在网页和小程序用同一账号登录，不依赖微信。"
+                : hasEmail
+                  ? "设置密码后即可直接使用已绑定邮箱与密码登录（用户名可选填）。"
+                  : "设置后即可在网页和小程序用同一账号登录，不依赖微信。"
             }}</text
             ><button class="btn primary" @click="openPasswordModal">
-              {{ hasPassword ? "修改密码" : "设置用户名与密码" }}
+              {{
+                hasPassword
+                  ? "修改密码"
+                  : hasEmail
+                    ? "设置登录密码"
+                    : "设置用户名与密码"
+              }}
             </button
             ><text v-if="pwdSuccess" class="success-text">{{
               pwdSuccess
@@ -308,7 +488,11 @@ async function logout() {
         ><view class="modal-card" @click.stop
           ><view class="modal-head"
             ><text class="section-title">{{
-              hasPassword ? "修改密码" : "设置登录用户名与密码"
+              hasPassword
+                ? "修改密码"
+                : hasEmail
+                  ? "设置登录密码"
+                  : "设置登录用户名与密码"
             }}</text
             ><button
               class="text-button"
@@ -320,15 +504,23 @@ async function logout() {
           ><text class="muted">{{
             hasPassword
               ? "输入原密码确认身份；修改后其他已登录设备仍保持在线。"
-              : "设置后即可在网页和小程序用同一账号登录，不依赖微信。"
+              : hasEmail
+                ? "设置密码后即可用已绑定的邮箱登录，也可顺便补充用户名。"
+                : "设置后即可在网页和小程序用同一账号登录，不依赖微信。"
           }}</text
           ><view v-if="!hasPassword" class="form-field"
-            ><text class="field-label">用户名</text
+            ><text class="field-label">{{
+              hasEmail ? "用户名（选填）" : "用户名"
+            }}</text
             ><input
               v-model="pwdUsername"
               class="input"
               maxlength="32"
-              placeholder="3–32 位中英文、数字、_ 或 -"
+              :placeholder="
+                hasEmail
+                  ? '留空则直接使用绑定邮箱登录'
+                  : '3–32 位中英文、数字、_ 或 -'
+              "
               :disabled="savingPassword" /></view
           ><view v-if="hasPassword" class="form-field"
             ><text class="field-label">原密码</text
@@ -379,6 +571,72 @@ async function logout() {
               @click="savePassword"
             >
               {{ hasPassword ? "确认修改" : "设置并启用" }}
+            </button></view
+          ></view
+        ></view
+      >
+      <view
+        v-if="emailModal"
+        class="modal-mask"
+        @click="closeEmailModal"
+        @touchmove.stop
+        ><view class="modal-card" @click.stop
+          ><view class="modal-head"
+            ><text class="section-title">绑定邮箱</text
+            ><button
+              class="text-button"
+              :disabled="bindingEmail"
+              @click="closeEmailModal"
+            >
+              关闭
+            </button></view
+          ><text class="muted"
+            >绑定后可用邮箱与密码登录当前账号，并可自动关联同邮箱 Google 账号。</text
+          ><view class="form-field"
+            ><text class="field-label">邮箱地址</text
+            ><input
+              v-model="bindEmailAddr"
+              class="input"
+              maxlength="160"
+              placeholder="name@example.com"
+              :disabled="bindingEmail || sendingEmailCode" /></view
+          ><view class="form-field"
+            ><text class="field-label">邮箱验证码</text
+            ><view class="otp-input-row"
+              ><input
+                v-model="bindEmailCode"
+                class="input"
+                type="number"
+                maxlength="6"
+                placeholder="6 位数字验证码"
+                :disabled="bindingEmail"
+                @confirm="submitBindEmail" /><button
+                class="btn secondary otp-send-btn"
+                :loading="sendingEmailCode"
+                :disabled="bindingEmail || sendingEmailCode || emailCooldown > 0"
+                @click="requestBindEmailCode"
+              >
+                {{
+                  emailCooldown > 0 ? `${emailCooldown}s 后重试` : "获取验证码"
+                }}
+              </button></view
+            ></view
+          ><text v-if="emailError" class="error-text">{{ emailError }}</text
+          ><view class="modal-actions"
+            ><button
+              class="btn secondary"
+              :disabled="bindingEmail"
+              @click="closeEmailModal"
+            >
+              取消
+            </button>
+            ><button
+              class="btn primary"
+              :loading="bindingEmail"
+              :disabled="bindingEmail"
+              @click="submitBindEmail"
+            >
+              确认绑定
             </button></view
           ></view
         ></view

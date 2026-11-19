@@ -208,6 +208,13 @@ image { display: block; flex-shrink: 0; }
 .password-login .form-field { margin-bottom: 0; }
 .password-login .tiny { text-align: center; }
 .login-form .text-button { align-self: center; }
+.auth-subswitch { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: -4px; }
+.auth-subswitch .text-button { min-height: 28px; padding: 2px 0; font-size: 13px; }
+.auth-divider { display: flex; align-items: center; gap: 12px; color: var(--fit-muted); font-size: 12px; }
+.auth-divider::before, .auth-divider::after { content: ""; flex: 1; height: 1px; background: var(--fit-border); }
+.oauth-btn-icon { width: 18px; height: 18px; flex-shrink: 0; }
+.otp-send-btn { flex-shrink: 0; min-height: 48px; padding: 0 14px; }
+.account-badges { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 /* 未登录时只展示登录入口：收起侧边导航与移动标签栏，品牌移到页面顶部。 */
 .guest-mode .desktop-sidebar, .guest-mode .mobile-tabs { display: none; }
 .guest-mode .main-wrap { margin-left: 0; padding: 32px 32px 0; }
@@ -562,6 +569,7 @@ image { display: block; flex-shrink: 0; }
 .appearance-option:hover { background: var(--fit-surface-variant); }
 .appearance-option.checked { background: var(--fit-primary-container); color: var(--fit-on-primary-container); border-color: var(--fit-primary); }
 .account-card .form-panel { margin-top: 20px; }
+.account-card .notice { margin-top: 20px; margin-bottom: 0; }
 .account-card .form-panel > .section-title { margin-bottom: 8px; }
 .account-card .form-panel > .muted { margin-bottom: 16px; }
 .account-card .form-panel .form-field { margin-bottom: 16px; }

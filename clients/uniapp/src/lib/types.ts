@@ -25,6 +25,8 @@ export interface WebSessionFields {
 export interface Config {
   wechatLoginEnabled: boolean;
   passwordLoginEnabled?: boolean;
+  emailAuthEnabled?: boolean;
+  googleLoginEnabled?: boolean;
   devLoginEnabled: boolean;
   stravaOAuthConfigured?: boolean;
   ads: {
@@ -39,7 +41,10 @@ export interface User {
   id: string;
   displayName: string;
   username?: string;
+  email?: string;
   hasPassword?: boolean;
+  hasEmail?: boolean;
+  hasGoogle?: boolean;
   hasWechat?: boolean;
 }
 export interface LoginResult {

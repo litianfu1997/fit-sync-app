@@ -19,6 +19,7 @@ public class ApiController {
   private final ActivityService activities;
   private final AccountService accounts;
   private final StravaOAuthService stravaOAuth;
+  private final GoogleOAuthService googleOAuth;
   private final JobService jobs;
   private final String nativeAd;
 
@@ -28,6 +29,7 @@ public class ApiController {
       ActivityService activities,
       AccountService accounts,
       StravaOAuthService stravaOAuth,
+      GoogleOAuthService googleOAuth,
       JobService jobs,
       @Value("${fitsync.native-ad-unit-id:}") String nativeAd) {
     this.auth = auth;
@@ -35,6 +37,7 @@ public class ApiController {
     this.activities = activities;
     this.accounts = accounts;
     this.stravaOAuth = stravaOAuth;
+    this.googleOAuth = googleOAuth;
     this.jobs = jobs;
     this.nativeAd = nativeAd;
   }
@@ -58,6 +61,10 @@ public class ApiController {
         auth.wechatEnabled(),
         "passwordLoginEnabled",
         auth.passwordLoginEnabled(),
+        "emailAuthEnabled",
+        auth.emailAuthEnabled(),
+        "googleLoginEnabled",
+        googleOAuth.isConfigured(),
         "devLoginEnabled",
         auth.devEnabled(),
         "stravaOAuthConfigured",
@@ -102,17 +109,31 @@ public class ApiController {
     return auth.wechat(body.code());
   }
 
-  public record Register(String username, String password, String displayName) {
+  public record Register(
+      String username, String email, String code, String password, String displayName) {
     @Override
     public String toString() {
       return "Register[凭据已隐藏]";
     }
   }
 
-  public record PasswordLogin(String username, String password) {
+  public record PasswordLogin(String username, String account, String password) {
     @Override
     public String toString() {
       return "PasswordLogin[凭据已隐藏]";
+    }
+  }
+
+  public record EmailCodeRequest(String email, String purpose) {}
+
+  public record EmailBindRequest(String email, String code) {}
+
+  public record GoogleOAuthStart(String redirectUri, String returnUrl) {}
+
+  public record GoogleTicketExchange(String ticket) {
+    @Override
+    public String toString() {
+      return "GoogleTicketExchange[凭据已隐藏]";
     }
   }
 
@@ -134,12 +155,84 @@ public class ApiController {
 
   @PostMapping("/auth/register")
   public Map<String, Object> register(@RequestBody Register body) {
+    if (body.email() != null && !body.email().isBlank()) {
+      return auth.registerWithEmail(body.email(), body.code(), body.password(), body.displayName());
+    }
     return auth.register(body.username(), body.password(), body.displayName());
   }
 
   @PostMapping("/auth/login")
   public Map<String, Object> passwordLogin(@RequestBody PasswordLogin body) {
-    return auth.passwordLogin(body.username(), body.password());
+    String acct =
+        (body.account() != null && !body.account().isBlank()) ? body.account() : body.username();
+    return auth.passwordLogin(acct, body.password());
+  }
+
+  @PostMapping("/auth/email/code")
+  public Map<String, Object> sendEmailCode(
+      HttpServletRequest request, @RequestBody EmailCodeRequest body) {
+    String authHeader = request.getHeader("Authorization");
+    String userId =
+        (authHeader != null && !authHeader.isBlank()) ? auth.authenticate(authHeader) : null;
+    return auth.sendEmailCode(userId, body.email(), body.purpose());
+  }
+
+  @PostMapping("/auth/email/bind")
+  public Map<String, Object> bindEmail(
+      HttpServletRequest request, @RequestBody EmailBindRequest body) {
+    return auth.bindEmail(user(request), body.email(), body.code());
+  }
+
+  @PostMapping("/auth/google/start")
+  public Map<String, Object> startGoogleLogin(
+      HttpServletRequest request, @RequestBody(required = false) GoogleOAuthStart body) {
+    var req = body == null ? new GoogleOAuthStart(null, null) : body;
+    return googleOAuth.startLogin(req.redirectUri(), req.returnUrl(), request);
+  }
+
+  @PostMapping("/auth/google/bind/start")
+  public Map<String, Object> startGoogleBind(
+      HttpServletRequest request, @RequestBody(required = false) GoogleOAuthStart body) {
+    var req = body == null ? new GoogleOAuthStart(null, null) : body;
+    return googleOAuth.startBind(user(request), req.redirectUri(), req.returnUrl(), request);
+  }
+
+  @GetMapping(value = "/auth/google/callback", produces = MediaType.TEXT_HTML_VALUE)
+  public ResponseEntity<String> googleOAuthCallback(
+      @RequestParam(required = false) String state,
+      @RequestParam(required = false) String code,
+      @RequestParam(required = false) String error) {
+    var outcome = googleOAuth.completeCallback(state, code, error);
+    if (outcome.returnUrl() != null) {
+      String sep = outcome.returnUrl().contains("?") ? "&" : "?";
+      String target;
+      if (outcome.ok() && "LOGIN".equals(outcome.mode()) && outcome.ticket() != null) {
+        target =
+            outcome.returnUrl()
+                + sep
+                + "googleTicket="
+                + URLEncoder.encode(outcome.ticket(), StandardCharsets.UTF_8);
+      } else {
+        target =
+            outcome.returnUrl()
+                + sep
+                + "googleOAuth="
+                + (outcome.ok() ? "success" : "error")
+                + (outcome.ok()
+                    ? ""
+                    : "&googleOAuthMsg="
+                        + URLEncoder.encode(outcome.message(), StandardCharsets.UTF_8));
+      }
+      return ResponseEntity.status(HttpStatus.FOUND).location(URI.create(target)).build();
+    }
+    String title = outcome.ok() ? "Google 授权成功" : "Google 授权未完成";
+    return oauthResultPage(outcome.ok(), title, outcome.message());
+  }
+
+  @PostMapping("/auth/google/exchange")
+  public Map<String, Object> exchangeGoogleTicket(
+      @RequestBody(required = false) GoogleTicketExchange body) {
+    return googleOAuth.exchangeTicket(body == null ? null : body.ticket());
   }
 
   @PostMapping("/auth/wechat/bind")
@@ -312,7 +405,12 @@ public class ApiController {
       return ResponseEntity.status(HttpStatus.FOUND).location(URI.create(target)).build();
     }
     String title = outcome.ok() ? "Strava 授权成功" : "Strava 授权未完成";
-    String badgeColor = outcome.ok() ? "#15803d" : "#b91c1c";
+    return oauthResultPage(outcome.ok(), title, outcome.message());
+  }
+
+  private static ResponseEntity<String> oauthResultPage(
+      boolean ok, String title, String message) {
+    String badgeColor = ok ? "#15803d" : "#b91c1c";
     String html =
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
             + "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
@@ -338,11 +436,11 @@ public class ApiController {
             + HtmlUtils.htmlEscape(title)
             + "</h2>"
             + "<p style=\"margin:0 0 16px;line-height:1.6;color:#374151;\">"
-            + HtmlUtils.htmlEscape(outcome.message())
+            + HtmlUtils.htmlEscape(message)
             + "</p>"
             + "<p style=\"margin:0;font-size:13px;color:#6b7280;\">现在可以关闭此网页并回到 FitSync 页面或微信小程序。</p>"
             + "</div></body></html>";
-    return ResponseEntity.status(outcome.ok() ? HttpStatus.OK : HttpStatus.BAD_REQUEST)
+    return ResponseEntity.status(ok ? HttpStatus.OK : HttpStatus.BAD_REQUEST)
         .contentType(MediaType.TEXT_HTML)
         .body(html);
   }

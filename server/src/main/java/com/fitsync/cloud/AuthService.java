@@ -16,6 +16,7 @@ public class AuthService {
   private final CloudStore store;
   private final CryptoService crypto;
   private final PasswordService passwords;
+  private final EmailService emailService;
   private final String appId, appSecret;
   private final boolean devEnabled;
   private final long sessionDays;
@@ -24,6 +25,7 @@ public class AuthService {
       CloudStore store,
       CryptoService crypto,
       PasswordService passwords,
+      EmailService emailService,
       Environment env,
       @Value("${fitsync.wechat-app-id:}") String appId,
       @Value("${fitsync.wechat-app-secret:}") String appSecret,
@@ -32,6 +34,7 @@ public class AuthService {
     this.store = store;
     this.crypto = crypto;
     this.passwords = passwords;
+    this.emailService = emailService;
     this.appId = appId;
     this.appSecret = appSecret;
     this.sessionDays = sessionDays;
@@ -60,11 +63,64 @@ public class AuthService {
     return true;
   }
 
+  public boolean emailAuthEnabled() {
+    return emailService.isConfigured();
+  }
+
   private static String validName(String raw, String fallback) {
     String name = raw == null ? "" : raw.strip();
     if (name.isEmpty()) name = fallback;
     if (name.length() > 80) throw ApiException.bad("昵称过长");
     return name;
+  }
+
+  private static String defaultNameForEmail(String email) {
+    int at = email.indexOf('@');
+    String local = at > 0 ? email.substring(0, at) : email;
+    if (local.isBlank()) return "骑行用户";
+    return local.length() > 80 ? local.substring(0, 80) : local;
+  }
+
+  /** 发送邮箱验证码：REGISTER 验证邮箱未注册；BIND 校验已登录且未绑定邮箱。 */
+  public Map<String, Object> sendEmailCode(
+      String currentUserId, String rawEmail, String rawPurpose) {
+    String email = passwords.validEmail(rawEmail);
+    String purpose = emailService.normalizePurpose(rawPurpose);
+    if ("REGISTER".equals(purpose)) {
+      if (emailTaken(email)) throw ApiException.bad("该邮箱已被注册，请直接登录");
+    } else if ("BIND".equals(purpose)) {
+      if (currentUserId == null || currentUserId.isBlank()) {
+        throw new ApiException(401, "UNAUTHORIZED", "请先登录");
+      }
+      var owner = store.one("SELECT email FROM app_user WHERE id=?", currentUserId);
+      if (CloudStore.str(owner, "email") != null) throw ApiException.bad("当前账号已绑定邮箱");
+      if (emailTaken(email)) throw ApiException.bad("该邮箱已被其他账号使用");
+    }
+    emailService.sendCode(email, purpose);
+    return Map.of("success", true);
+  }
+
+  /** 通过邮箱验证码与密码注册 FitSync 账号；不加外层事务以免验证码错误计数随业务异常回滚。 */
+  public Map<String, Object> registerWithEmail(
+      String rawEmail, String rawCode, String rawPassword, String rawName) {
+    String email = passwords.validEmail(rawEmail);
+    passwords.validPassword(rawPassword, "密码");
+    String name = validName(rawName, defaultNameForEmail(email));
+    if (emailTaken(email)) throw ApiException.bad("该邮箱已被注册，请直接登录");
+    emailService.verifyAndConsume(email, "REGISTER", rawCode);
+    String id = CloudStore.id();
+    try {
+      store.db.update(
+          "INSERT INTO app_user(id,email,password_hash,display_name,created_at) VALUES(?,?,?,?,?)",
+          id,
+          email,
+          passwords.hash(rawPassword),
+          name,
+          System.currentTimeMillis());
+    } catch (DuplicateKeyException e) {
+      throw ApiException.bad("该邮箱已被注册，请直接登录");
+    }
+    return issue(id);
   }
 
   /** 注册 FitSync 业务账号，成功后返回可直接使用的会话。 */
@@ -89,25 +145,33 @@ public class AuthService {
     return issue(id);
   }
 
-  /** 用户名加密码登录；用户名不区分大小写。 */
+  /** 邮箱或用户名加密码登录；不区分大小写。 */
   @Transactional
-  public Map<String, Object> passwordLogin(String rawUsername, String rawPassword) {
-    if (rawUsername == null || rawUsername.isBlank()) throw ApiException.bad("请输入用户名");
+  public Map<String, Object> passwordLogin(String rawAccount, String rawPassword) {
+    if (rawAccount == null || rawAccount.isBlank()) throw ApiException.bad("请输入邮箱或用户名");
     if (rawPassword == null || rawPassword.isBlank()) throw ApiException.bad("请输入密码");
-    String key = rawUsername.strip().toLowerCase(Locale.ROOT);
-    if (key.length() > 64) throw ApiException.bad("账号或密码错误");
+    String key = rawAccount.strip().toLowerCase(Locale.ROOT);
+    if (key.length() > 160) throw ApiException.bad("账号或密码错误");
     var rows =
         store.db.queryForList(
-            "SELECT id,password_hash FROM app_user WHERE username=?", key);
-    String hash = rows.isEmpty() ? null : CloudStore.str(rows.getFirst(), "password_hash");
-    if (hash == null || !passwords.matches(rawPassword, hash))
-      throw ApiException.bad("账号或密码错误");
+            "SELECT id,password_hash FROM app_user WHERE email=? OR username=?", key, key);
+    if (rows.isEmpty()) throw ApiException.bad("账号或密码错误");
+    String hash = CloudStore.str(rows.getFirst(), "password_hash");
+    if (hash == null)
+      throw ApiException.bad("该账号尚未设置密码，请使用 Google 或微信登录后在设置页设置密码");
+    if (!passwords.matches(rawPassword, hash)) throw ApiException.bad("账号或密码错误");
     return issue(CloudStore.str(rows.getFirst(), "id"));
   }
 
   private boolean taken(String username) {
     return store.db.queryForObject(
             "SELECT COUNT(*) FROM app_user WHERE username=?", Integer.class, username)
+        > 0;
+  }
+
+  private boolean emailTaken(String email) {
+    return store.db.queryForObject(
+            "SELECT COUNT(*) FROM app_user WHERE email=?", Integer.class, email)
         > 0;
   }
 
@@ -194,14 +258,139 @@ public class AuthService {
     return issue(CloudStore.str(users.getFirst(), "id"));
   }
 
-  /** 无密码用户补设用户名与密码；已有密码时请使用修改密码接口。 */
+  /** 已登录用户验证邮箱验证码并绑定邮箱；不加外层事务以免验证码错误计数被回滚。 */
+  public Map<String, Object> bindEmail(String user, String rawEmail, String rawCode) {
+    String email = passwords.validEmail(rawEmail);
+    var owner = store.one("SELECT email FROM app_user WHERE id=?", user);
+    if (CloudStore.str(owner, "email") != null) throw ApiException.bad("当前账号已绑定邮箱");
+    if (emailTaken(email)) throw ApiException.bad("该邮箱已被其他账号使用");
+    emailService.verifyAndConsume(email, "BIND", rawCode);
+    try {
+      if (store.db.update(
+              "UPDATE app_user SET email=? WHERE id=? AND email IS NULL", email, user)
+          != 1) throw ApiException.bad("邮箱绑定失败，请刷新后重试");
+    } catch (DuplicateKeyException e) {
+      throw ApiException.bad("该邮箱已被其他账号使用");
+    }
+    return account(user);
+  }
+
+  /** 根据 Google OAuth 身份查找、同邮箱自动关联或创建业务用户。 */
+  @Transactional
+  public synchronized String resolveOrCreateGoogleUser(
+      String sub, String verifiedEmail, String rawName) {
+    var bySub = store.db.queryForList("SELECT id,email FROM app_user WHERE google_sub=?", sub);
+    if (!bySub.isEmpty()) {
+      var row = bySub.getFirst();
+      String uid = CloudStore.str(row, "id");
+      if (CloudStore.str(row, "email") == null
+          && verifiedEmail != null
+          && !emailTaken(verifiedEmail)) {
+        store.db.update(
+            "UPDATE app_user SET email=? WHERE id=? AND email IS NULL", verifiedEmail, uid);
+      }
+      return uid;
+    }
+
+    if (verifiedEmail != null) {
+      var byEmail =
+          store.db.queryForList("SELECT id,google_sub FROM app_user WHERE email=?", verifiedEmail);
+      if (!byEmail.isEmpty()) {
+        var row = byEmail.getFirst();
+        if (CloudStore.str(row, "google_sub") != null) {
+          throw ApiException.bad("该邮箱关联的账号已绑定其他 Google 账号");
+        }
+        String uid = CloudStore.str(row, "id");
+        if (store.db.update(
+                "UPDATE app_user SET google_sub=? WHERE id=? AND google_sub IS NULL", sub, uid)
+            != 1) {
+          throw ApiException.bad("关联 Google 账号失败，请重试");
+        }
+        return uid;
+      }
+    }
+
+    String id = CloudStore.id();
+    String emailToSet =
+        (verifiedEmail != null && !emailTaken(verifiedEmail)) ? verifiedEmail : null;
+    String fallback =
+        emailToSet != null ? defaultNameForEmail(emailToSet) : "骑行用户";
+    String name = validName(rawName, fallback);
+    if (name.length() > 80) name = name.substring(0, 80);
+    try {
+      store.db.update(
+          "INSERT INTO app_user(id,email,google_sub,display_name,created_at) VALUES(?,?,?,?,?)",
+          id,
+          emailToSet,
+          sub,
+          name,
+          System.currentTimeMillis());
+    } catch (DuplicateKeyException e) {
+      throw ApiException.bad("Google 账号注册冲突，请重试");
+    }
+    return id;
+  }
+
+  /** 已登录用户绑定 Google 账号；若账号尚未设置邮箱则顺便补齐已验证邮箱。 */
+  @Transactional
+  public synchronized Map<String, Object> bindGoogle(
+      String user, String sub, String verifiedEmail) {
+    var owner = store.one("SELECT email,google_sub FROM app_user WHERE id=?", user);
+    if (CloudStore.str(owner, "google_sub") != null)
+      throw ApiException.bad("当前账号已绑定 Google 账号");
+    var existing = store.db.queryForList("SELECT id FROM app_user WHERE google_sub=?", sub);
+    if (!existing.isEmpty())
+      throw ApiException.bad("该 Google 账号已绑定其他 FitSync 账号，请先登录该账号");
+    try {
+      if (store.db.update(
+              "UPDATE app_user SET google_sub=? WHERE id=? AND google_sub IS NULL", sub, user)
+          != 1) throw ApiException.bad("Google 账号绑定失败，请刷新后重试");
+    } catch (DuplicateKeyException e) {
+      throw ApiException.bad("该 Google 账号已绑定其他 FitSync 账号，请先登录该账号");
+    }
+    if (CloudStore.str(owner, "email") == null
+        && verifiedEmail != null
+        && !emailTaken(verifiedEmail)) {
+      store.db.update(
+          "UPDATE app_user SET email=? WHERE id=? AND email IS NULL", verifiedEmail, user);
+    }
+    return account(user);
+  }
+
+  @Transactional
+  public Map<String, Object> issueForUser(String userId) {
+    return issue(userId);
+  }
+
+  /** 无密码用户补设密码（已有邮箱时用户名可选填）；已有密码时请使用修改密码接口。 */
   @Transactional
   public Map<String, Object> setPassword(String user, String rawUsername, String rawPassword) {
-    var row = store.one("SELECT username,password_hash FROM app_user WHERE id=?", user);
+    var row = store.one("SELECT username,email,password_hash FROM app_user WHERE id=?", user);
     if (CloudStore.str(row, "password_hash") != null)
       throw ApiException.bad("当前账号已设置密码，请使用修改密码");
-    String username = passwords.validUsername(rawUsername);
     passwords.validPassword(rawPassword, "密码");
+    String existingUsername = CloudStore.str(row, "username");
+    boolean hasEmail = CloudStore.str(row, "email") != null;
+    if ((rawUsername == null || rawUsername.isBlank())
+        && (hasEmail || existingUsername != null)) {
+      if (store.db.update(
+              "UPDATE app_user SET password_hash=? WHERE id=? AND password_hash IS NULL",
+              passwords.hash(rawPassword),
+              user)
+          != 1) throw ApiException.bad("密码设置失败，请刷新后重试");
+      return account(user);
+    }
+    if (existingUsername != null) {
+      String requested = passwords.validUsername(rawUsername);
+      if (!existingUsername.equals(requested)) throw ApiException.bad("当前账号已绑定用户名，不可更改");
+      if (store.db.update(
+              "UPDATE app_user SET password_hash=? WHERE id=? AND password_hash IS NULL",
+              passwords.hash(rawPassword),
+              user)
+          != 1) throw ApiException.bad("密码设置失败，请刷新后重试");
+      return account(user);
+    }
+    String username = passwords.validUsername(rawUsername);
     if (taken(username)) throw ApiException.bad("该用户名已被注册");
     try {
       if (store.db.update(
@@ -247,6 +436,10 @@ public class AuthService {
     result.put("displayName", row.get("display_name"));
     result.put("hasPassword", row.get("password_hash") != null);
     result.put("hasWechat", row.get("wechat_openid") != null);
+    String email = CloudStore.str(row, "email");
+    result.put("hasEmail", email != null);
+    if (email != null) result.put("email", email);
+    result.put("hasGoogle", row.get("google_sub") != null);
     String username = CloudStore.str(row, "username");
     if (username != null) result.put("username", username);
     return result;

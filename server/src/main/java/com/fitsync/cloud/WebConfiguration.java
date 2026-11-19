@@ -79,6 +79,10 @@ public class WebConfiguration implements WebMvcConfigurer {
                 || path.equals("/api/v1/auth/wechat")
                 || path.equals("/api/v1/auth/register")
                 || path.equals("/api/v1/auth/login")
+                || path.equals("/api/v1/auth/email/code")
+                || path.equals("/api/v1/auth/google/start")
+                || path.equals("/api/v1/auth/google/exchange")
+                || path.equals(GoogleOAuthService.CALLBACK_PATH)
                 || path.equals(StravaOAuthService.CALLBACK_PATH);
         if (path.startsWith("/api/v1/auth/") && !request.getMethod().equals("OPTIONS")) {
           long current = System.currentTimeMillis() / 60000;

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onUnmounted, ref, watch } from "vue";
 import {
   initialize,
   loginAsDev,
@@ -7,31 +7,166 @@ import {
   loginWithWechat,
   messageOf,
   register,
+  registerWithEmail,
+  sendEmailCode,
   session,
+  startGoogleOAuth,
+  toast,
 } from "../lib/api";
 import { theme } from "../lib/theme";
+
 const emit = defineEmits<{ ready: [] }>();
+const EMAIL_RE = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
+
 const passwordEnabled = computed(
   () => session.config?.passwordLoginEnabled !== false,
 );
+const emailAuthEnabled = computed(() => !!session.config?.emailAuthEnabled);
+const googleLoginEnabled = computed(() => !!session.config?.googleLoginEnabled);
 const wechatEnabled = computed(() => !!session.config?.wechatLoginEnabled);
+
 const mode = ref<"login" | "register">("login");
+const registerByEmail = ref(true);
 const busy = ref(false),
+  sendingCode = ref(false),
+  cooldown = ref(0),
   error = ref(""),
+  account = ref(""),
+  email = ref(""),
+  emailCode = ref(""),
   username = ref(""),
   password = ref(""),
   confirmPassword = ref(""),
   displayName = ref("");
+
+let cooldownTimer: ReturnType<typeof setInterval> | null = null;
+
+watch(
+  emailAuthEnabled,
+  (enabled) => {
+    registerByEmail.value = enabled;
+  },
+  { immediate: true },
+);
+
+onUnmounted(() => {
+  if (cooldownTimer) {
+    clearInterval(cooldownTimer);
+    cooldownTimer = null;
+  }
+});
+
+const useEmailRegister = computed(
+  () => emailAuthEnabled.value && registerByEmail.value,
+);
+const displayError = computed(() => error.value || session.authNotice);
+
+function clearNotice() {
+  error.value = "";
+  session.authNotice = "";
+}
+
 function switchMode(next: "login" | "register") {
   if (busy.value) return;
   mode.value = next;
-  error.value = "";
+  clearNotice();
   password.value = "";
   confirmPassword.value = "";
 }
+
+function toggleRegisterKind() {
+  if (busy.value || !emailAuthEnabled.value) return;
+  registerByEmail.value = !registerByEmail.value;
+  clearNotice();
+  password.value = "";
+  confirmPassword.value = "";
+}
+
+function startCooldown() {
+  if (cooldownTimer) clearInterval(cooldownTimer);
+  cooldown.value = 60;
+  cooldownTimer = setInterval(() => {
+    if (cooldown.value <= 1) {
+      cooldown.value = 0;
+      if (cooldownTimer) {
+        clearInterval(cooldownTimer);
+        cooldownTimer = null;
+      }
+      return;
+    }
+    cooldown.value -= 1;
+  }, 1000);
+}
+
+async function requestEmailCode() {
+  clearNotice();
+  const addr = email.value.trim().toLowerCase();
+  if (!addr) return (error.value = "请输入邮箱地址");
+  if (addr.length > 160 || !EMAIL_RE.test(addr))
+    return (error.value = "邮箱格式不正确");
+  sendingCode.value = true;
+  try {
+    await sendEmailCode(addr, "REGISTER");
+    startCooldown();
+    toast("验证码已发送至邮箱，请查收");
+  } catch (reason) {
+    error.value = messageOf(reason);
+  } finally {
+    sendingCode.value = false;
+  }
+}
+
 async function submitPassword() {
-  const name = username.value.trim(),
-    pwd = password.value;
+  clearNotice();
+  const pwd = password.value;
+
+  if (mode.value === "login") {
+    const acct = account.value.trim();
+    if (!acct) return (error.value = "请输入邮箱或用户名");
+    if (!pwd) return (error.value = "请输入密码");
+    if (pwd.length < 8 || pwd.length > 128)
+      return (error.value = "密码需为 8–128 个字符");
+    busy.value = true;
+    try {
+      await loginWithPassword(acct, pwd);
+      password.value = "";
+      emit("ready");
+    } catch (reason) {
+      error.value = messageOf(reason);
+    } finally {
+      busy.value = false;
+    }
+    return;
+  }
+
+  if (useEmailRegister.value) {
+    const addr = email.value.trim().toLowerCase();
+    const code = emailCode.value.trim();
+    if (!addr) return (error.value = "请输入邮箱地址");
+    if (addr.length > 160 || !EMAIL_RE.test(addr))
+      return (error.value = "邮箱格式不正确");
+    if (!/^\d{6}$/.test(code))
+      return (error.value = "请输入 6 位数字验证码");
+    if (pwd.length < 8 || pwd.length > 128)
+      return (error.value = "密码需为 8–128 个字符");
+    if (pwd !== confirmPassword.value)
+      return (error.value = "两次输入的密码不一致");
+    busy.value = true;
+    try {
+      await registerWithEmail(addr, code, pwd, displayName.value.trim());
+      password.value = "";
+      confirmPassword.value = "";
+      emailCode.value = "";
+      emit("ready");
+    } catch (reason) {
+      error.value = messageOf(reason);
+    } finally {
+      busy.value = false;
+    }
+    return;
+  }
+
+  const name = username.value.trim();
   if (!name) return (error.value = "请输入用户名");
   if (!pwd) return (error.value = "请输入密码");
   if (name.length < 3 || name.length > 32)
@@ -40,14 +175,11 @@ async function submitPassword() {
     return (error.value = "用户名只能包含中英文、数字、下划线或连字符");
   if (pwd.length < 8 || pwd.length > 128)
     return (error.value = "密码需为 8–128 个字符");
-  if (mode.value === "register" && pwd !== confirmPassword.value)
+  if (pwd !== confirmPassword.value)
     return (error.value = "两次输入的密码不一致");
   busy.value = true;
-  error.value = "";
   try {
-    if (mode.value === "register")
-      await register(name, pwd, displayName.value.trim());
-    else await loginWithPassword(name, pwd);
+    await register(name, pwd, displayName.value.trim());
     password.value = "";
     confirmPassword.value = "";
     emit("ready");
@@ -57,19 +189,28 @@ async function submitPassword() {
     busy.value = false;
   }
 }
-async function signIn(kind: "wechat" | "dev") {
+
+async function signIn(kind: "wechat" | "dev" | "google") {
+  clearNotice();
   busy.value = true;
-  error.value = "";
   try {
-    if (kind === "wechat") await loginWithWechat();
-    else await loginAsDev("");
-    emit("ready");
+    if (kind === "wechat") {
+      await loginWithWechat();
+      emit("ready");
+    } else if (kind === "google") {
+      await startGoogleOAuth("login");
+      return;
+    } else {
+      await loginAsDev("");
+      emit("ready");
+    }
   } catch (reason) {
     error.value = messageOf(reason);
   } finally {
     busy.value = false;
   }
 }
+
 async function retry() {
   await initialize(true);
   if (session.config && session.token) emit("ready");
@@ -117,16 +258,66 @@ async function retry() {
           >
             注册</button
           ></view
-        ><view class="form-field"
-          ><text class="field-label">用户名</text
-          ><input
-            v-model="username"
-            class="input"
-            maxlength="32"
-            placeholder="输入用户名"
-            :disabled="busy"
-            @confirm="submitPassword" /></view
-        ><view v-if="mode === 'register'" class="form-field"
+        >
+
+        <template v-if="mode === 'login'">
+          <view class="form-field"
+            ><text class="field-label">邮箱或用户名</text
+            ><input
+              v-model="account"
+              class="input"
+              maxlength="160"
+              placeholder="输入注册邮箱或用户名"
+              :disabled="busy"
+              @confirm="submitPassword" /></view
+          >
+        </template>
+
+        <template v-else-if="useEmailRegister">
+          <view class="form-field"
+            ><text class="field-label">邮箱</text
+            ><input
+              v-model="email"
+              class="input"
+              maxlength="160"
+              placeholder="name@example.com"
+              :disabled="busy || sendingCode" /></view
+          ><view class="form-field"
+            ><text class="field-label">邮箱验证码</text
+            ><view class="otp-input-row"
+              ><input
+                v-model="emailCode"
+                class="input"
+                type="number"
+                maxlength="6"
+                placeholder="6 位数字验证码"
+                :disabled="busy"
+                @confirm="submitPassword" /><button
+                class="btn secondary otp-send-btn"
+                :loading="sendingCode"
+                :disabled="busy || sendingCode || cooldown > 0"
+                @click="requestEmailCode"
+              >
+                {{ cooldown > 0 ? `${cooldown}s 后重试` : "获取验证码" }}
+              </button></view
+            ></view
+          >
+        </template>
+
+        <template v-else>
+          <view class="form-field"
+            ><text class="field-label">用户名</text
+            ><input
+              v-model="username"
+              class="input"
+              maxlength="32"
+              placeholder="输入用户名"
+              :disabled="busy"
+              @confirm="submitPassword" /></view
+          >
+        </template>
+
+        <view v-if="mode === 'register'" class="form-field"
           ><text class="field-label">昵称</text
           ><input
             v-model="displayName"
@@ -156,6 +347,10 @@ async function retry() {
             placeholder="再次输入密码"
             :disabled="busy"
             @confirm="submitPassword" /></view
+        ><view v-if="mode === 'register' && emailAuthEnabled" class="auth-subswitch"
+          ><button class="text-button" :disabled="busy" @click="toggleRegisterKind">
+            {{ useEmailRegister ? "改用用户名注册" : "改用邮箱验证码注册" }}
+          </button></view
         ><button
           class="btn primary full"
           :loading="busy"
@@ -165,6 +360,21 @@ async function retry() {
           {{ mode === "register" ? "注册并登录" : "登录" }}</button
         ></view
       >
+
+      <!-- #ifdef H5 -->
+      <template v-if="googleLoginEnabled">
+        <view class="auth-divider"><text>或</text></view>
+        <button
+          class="btn secondary full"
+          :loading="busy"
+          :disabled="busy"
+          @click="signIn('google')"
+        >
+          <image class="oauth-btn-icon" src="/static/google.svg" />
+          <text>使用 Google 账号登录</text>
+        </button>
+      </template>
+      <!-- #endif -->
 
       <!-- #ifdef MP-WEIXIN -->
       <button
@@ -191,7 +401,7 @@ async function retry() {
       >
       <!-- #endif -->
 
-      <text v-if="error" class="error-text">{{ error }}</text></view
+      <text v-if="displayError" class="error-text">{{ displayError }}</text></view
     ></view
   >
   <slot v-else />

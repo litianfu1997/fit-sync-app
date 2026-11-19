@@ -3,6 +3,8 @@ package com.fitsync.cloud;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.Base64;
+import java.util.Locale;
+import java.util.regex.Pattern;
 import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.PBEKeySpec;
 import org.springframework.stereotype.Service;
@@ -13,6 +15,8 @@ public class PasswordService {
   private static final String ALGORITHM = "PBKDF2WithHmacSHA256";
   private static final int ITERATIONS = 210_000, SALT_BYTES = 16, KEY_BITS = 256;
   private static final int MAX_LENGTH = 128;
+  private static final Pattern EMAIL_PATTERN =
+      Pattern.compile("^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$");
   private final SecureRandom random = new SecureRandom();
 
   static {
@@ -32,7 +36,16 @@ public class PasswordService {
       throw ApiException.bad("用户名需为 3–32 个字符");
     if (!value.matches("[A-Za-z0-9_\\u4e00-\\u9fff-]+"))
       throw ApiException.bad("用户名只能包含中英文、数字、下划线或连字符");
-    return value.toLowerCase(java.util.Locale.ROOT);
+    return value.toLowerCase(Locale.ROOT);
+  }
+
+  /** 校验邮箱地址格式，并返回统一存库的小写形式。 */
+  public String validEmail(String raw) {
+    if (raw == null || raw.isBlank()) throw ApiException.bad("请输入邮箱地址");
+    String value = raw.strip().toLowerCase(Locale.ROOT);
+    if (value.length() > 160 || !EMAIL_PATTERN.matcher(value).matches())
+      throw ApiException.bad("邮箱格式不正确");
+    return value;
   }
 
   /** 校验密码长度；密码不记录日志、不加密留存明文。 */
