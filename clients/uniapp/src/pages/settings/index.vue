@@ -34,7 +34,8 @@ const pwdUsername = ref(""),
   pwdConfirm = ref(""),
   savingPassword = ref(false),
   pwdError = ref(""),
-  pwdSuccess = ref("");
+  pwdSuccess = ref(""),
+  pwdModal = ref(false);
 const bindingWechat = ref(false),
   bindError = ref(""),
   bindSuccess = ref("");
@@ -62,6 +63,20 @@ async function saveProfile() {
   } finally {
     savingProfile.value = false;
   }
+}
+function openPasswordModal() {
+  pwdError.value = "";
+  pwdSuccess.value = "";
+  pwdUsername.value = "";
+  pwdOld.value = "";
+  pwdNew.value = "";
+  pwdConfirm.value = "";
+  pwdModal.value = true;
+}
+function closePasswordModal() {
+  if (savingPassword.value) return;
+  pwdError.value = "";
+  pwdModal.value = false;
 }
 async function savePassword() {
   pwdError.value = "";
@@ -91,6 +106,7 @@ async function savePassword() {
     pwdOld.value = "";
     pwdNew.value = "";
     pwdConfirm.value = "";
+    pwdModal.value = false;
     toast("账号安全信息已保存");
   } catch (reason) {
     pwdError.value = messageOf(reason);
@@ -238,59 +254,13 @@ async function logout() {
                 ? "修改后，其他已登录设备仍保持在线；请牢记新密码。"
                 : "设置后即可在网页和小程序用同一账号登录，不依赖微信。"
             }}</text
-            ><view v-if="!hasPassword" class="form-field"
-              ><text class="field-label">用户名</text
-              ><input
-                v-model="pwdUsername"
-                class="input"
-                maxlength="32"
-                placeholder="3–32 位中英文、数字、_ 或 -"
-                :disabled="savingPassword" /></view
-            ><view v-if="hasPassword" class="form-field"
-              ><text class="field-label">原密码</text
-              ><input
-                v-model="pwdOld"
-                class="input"
-                type="password"
-                password
-                maxlength="128"
-                placeholder="当前密码"
-                :disabled="savingPassword" /></view
-            ><view class="form-field"
-              ><text class="field-label">{{
-                hasPassword ? "新密码" : "密码"
-              }}</text
-              ><input
-                v-model="pwdNew"
-                class="input"
-                type="password"
-                password
-                maxlength="128"
-                placeholder="至少 8 位"
-                :disabled="savingPassword" /></view
-            ><view class="form-field"
-              ><text class="field-label">确认密码</text
-              ><input
-                v-model="pwdConfirm"
-                class="input"
-                type="password"
-                password
-                maxlength="128"
-                placeholder="再次输入"
-                :disabled="savingPassword"
-                @confirm="savePassword" /></view
-            ><text v-if="pwdError" class="error-text">{{ pwdError }}</text
+            ><button class="btn primary" @click="openPasswordModal">
+              {{ hasPassword ? "修改密码" : "设置用户名与密码" }}
+            </button
             ><text v-if="pwdSuccess" class="success-text">{{
               pwdSuccess
             }}</text
-            ><button
-              class="btn primary"
-              :loading="savingPassword"
-              :disabled="savingPassword"
-              @click="savePassword"
-            >
-              {{ hasPassword ? "修改密码" : "设置并启用密码登录" }}
-            </button></view
+            ></view
           >
         </view>
 
@@ -330,6 +300,89 @@ async function logout() {
           ><text>FitSync Cloud</text><text>0.1.0 · 预览版</text></view
         ></view
       ></view
+      ><view
+        v-if="pwdModal"
+        class="modal-mask"
+        @click="closePasswordModal"
+        @touchmove.stop
+        ><view class="modal-card" @click.stop
+          ><view class="modal-head"
+            ><text class="section-title">{{
+              hasPassword ? "修改密码" : "设置登录用户名与密码"
+            }}</text
+            ><button
+              class="text-button"
+              :disabled="savingPassword"
+              @click="closePasswordModal"
+            >
+              关闭
+            </button></view
+          ><text class="muted">{{
+            hasPassword
+              ? "输入原密码确认身份；修改后其他已登录设备仍保持在线。"
+              : "设置后即可在网页和小程序用同一账号登录，不依赖微信。"
+          }}</text
+          ><view v-if="!hasPassword" class="form-field"
+            ><text class="field-label">用户名</text
+            ><input
+              v-model="pwdUsername"
+              class="input"
+              maxlength="32"
+              placeholder="3–32 位中英文、数字、_ 或 -"
+              :disabled="savingPassword" /></view
+          ><view v-if="hasPassword" class="form-field"
+            ><text class="field-label">原密码</text
+            ><input
+              v-model="pwdOld"
+              class="input"
+              type="password"
+              password
+              maxlength="128"
+              placeholder="当前密码"
+              :disabled="savingPassword" /></view
+          ><view class="form-field"
+            ><text class="field-label">{{
+              hasPassword ? "新密码" : "密码"
+            }}</text
+            ><input
+              v-model="pwdNew"
+              class="input"
+              type="password"
+              password
+              maxlength="128"
+              placeholder="至少 8 位"
+              :disabled="savingPassword" /></view
+          ><view class="form-field"
+            ><text class="field-label">确认密码</text
+            ><input
+              v-model="pwdConfirm"
+              class="input"
+              type="password"
+              password
+              maxlength="128"
+              placeholder="再次输入"
+              :disabled="savingPassword"
+              @confirm="savePassword" /></view
+          ><text v-if="pwdError" class="error-text">{{ pwdError }}</text
+          ><view class="modal-actions"
+            ><button
+              class="btn secondary"
+              :disabled="savingPassword"
+              @click="closePasswordModal"
+            >
+              取消
+            </button
+            ><button
+              class="btn primary"
+              :loading="savingPassword"
+              :disabled="savingPassword"
+              @click="savePassword"
+            >
+              {{ hasPassword ? "确认修改" : "设置并启用" }}
+            </button></view
+          ></view
+        ></view
+      >
     ></AppShell
   >
 </template>
