@@ -56,8 +56,6 @@ public class ApiController {
     return Map.of(
         "wechatLoginEnabled",
         auth.wechatEnabled(),
-        "webLoginEnabled",
-        auth.wechatEnabled(),
         "passwordLoginEnabled",
         auth.passwordLoginEnabled(),
         "devLoginEnabled",
@@ -160,26 +158,6 @@ public class ApiController {
   public Map<String, Object> changePassword(
       HttpServletRequest request, @RequestBody ChangePassword body) {
     return auth.changePassword(user(request), body.oldPassword(), body.newPassword());
-  }
-
-  @PostMapping("/auth/web-challenges")
-  public Map<String, Object> webChallenge() {
-    return auth.createWebChallenge();
-  }
-
-  @GetMapping("/auth/web-challenges/{id}")
-  public Map<String, Object> pollChallenge(
-      @PathVariable String id,
-      @RequestHeader(value = "X-Login-Poll-Token", required = false) String poll) {
-    return auth.pollWebChallenge(id, poll);
-  }
-
-  public record ConfirmWeb(String code, boolean confirm) {}
-
-  @PostMapping("/auth/web-challenges/confirm")
-  public Map<String, Object> confirmChallenge(
-      HttpServletRequest request, @RequestBody ConfirmWeb body) {
-    return auth.confirmWebChallenge(user(request), body.code(), body.confirm());
   }
 
   @GetMapping("/me")

@@ -24,10 +24,6 @@ const themeOptions: { value: ThemeMode; label: string }[] = [
   { value: "light", label: "浅色" },
   { value: "dark", label: "深色" },
 ];
-const webCode = ref(""),
-  confirmingWeb = ref(false),
-  webError = ref(""),
-  webSuccess = ref("");
 const profileName = ref(""),
   savingProfile = ref(false),
   profileError = ref(""),
@@ -50,33 +46,6 @@ function applyUser(user: typeof session.user) {
   if (!user) return;
   patchSessionUser(user);
   profileName.value = user.displayName || "";
-}
-async function confirmWeb() {
-  webError.value = "";
-  webSuccess.value = "";
-  const code = webCode.value.replace(/\s+/g, "").toUpperCase();
-  if (!/^[A-Z0-9]{10}$/.test(code)) {
-    webError.value = "请输入网页显示的 10 位登录确认码";
-    return;
-  }
-  if (
-    !(await confirm(
-      "确认授权网页登录",
-      `确认将当前 FitSync 账号登录到显示确认码 ${code} 的网页？请仅确认你本人打开的网页。`,
-    ))
-  )
-    return;
-  confirmingWeb.value = true;
-  try {
-    await api("/auth/web-challenges/confirm", "POST", { code, confirm: true });
-    webCode.value = "";
-    webSuccess.value = "已确认登录，请返回原网页继续使用。";
-    toast("网页登录已确认");
-  } catch (reason) {
-    webError.value = messageOf(reason);
-  } finally {
-    confirmingWeb.value = false;
-  }
 }
 async function saveProfile() {
   const name = profileName.value.trim();
@@ -336,41 +305,7 @@ async function logout() {
               :aria-pressed="theme.mode === option.value"
               @click="setThemeMode(option.value)"
             >{{ option.label }}</button></view></view
-        ><!-- #ifdef MP-WEIXIN -->
-        <view
-          v-if="session.token && session.config?.webLoginEnabled"
-          class="card"
-          ><view class="card-heading"
-            ><view
-              ><text class="section-title">网页授权登录</text
-              ><text class="muted"
-                >仅确认你本人打开的 FitSync 网页。</text
-              ></view
-            ></view
-          ><view class="form-field"
-            ><text class="field-label">网页上的 10 位确认码</text
-            ><input
-              v-model="webCode"
-              class="input login-code-input"
-              maxlength="12"
-              placeholder="输入网页显示的确认码"
-              :disabled="confirmingWeb" /></view
-          ><text class="tiny muted"
-            >确认后，你的 FitSync
-            账号将登录到显示此码的网页。请勿确认他人发来的登录码。</text
-          ><text v-if="webError" class="error-text">{{ webError }}</text
-          ><text v-if="webSuccess" class="success-text">{{ webSuccess }}</text
-          ><button
-            class="btn primary full"
-            style="margin-top: 16px"
-            :disabled="confirmingWeb"
-            :loading="confirmingWeb"
-            @click="confirmWeb"
-          >
-            确认将我的账号登录到该网页
-          </button></view
         >
-        <!-- #endif -->
         <RewardSupport /></view
       ><view class="card about-card"
         ><text class="section-title">关于 FitSync</text

@@ -35,7 +35,7 @@ public class WebConfiguration implements WebMvcConfigurer {
         .addMapping("/api/**")
         .allowedOrigins(origins)
         .allowedMethods("GET", "POST", "PUT", "DELETE", "OPTIONS")
-        .allowedHeaders("Authorization", "Content-Type", "X-Login-Poll-Token")
+        .allowedHeaders("Authorization", "Content-Type")
         .exposedHeaders("Content-Disposition")
         .maxAge(3600);
   }
@@ -45,7 +45,7 @@ public class WebConfiguration implements WebMvcConfigurer {
     var configuration = new CorsConfiguration();
     configuration.setAllowedOrigins(Arrays.asList(origins));
     configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
-    configuration.setAllowedHeaders(List.of("Authorization", "Content-Type", "X-Login-Poll-Token"));
+    configuration.setAllowedHeaders(List.of("Authorization", "Content-Type"));
     configuration.setExposedHeaders(List.of("Content-Disposition"));
     configuration.setMaxAge(3600L);
     var source = new UrlBasedCorsConfigurationSource();
@@ -73,17 +73,13 @@ public class WebConfiguration implements WebMvcConfigurer {
         String path = request.getRequestURI();
         response.setHeader("X-Content-Type-Options", "nosniff");
         if (path.startsWith("/api/")) response.setHeader("Cache-Control", "no-store");
-        boolean challenge =
-            path.startsWith("/api/v1/auth/web-challenges")
-                && !path.equals("/api/v1/auth/web-challenges/confirm");
         boolean publicPath =
             path.equals("/api/v1/config")
                 || path.equals("/api/v1/auth/dev-login")
                 || path.equals("/api/v1/auth/wechat")
                 || path.equals("/api/v1/auth/register")
                 || path.equals("/api/v1/auth/login")
-                || path.equals(StravaOAuthService.CALLBACK_PATH)
-                || challenge;
+                || path.equals(StravaOAuthService.CALLBACK_PATH);
         if (path.startsWith("/api/v1/auth/") && !request.getMethod().equals("OPTIONS")) {
           long current = System.currentTimeMillis() / 60000;
           if (current != window) {
@@ -94,14 +90,12 @@ public class WebConfiguration implements WebMvcConfigurer {
               }
             }
           }
-          String category = challenge && request.getMethod().equals("GET") ? "poll" : "auth";
-          String key = request.getRemoteAddr() + ":" + category;
-          int max = category.equals("poll") ? Math.max(90, authRateLimit) : authRateLimit;
+          String key = request.getRemoteAddr() + ":auth";
           if (requests.size() > 10000
               || requests
                       .computeIfAbsent(key, k -> new java.util.concurrent.atomic.AtomicInteger())
                       .incrementAndGet()
-                  > max) {
+                  > authRateLimit) {
             response.setStatus(429);
             response.setHeader("Retry-After", "60");
             response.setContentType("application/json;charset=UTF-8");

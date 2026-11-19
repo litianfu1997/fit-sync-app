@@ -58,7 +58,8 @@ class AuthIntegrationTest {
   void configAdvertisesPasswordLogin() throws Exception {
     mvc.perform(get("/api/v1/config"))
         .andExpect(status().isOk())
-        .andExpect(jsonPath("$.passwordLoginEnabled").value(true));
+        .andExpect(jsonPath("$.passwordLoginEnabled").value(true))
+        .andExpect(jsonPath("$.webLoginEnabled").doesNotExist());
   }
 
   @Test

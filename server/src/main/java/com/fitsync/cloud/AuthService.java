@@ -141,7 +141,7 @@ public class AuthService {
       throw ApiException.bad("当前账号已绑定微信");
     var existing = store.db.queryForList("SELECT id FROM app_user WHERE wechat_openid=?", openId);
     if (!existing.isEmpty())
-      throw ApiException.bad("该微信已绑定其他 FitSync 账号，请先登录该账号或在网页确认登录");
+      throw ApiException.bad("该微信已绑定其他 FitSync 账号，请先登录该账号");
     if (store.db.update(
             "UPDATE app_user SET wechat_openid=? WHERE id=? AND wechat_openid IS NULL",
             openId,
@@ -260,70 +260,6 @@ public class AuthService {
         id,
         System.currentTimeMillis() + Duration.ofDays(sessionDays).toMillis());
     return Map.of("token", token, "user", account(id));
-  }
-
-  @Transactional
-  public Map<String, Object> createWebChallenge() {
-    long now = System.currentTimeMillis(), expires = now + Duration.ofMinutes(5).toMillis();
-    String id = CloudStore.id(), poll = crypto.token();
-    String alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    var random = new java.security.SecureRandom();
-    var chars = new StringBuilder();
-    for (int i = 0; i < 10; i++) chars.append(alphabet.charAt(random.nextInt(alphabet.length())));
-    String code = chars.toString();
-    store.db.update(
-        "DELETE FROM web_login_challenge WHERE expires_at<?",
-        now - Duration.ofMinutes(10).toMillis());
-    store.db.update(
-        "INSERT INTO web_login_challenge(id,code_hash,poll_hash,status,expires_at)"
-            + " VALUES(?,?,?,'PENDING',?)",
-        id,
-        CryptoService.hash(code),
-        CryptoService.hash(poll),
-        expires);
-    return Map.of("id", id, "code", code, "pollToken", poll, "expiresAtEpochMs", expires);
-  }
-
-  @Transactional
-  public Map<String, Object> pollWebChallenge(String id, String poll) {
-    if (poll == null || poll.length() > 128) throw ApiException.missing();
-    var rows =
-        store.db.queryForList(
-            "SELECT * FROM web_login_challenge WHERE id=? AND poll_hash=?",
-            id,
-            CryptoService.hash(poll));
-    if (rows.isEmpty()) throw ApiException.missing();
-    var challenge = rows.getFirst();
-    if (CloudStore.number(challenge, "expires_at") < System.currentTimeMillis())
-      return Map.of("status", "EXPIRED");
-    String status = CloudStore.str(challenge, "status");
-    if (!status.equals("CONFIRMED")) return Map.of("status", status);
-    if (store.db.update(
-            "UPDATE web_login_challenge SET status='CONSUMED' WHERE id=? AND poll_hash=? AND"
-                + " status='CONFIRMED' AND expires_at>?",
-            id,
-            CryptoService.hash(poll),
-            System.currentTimeMillis())
-        != 1) return Map.of("status", "CONSUMED");
-    String user = CloudStore.str(challenge, "confirmed_user_id");
-    var result = new LinkedHashMap<>(issue(user));
-    result.put("status", "CONFIRMED");
-    return result;
-  }
-
-  public Map<String, Object> confirmWebChallenge(String user, String code, boolean confirm) {
-    if (!confirm) throw ApiException.bad("请明确确认将当前账号登录到网页");
-    if (code == null || !code.strip().toUpperCase(Locale.ROOT).matches("[A-Z2-9]{10}"))
-      throw ApiException.bad("请输入网页显示的 10 位登录码");
-    int changed =
-        store.db.update(
-            "UPDATE web_login_challenge SET status='CONFIRMED',confirmed_user_id=? WHERE"
-                + " code_hash=? AND status='PENDING' AND expires_at>?",
-            user,
-            CryptoService.hash(code.strip().toUpperCase(Locale.ROOT)),
-            System.currentTimeMillis());
-    if (changed != 1) throw ApiException.bad("登录码已过期或已被确认，请重新生成");
-    return Map.of("confirmed", true);
   }
 
   /** 撤销当前 Bearer 会话；只影响这一个登录，其他设备上的会话保持有效。 */

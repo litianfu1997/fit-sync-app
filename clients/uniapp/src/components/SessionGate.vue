@@ -9,16 +9,12 @@ import {
   register,
   session,
 } from "../lib/api";
-import WebLogin from "./WebLogin.vue";
 import { theme } from "../lib/theme";
 const emit = defineEmits<{ ready: [] }>();
 const passwordEnabled = computed(
   () => session.config?.passwordLoginEnabled !== false,
 );
 const wechatEnabled = computed(() => !!session.config?.wechatLoginEnabled);
-const webEnabled = computed(
-  () => session.config?.webLoginEnabled ?? wechatEnabled.value,
-);
 const mode = ref<"login" | "register">("login");
 const busy = ref(false),
   error = ref(""),
@@ -183,7 +179,6 @@ async function retry() {
       <!-- #endif -->
 
       <!-- #ifdef H5 -->
-      <WebLogin v-if="webEnabled" @ready="emit('ready')" />
       <view v-if="session.config?.devLoginEnabled" class="dev-login"
         ><button
           class="btn secondary full"

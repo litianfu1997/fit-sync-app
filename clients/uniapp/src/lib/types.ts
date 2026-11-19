@@ -24,7 +24,6 @@ export interface WebSessionFields {
 }
 export interface Config {
   wechatLoginEnabled: boolean;
-  webLoginEnabled?: boolean;
   passwordLoginEnabled?: boolean;
   devLoginEnabled: boolean;
   stravaOAuthConfigured?: boolean;

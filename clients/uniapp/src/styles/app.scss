@@ -199,7 +199,7 @@ image { display: block; flex-shrink: 0; }
 .login-logo { width: 44px; height: 44px; margin-bottom: 16px; }
 .login-title { display: block; font-size: 24px; line-height: 30px; font-weight: 700; letter-spacing: -.4px; margin: 0 0 8px; }
 .login-form { padding: 28px 32px; display: flex; flex-direction: column; justify-content: center; gap: 16px; }
-.dev-login, .web-login, .password-login { display: flex; flex-direction: column; gap: 14px; }
+.dev-login, .password-login { display: flex; flex-direction: column; gap: 14px; }
 .dev-login .tag { align-self: flex-start; }
 .auth-tabs { display: flex; gap: 8px; border-bottom: 1px solid var(--fit-border); }
 .auth-tab { flex: 1; min-height: 44px; padding: 10px 16px; color: var(--fit-muted); font-size: 15px; border-bottom: 2px solid transparent; border-radius: 0; }
@@ -568,13 +568,6 @@ image { display: block; flex-shrink: 0; }
 .support-card { padding: 16px; background: var(--fit-surface); border: 1px solid var(--fit-border); border-radius: 8px; display: flex; align-items: center; gap: 24px; }
 .support-card .section-title { font-size: 15px; }
 .support-card .muted { margin-top: 8px; }
-.web-code-box { text-align: center; padding: 16px; border: 1px solid var(--fit-outline); background: var(--fit-surface-variant); border-radius: 4px; }
-.web-login-code { display: block; width: 100%; min-height: 48px; font-size: 28px; line-height: 34px; font-weight: 700; letter-spacing: 3px; color: var(--fit-primary); padding: 12px 0; font-variant-numeric: tabular-nums; }
-.web-login-steps { font-size: 14px; line-height: 21px; color: var(--fit-muted); display: flex; flex-direction: column; gap: 8px; }
-.web-login-wait { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.web-login-wait .spinner { width: 16px; height: 16px; }
-.web-login-wait .text-button { margin-left: auto; }
-.login-code-input { text-transform: uppercase; letter-spacing: 3px; }
 .selection-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
 .selection-row { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--fit-border); }
 .selection-row:last-child { border: 0; }

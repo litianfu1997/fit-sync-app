@@ -34,9 +34,7 @@ Web 和微信小程序都提供用户名密码**注册**与**登录**，同一�
 
 ## 网页登录
 
-网页首选**用户名密码登录 / 注册**，与小程序共用同一 FitSync 账号；不依赖微信配置。
-
-服务端配置微信登录后，H5 还可用已登录小程序确认登录：生成 5 分钟有效的 10 位登录确认码，用户在 FitSync 小程序「设置 → 网页授权登录」输入该码，明确确认将自己的账号登录到该网页。原网页每 3 秒轮询一次，确认后领取一次性的登录结果。轮询密钥只保留在当前组件内存，不持久化、不附在 URL；关闭页面即停止轮询。该流程需要用户操作自己的小程序，部署前需用真实微信环境联调；网页不依赖个人主体无法开通的开放平台扫码登录能力。
+网页使用**用户名密码登录 / 注册**，与小程序共用同一 FitSync 账号；不依赖微信配置。
 
 ## 账号打通
 
@@ -55,7 +53,7 @@ Web 和微信小程序都提供用户名密码**注册**与**登录**，同一�
 - 同步：六个运动平台（COROS、iGPSPORT、迈金、行者、Garmin 中国站、Strava）均支持直接在 Web 端与微信小程序端输入平台账号密码完成登录，由云端自动提取并加密保存登录态，无需手动复制 Cookie 或 Token；勾选托管凭据后可在会话失效时自动续登。桌面 Chrome／Edge 安装 [FitSync 会话助手扩展](../../clients/browser-extension/README.md) 后，也可在网页额外使用「弹窗快捷授权」。密码只在内存提交一次，提交后清空；托管凭据支持由用户勾选控制。
 - 规则：来源 / 目标选择、历史补齐开关、启停与删除。开启规则即授权云端持续执行。
 - 任务：分页状态、错误说明与手动重试，刷新查看实际后台结果。
-- 设置：账号昵称、密码与绑定微信、网页授权确认码、连通性检查、切换服务器后清理登录态、退出提示云端规则仍继续运行。
+- 设置：账号昵称、密码与绑定微信、连通性检查、切换服务器后清理登录态、退出提示云端规则仍继续运行。
 
 API 地址统一以 `/api` 结尾，客户端追加 `/v1/...`，错误读取 `{code,message}`。401 清理登录态，网络失败显示重试和服务器设置入口。服务器设置保存在本机，切换地址会清除原令牌，避免向另一服务器发送现有登录凭证。
 
@@ -81,7 +79,6 @@ H5 生产通过网关部署静态文件，并将 `/api` 反向代理至 Java 服
 
 - 注册登录：`GET /config`、`POST /auth/register`、`POST /auth/login`、`POST /auth/dev-login`、`POST /auth/wechat`、`GET /me`、`PUT /me`。
 - 账号打通：`POST /auth/wechat/bind`、`POST /auth/password`、`POST /auth/password/change`。
-- 网页确认：`POST /auth/web-challenges`、`GET /auth/web-challenges/{id}`（`X-Login-Poll-Token` 请求头）、`POST /auth/web-challenges/confirm`。
 - 活动：`GET /dashboard`、`GET /activities`、`POST /activities/pull`、`GET /activities/pull`、`POST /activities/import`、`GET /activities/{id}`、`DELETE /activities/{id}`、`GET /activities/{id}/file`、`POST /activities/{id}/review`。
 - 授权与同步：`/accounts`、`/rules`、`POST /sync`、`GET /jobs`、`POST /jobs/{id}/retry`。
 
