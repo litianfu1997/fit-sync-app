@@ -15,6 +15,7 @@ import {
   toast,
 } from "../lib/api";
 import { theme } from "../lib/theme";
+import PageSkeleton from "./PageSkeleton.vue";
 
 const emit = defineEmits<{ ready: [] }>();
 const EMAIL_RE = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
@@ -262,9 +263,9 @@ async function retry() {
 }
 </script>
 <template>
-  <view v-if="session.connecting && !session.config" class="card empty-state"
-    ><view class="spinner" /><text class="empty-title">正在连接</text></view
-  >
+  <!-- 真正的首次访问（无任何本地快照）才走到这里：用骨架屏占位，
+      与页面数据加载态视觉一致，避免孤零零的转圈。 -->
+  <PageSkeleton v-if="session.connecting && !session.config" variant="list" />
   <view v-else-if="session.configError" class="card empty-state"
     ><image class="empty-icon" :src="`/static/cloud${theme.dark ? '-dark' : ''}.svg`" /><text
       class="empty-title"

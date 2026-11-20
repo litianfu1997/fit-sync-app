@@ -84,7 +84,9 @@ image { display: block; flex-shrink: 0; }
 .nav-dot { width: 4px; height: 16px; border-radius: 2px; background: var(--fit-primary); margin-left: auto; }
 .sidebar-note { margin-top: auto; padding: 16px 8px 0; border-top: 1px solid var(--fit-border); color: var(--fit-muted); font-size: 12px; }
 .main-wrap { margin-left: 224px; padding: 32px 32px 0; }
-.page-content { max-width: 1200px; margin: auto; }
+/* 页面级入场过渡：新建页面时淡入上移，回切（已挂载实例）不重播，消除硬跳变。 */
+.page-content { max-width: 1200px; margin: auto; animation: fit-page-in .18s ease-out both; }
+@keyframes fit-page-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .mobile-brand, .mobile-tabs { display: none; }
 .page-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
 .page-heading > view:first-child { min-width: 0; }
@@ -712,6 +714,6 @@ image { display: block; flex-shrink: 0; }
 }
 @media (prefers-reduced-motion: reduce) {
   .spinner { animation: none; }
-  .skeleton, .refresh-bar-fill { animation: none; }
+  .skeleton, .refresh-bar-fill, .page-content { animation: none; }
   button, .btn, .side-nav { transition: none; }
 }

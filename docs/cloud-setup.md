@@ -49,12 +49,9 @@ python scripts/generate-sample-fit.py
 
 生成 `.cache/samples/sample-ride.fit`，不包含任何真实账号或私人路线。登录后进入「活动」选择文件并导入，可查看指标、轨迹并下载原始 FIT；再次导入同一文件应提示已有记录，不新增活动。
 
-「同步中心」可连接六平台：COROS、iGPSPORT 中国站使用账号密码并明确勾选授权；迈金、行者、Garmin 中国站和 Strava 使用网页会话。网页会话有两种导入方式：
+「同步中心」可连接六平台：COROS、iGPSPORT 中国站使用账号密码并明确勾选授权；迈金、行者、Garmin 中国站使用网页会话；Strava 使用官方 OAuth 2.0 跳转授权，支持拉取活动（依据官方 Streams 接口重建 FIT）与上传。网页会话通过手动方式导入：在浏览器登录平台，从开发者工具复制 Cookie（迈金另需 token，Garmin 可补充 CSRF/SSO Cookie），确认交由当前 FitSync 云服务加密保存。
 
-- **自动（桌面 Chrome／Edge）**：安装 [FitSync 会话助手扩展](../clients/browser-extension/README.md)，在网页点「弹窗登录并自动读取」。扩展弹出平台官方登录窗口，你完成人工登录和验证码后，扩展读取 Cookie 并提交，窗口自动关闭。
-- **手动**：在浏览器登录平台，从开发者工具复制 Cookie（迈金另需 token，Garmin 可补充 CSRF/SSO Cookie），确认交由当前 FitSync 云服务加密保存。
-
-无论哪种方式，会话值都不会写入 FitSync 网页的存储、URL 或日志。使用扩展时需把扩展 Origin（`chrome-extension://<扩展ID>`）加入 `FITSYNC_CORS_ORIGINS`，否则会收到 `403 Invalid CORS request`。
+无论哪种方式，会话值都不会写入 FitSync 网页的存储、URL 或日志。
 
 Garmin 登录页由 Cloudflare Turnstile 保护，账号密码不能交给云端自动登录；二次认证和验证码必须在平台官方页面由本人完成。GitHub stub／集成测试不能替代真实账号验证，首次部署应先用少量活动验证拉取、下载、上传与续期。无账号时可以验证活动导入和查询，但不能据此判断远端同步已成功。
 

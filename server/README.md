@@ -40,7 +40,7 @@ mvn -pl server -am verify
 ## 已实现的执行边界
 
 - Web 和微信小程序都支持用户名密码注册登录；密码用 PBKDF2-HMAC-SHA256 加盐散列保存，数据库不存明文。已有微信用户可在登录后补设密码，密码用户可在小程序绑定微信，使两端落到同一业务用户。小程序微信 `code2session` 一键登录继续保留；业务 Bearer 会话只保存 SHA-256 摘要。
-- COROS、iGPSPORT、迈金、行者、Garmin 中国站和 Strava 均支持通过账号密码由云端直接登录，自动提取并加密存储登录态（Token / RefreshToken / Cookie / CSRF / SSO Cookie）；同时保留 `/accounts/web-session` 接口兼容浏览器扩展快捷连接。六平台均通过统一连接器处理拉取、下载、上传及异步确认。它们仍属于实验性平台接入，真实账号、云端 IP 和平台风控尚需在部署环境验证；协议变化或遇到验证码时任务会暂停并提示重新连接，不会伪造成功。
+- COROS、iGPSPORT、迈金、行者、Garmin 中国站和 Strava 均支持通过账号密码由云端直接登录，自动提取并加密存储登录态（Token / RefreshToken / Cookie / CSRF / SSO Cookie）；`/accounts/web-session` 接口保留用于手动导入网页会话。Strava 走官方 OAuth 2.0 授权，拉取通过 Streams 接口重建 FIT。六平台均通过统一连接器处理拉取、下载、上传及异步确认。它们仍属于实验性平台接入，真实账号、云端 IP 和平台风控尚需在部署环境验证；协议变化或遇到验证码时任务会暂停并提示重新连接，不会伪造成功。
 - 网页会话字段（Cookie、迈金 token/refresh token、Garmin CSRF/SSO Cookie、UA）同样属于敏感凭据，和密码凭据一样使用 AES-GCM 加密并绑定用户与账号，不写入日志、不回传客户端。普通 Web／小程序不尝试跨站读取第三方 Cookie，也不绕过验证码或二次认证。
 - 账号令牌与用户明确同意托管的密码使用 AES-256-GCM 加密，并绑定用户和账号 ID。未同意托管密码时仅保存令牌，过期后暂停并提示重新连接。
 - 任务和分页游标持久化；账号租约保证串行，重试退避最大六小时。手动回填使用所选历史范围，规则定时拉取使用 48 小时增量重叠窗。

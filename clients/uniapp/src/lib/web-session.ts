@@ -35,7 +35,7 @@ export const platformLoginHints: Partial<Record<PlatformCode, PlatformLoginHint>
   STRAVA: {
     accountLabel: "Strava 官方授权",
     accountPlaceholder: "Strava 账号",
-    note: "使用 Strava 官方 OAuth 2.0 跳转授权，自动保存并续期令牌；支持把本地或国内平台活动自动同步至 Strava（受开放 API 限制，暂不支持直接导出原始 FIT）。",
+    note: "使用 Strava 官方 OAuth 2.0 跳转授权，自动保存并续期令牌；支持拉取 Strava 活动（依据官方 Streams 接口重建 FIT）与上传活动。",
   },
 };
 

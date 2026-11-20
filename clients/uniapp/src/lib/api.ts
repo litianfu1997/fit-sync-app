@@ -10,10 +10,31 @@ import {
 import { beginNavigation, endNavigation } from "./nav-progress";
 
 const TOKEN_KEY = "fitsync.session.v1";
+const CONFIG_KEY = "fitsync.config.v1";
+const USER_KEY = "fitsync.user.v1";
+/** 读取持久化快照；损坏或缺失时返回 null，不阻塞启动。 */
+function readSnapshot<T>(key: string): T | null {
+  try {
+    const raw = uni.getStorageSync(key);
+    return raw ? (JSON.parse(String(raw)) as T) : null;
+  } catch {
+    return null;
+  }
+}
+function writeSnapshot(key: string, value: unknown) {
+  try {
+    uni.setStorageSync(key, JSON.stringify(value));
+  } catch {
+    // 存储写入失败（空间不足等）不影响主流程。
+  }
+}
+const storedToken = String(uni.getStorageSync(TOKEN_KEY) || "");
 export const session = reactive({
-  token: String(uni.getStorageSync(TOKEN_KEY) || ""),
-  user: null as User | null,
-  config: null as Config | null,
+  token: storedToken,
+  // 冷启动同步水合上次会话的快照：config 与账号无关直接恢复；
+  // user 仅在仍有登录凭证时恢复，避免向未登录访客展示旧资料。
+  user: (storedToken ? readSnapshot<User>(USER_KEY) : null) as User | null,
+  config: readSnapshot<Config>(CONFIG_KEY),
   configError: "",
   authNotice: "",
   googleBindSuccess: false,
@@ -49,6 +70,8 @@ export function clearSession() {
   session.token = "";
   session.user = null;
   uni.removeStorageSync(TOKEN_KEY);
+  // 资料快照含账号信息，登出即清；config 与账号无关，保留给下次冷启动。
+  uni.removeStorageSync(USER_KEY);
 }
 export class ApiError extends Error {
   constructor(
@@ -148,15 +171,54 @@ function extractH5GoogleParams(): {
   return { ticket, oauth, oauthMsg };
 }
 
+/** 无副作用地预检 URL 是否携带 Google OAuth 回跳参数（有则必须走完整初始化）。 */
+function hasPendingAuthCallback(): boolean {
+  if (typeof window === "undefined") return false;
+  const searchParams = new URLSearchParams(window.location.search);
+  const hash = window.location.hash || "";
+  const hashQ = hash.indexOf("?");
+  const hashParams = new URLSearchParams(hashQ >= 0 ? hash.slice(hashQ + 1) : "");
+  return Boolean(
+    hashParams.get("googleTicket") ||
+      searchParams.get("googleTicket") ||
+      hashParams.get("googleOAuth") ||
+      searchParams.get("googleOAuth"),
+  );
+}
 let initializing: Promise<void> | null = null;
+let snapshotRefreshing: Promise<void> | null = null;
+/** 已有 config（水合或此前拉取）时的后台刷新：成功回写快照，失败静默保留旧值。 */
+function refreshSessionSnapshot() {
+  if (snapshotRefreshing) return snapshotRefreshing;
+  snapshotRefreshing = (async () => {
+    try {
+      session.config = await api<Config>("/config", "GET", undefined, false);
+      writeSnapshot(CONFIG_KEY, session.config);
+      if (session.token) {
+        session.user = await api<User>("/me");
+        writeSnapshot(USER_KEY, session.user);
+      }
+    } catch {
+      // 后台刷新失败不打扰页面；401 已由请求层统一清理会话。
+    } finally {
+      snapshotRefreshing = null;
+    }
+  })();
+  return snapshotRefreshing;
+}
 export async function initialize(force = false): Promise<void> {
   if (initializing) return initializing;
-  if (session.config && !force) return;
+  if (session.config && !force && !hasPendingAuthCallback()) {
+    // 冷启动水合命中：立即放行页面数据加载，config/user 转后台静默刷新。
+    void refreshSessionSnapshot();
+    return;
+  }
   initializing = (async () => {
     session.connecting = true;
     session.configError = "";
     try {
       session.config = await api<Config>("/config", "GET", undefined, false);
+      writeSnapshot(CONFIG_KEY, session.config);
       let exchanged = false;
       // #ifdef H5
       const callback = extractH5GoogleParams();
@@ -174,7 +236,10 @@ export async function initialize(force = false): Promise<void> {
           callback.oauthMsg || "Google 授权未完成，请重试";
       }
       // #endif
-      if (session.token && !exchanged) session.user = await api<User>("/me");
+      if (session.token && !exchanged) {
+        session.user = await api<User>("/me");
+        writeSnapshot(USER_KEY, session.user);
+      }
     } catch (error) {
       session.configError =
         error instanceof ApiError && error.status === 401
@@ -352,10 +417,12 @@ export function setSession(result: LoginResult) {
   session.token = result.token;
   session.user = result.user;
   uni.setStorageSync(TOKEN_KEY, result.token);
+  writeSnapshot(USER_KEY, result.user);
 }
 /** 本地更新用户资料后同步内存中的会话对象。 */
 export function patchSessionUser(user: User) {
   session.user = user;
+  writeSnapshot(USER_KEY, user);
 }
 export function uploadFit(
   filePath: string,
