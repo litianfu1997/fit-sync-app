@@ -36,3 +36,6 @@ out/
 /server/.env
 /.env.cloud
 .data/
+
+# ZCode 本机会话/计划目录
+/.zcode/

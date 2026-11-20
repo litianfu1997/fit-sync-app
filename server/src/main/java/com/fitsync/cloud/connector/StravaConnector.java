@@ -3,6 +3,7 @@ package com.fitsync.cloud.connector;
 import static com.fitsync.cloud.connector.ConnectorResult.Status.*;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fitsync.fitcore.FitComposer;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -394,8 +395,8 @@ public final class StravaConnector extends WebSessionConnector {
 
   @Override
   public boolean skipPullAsDestination(Session session) {
-    // 纯 OAuth 会话下 Strava 官方 API 不提供原始 FIT 下载；作为同步目标时跳过空耗读配额的预拉取与定时拉取。
-    return isOAuth(session) && blank(cookie(session));
+    // OAuth 会话也能通过官方 Streams 接口重建 FIT 参与拉取，无需再跳过预拉取与定时拉取。
+    return false;
   }
 
   @Override
@@ -604,16 +605,114 @@ public final class StravaConnector extends WebSessionConnector {
   @Override
   public ConnectorResult<FitDownload> downloadFit(Session session, RemoteActivity activity) {
     if (isOAuth(session) && blank(cookie(session))) {
-      return fail(
-          PERMANENT_FAILURE,
-          "NO_ORIGINAL_FILE",
-          "Strava 官方 OAuth 授权暂不支持导出原始 FIT 文件");
+      return rebuildFitFromStreams(session, activity);
     }
     ConnectorResult<FitDownload> first = downloadFitOnce(session, activity);
     if (first.status() == REQUIRES_LOGIN && reloginIfPossible(session)) {
       return downloadFitOnce(session, activity);
     }
     return first;
+  }
+
+  /**
+   * 纯 OAuth 会话拿不到网页版 export_original 的原始文件，改为读取官方 Streams 曲线
+   * （时间/轨迹/心率/功率/踏频/海拔）在服务端重建 FIT。每活动只消耗一次读配额。
+   */
+  private ConnectorResult<FitDownload> rebuildFitFromStreams(
+      Session session, RemoteActivity activity) {
+    Long start = activity.startTimeEpochMs();
+    if (start == null)
+      return fail(PERMANENT_FAILURE, "NO_ORIGINAL_FILE", "该 Strava 活动缺少开始时间，无法重建 FIT");
+    URI uri = apiBase.resolve(
+        "/api/v3/activities/" + activity.remoteActivityId()
+            + "/streams?keys=time,latlng,distance,altitude,velocity_smooth,heartrate,cadence,watts,moving"
+            + "&key_by_type=true");
+    ConnectorResult<WireResponse> resp = sendOAuthGet(session, uri, "Strava 活动曲线");
+    if (resp.status() != SUCCESS) return resp.castFailure();
+    WireResponse wire = resp.value();
+    if (wire.status() == 401 || wire.status() == 403) return oauthDenied(wire, "活动曲线请求").castFailure();
+    if (wire.status() == 404 || wire.status() == 410)
+      return fail(PERMANENT_FAILURE, "NO_ORIGINAL_FILE", "该 Strava 活动没有可用的曲线数据");
+    if (wire.status() == 408 || wire.status() == 429 || wire.status() >= 500)
+      return rateLimitOrServerFailure(wire, "Strava 活动曲线");
+    if (wire.status() < 200 || wire.status() >= 300)
+      return fail(PERMANENT_FAILURE, "HTTP_" + wire.status(), "Strava 活动曲线请求失败");
+    try {
+      JsonNode root = JSON.readTree(wire.bytes());
+      FitComposer.Streams streams = new FitComposer.Streams();
+      streams.time = intSeries(root, "time");
+      if (streams.time == null)
+        return fail(PERMANENT_FAILURE, "NO_ORIGINAL_FILE", "该 Strava 活动没有可用的时间曲线");
+      streams.latlng = latlngSeries(root);
+      streams.distance = doubleSeries(root, "distance");
+      streams.altitude = doubleSeries(root, "altitude");
+      streams.speed = doubleSeries(root, "velocity_smooth");
+      streams.heartRate = intSeries(root, "heartrate");
+      streams.cadence = intSeries(root, "cadence");
+      streams.power = intSeries(root, "watts");
+      streams.moving = movingSeries(root);
+      byte[] fit = FitComposer.compose(start, activity.metadata().get("sport_type"), streams);
+      return ConnectorResult.success(
+          new FitDownload(fit, "strava_streams_" + activity.remoteActivityId() + ".fit"));
+    } catch (IllegalArgumentException invalid) {
+      return fail(PERMANENT_FAILURE, "NO_ORIGINAL_FILE", "该 Strava 活动曲线无效，无法重建 FIT");
+    } catch (Exception e) {
+      return fail(RETRYABLE_FAILURE, "INVALID_RESPONSE", "Strava 活动曲线响应无法解析");
+    }
+  }
+
+  /** Streams 接口对每条曲线可能直接返回数组，也可能包一层 {data:[...]}，两种都要认。 */
+  private static JsonNode seriesData(JsonNode root, String key) {
+    JsonNode node = root.get(key);
+    if (node == null || node.isNull()) return null;
+    if (node.isObject()) node = node.get("data");
+    if (node == null || !node.isArray() || node.isEmpty()) return null;
+    return node;
+  }
+
+  private static int[] intSeries(JsonNode root, String key) {
+    JsonNode array = seriesData(root, key);
+    if (array == null) return null;
+    int[] values = new int[array.size()];
+    for (int i = 0; i < values.length; i++) {
+      JsonNode item = array.get(i);
+      values[i] = item == null || !item.isNumber() ? -1 : (int) Math.round(item.asDouble());
+    }
+    return values;
+  }
+
+  private static double[] doubleSeries(JsonNode root, String key) {
+    JsonNode array = seriesData(root, key);
+    if (array == null) return null;
+    double[] values = new double[array.size()];
+    for (int i = 0; i < values.length; i++) {
+      JsonNode item = array.get(i);
+      values[i] = item == null || !item.isNumber() ? Double.NaN : item.asDouble();
+    }
+    return values;
+  }
+
+  private static double[][] latlngSeries(JsonNode root) {
+    JsonNode array = seriesData(root, "latlng");
+    if (array == null) return null;
+    double[][] values = new double[array.size()][];
+    for (int i = 0; i < values.length; i++) {
+      JsonNode pair = array.get(i);
+      if (pair == null || !pair.isArray() || pair.size() < 2
+          || !pair.get(0).isNumber() || !pair.get(1).isNumber()) {
+        continue;
+      }
+      values[i] = new double[] {pair.get(0).asDouble(), pair.get(1).asDouble()};
+    }
+    return values;
+  }
+
+  private static boolean[] movingSeries(JsonNode root) {
+    JsonNode array = seriesData(root, "moving");
+    if (array == null) return null;
+    boolean[] values = new boolean[array.size()];
+    for (int i = 0; i < values.length; i++) values[i] = array.get(i) != null && array.get(i).asBoolean(false);
+    return values;
   }
 
   private ConnectorResult<FitDownload> downloadFitOnce(Session session, RemoteActivity activity) {

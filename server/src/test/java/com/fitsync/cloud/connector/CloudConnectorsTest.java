@@ -826,7 +826,7 @@ class CloudConnectorsTest {
   }
 
   @Test
-  void stravaOAuthExchangeRefreshListUploadAndSkipPull() throws Exception {
+  void stravaOAuthExchangeRefreshListDownloadAndUpload() throws Exception {
     assertTrue(StravaConnector.hasRequiredOAuthScopes("read,activity:read_all,activity:write"));
     assertFalse(StravaConnector.hasRequiredOAuthScopes("read"));
     String authorizeUrl =
@@ -859,13 +859,36 @@ class CloudConnectorsTest {
     assertEquals("ref-1", session.attribute("refreshToken"));
     assertNull(session.attribute("clientId"));
     assertEquals(1, http.requests.size());
-    assertTrue(connector.skipPullAsDestination(session));
+    assertFalse(connector.skipPullAsDestination(session));
 
-    ConnectorResult<FitDownload> dl =
-        connector.downloadFit(session, activity("https://www.strava.com/activities/1/export_original"));
-    assertEquals(PERMANENT_FAILURE, dl.status());
-    assertEquals("NO_ORIGINAL_FILE", dl.code());
-    assertEquals(1, http.requests.size());
+    http.reply(
+        200,
+        "{\"time\":[0,10,20],\"latlng\":[[39.90,116.40],[39.91,116.41],[39.92,116.42]],"
+            + "\"distance\":[0,200,420],\"altitude\":[40,42,45],\"velocity_smooth\":[6.5,7.0,7.2],"
+            + "\"heartrate\":[120,128,132],\"cadence\":[88,90,92],\"watts\":[180,200,210],"
+            + "\"moving\":[true,true,true]}");
+    RemoteActivity ride =
+        new RemoteActivity(
+            "1",
+            1_732_896_400_000L,
+            "Morning Ride",
+            null,
+            "https://www.strava.com/activities/1/export_original",
+            Map.of("sport_type", "Ride"));
+    ConnectorResult<FitDownload> dl = connector.downloadFit(session, ride);
+    assertEquals(SUCCESS, dl.status());
+    assertEquals("strava_streams_1.fit", dl.value().fileName());
+    com.fitsync.fitcore.ParsedFit rebuilt = new com.fitsync.fitcore.FitParser().parse(dl.value().bytes());
+    assertEquals("CYCLING", rebuilt.sportType());
+    assertEquals(1_732_896_400_000L, rebuilt.startTimeEpochMs());
+    assertEquals(20, rebuilt.elapsedSeconds());
+    assertEquals(420.0, rebuilt.distanceMeters(), 0.01);
+    assertEquals(3, rebuilt.track().size());
+    assertEquals("/api/v3/activities/1/streams", http.requests.get(1).uri().getPath());
+    assertEquals(
+        "Bearer acc-1",
+        http.requests.get(1).headers().firstValue("Authorization").orElseThrow());
+    assertEquals(2, http.requests.size());
 
     http.reply(401, "{}");
     http.reply(
@@ -882,16 +905,16 @@ class CloudConnectorsTest {
     assertEquals(SUCCESS, page.status());
     assertEquals(1, page.value().items().size());
     assertEquals("1001", page.value().items().getFirst().remoteActivityId());
-    assertEquals("/api/v3/athlete/activities", http.requests.get(1).uri().getPath());
-    assertTrue(http.requests.get(1).uri().getQuery().contains("per_page=100"));
+    assertEquals("/api/v3/athlete/activities", http.requests.get(2).uri().getPath());
+    assertTrue(http.requests.get(2).uri().getQuery().contains("per_page=100"));
     assertEquals(
         "Bearer acc-1",
-        http.requests.get(1).headers().firstValue("Authorization").orElseThrow());
-    assertEquals("/oauth/token", http.requests.get(2).uri().getPath());
-    assertTrue(body(http.requests.get(2)).contains("refresh_token=ref-1"));
+        http.requests.get(2).headers().firstValue("Authorization").orElseThrow());
+    assertEquals("/oauth/token", http.requests.get(3).uri().getPath());
+    assertTrue(body(http.requests.get(3)).contains("refresh_token=ref-1"));
     assertEquals(
         "Bearer acc-2",
-        http.requests.get(3).headers().firstValue("Authorization").orElseThrow());
+        http.requests.get(4).headers().firstValue("Authorization").orElseThrow());
     assertEquals("acc-2", session.accessToken());
     assertEquals("ref-2", session.attribute("refreshToken"));
 
@@ -901,11 +924,11 @@ class CloudConnectorsTest {
     assertEquals(PROCESSING, upRes.status());
     assertEquals("987654", upRes.confirmationToken());
     assertEquals(15_000L, upRes.retryAfterMillis());
-    assertEquals("/api/v3/uploads", http.requests.get(4).uri().getPath());
+    assertEquals("/api/v3/uploads", http.requests.get(5).uri().getPath());
     assertEquals(
         "Bearer acc-2",
-        http.requests.get(4).headers().firstValue("Authorization").orElseThrow());
-    String uploadBody = body(http.requests.get(4));
+        http.requests.get(5).headers().firstValue("Authorization").orElseThrow());
+    String uploadBody = body(http.requests.get(5));
     assertTrue(uploadBody.contains("external_id"));
     assertTrue(uploadBody.contains("fitsync-"));
 
@@ -924,7 +947,52 @@ class CloudConnectorsTest {
     ConnectorResult<UploadResult> checked = connector.checkUpload(session, "987654");
     assertEquals(SUCCESS, checked.status());
     assertEquals("555666", checked.value().remoteActivityId());
-    assertEquals(8, http.requests.size());
+    assertEquals(9, http.requests.size());
+  }
+
+  @Test
+  void stravaStreamsRebuildHandles404AndWrappedSeries() throws Exception {
+    StubClient http = new StubClient();
+    long expiresFuture = CLOCK.millis() / 1000L + 3600L;
+    http.reply(
+        200,
+        "{\"access_token\":\"acc-1\",\"refresh_token\":\"ref-1\",\"expires_at\":"
+            + expiresFuture
+            + ",\"athlete\":{\"id\":1,\"firstname\":\"A\",\"lastname\":\"B\"}}");
+    StravaConnector connector =
+        new StravaConnector("183007", "app-secret", http, URI.create("https://www.strava.com"), CLOCK);
+    Session session =
+        connector
+            .exchangeOAuthCode(
+                "183007", "app-secret", "auth-code-1", "read,activity:read_all,activity:write", false)
+            .value();
+    RemoteActivity run =
+        new RemoteActivity(
+            "9",
+            1_732_896_400_000L,
+            "Run",
+            null,
+            "https://www.strava.com/activities/9/export_original",
+            Map.of("sport_type", "Run"));
+
+    http.reply(404, "{\"message\":\"Record Not Found\"}");
+    ConnectorResult<FitDownload> missing = connector.downloadFit(session, run);
+    assertEquals(PERMANENT_FAILURE, missing.status());
+    assertEquals("NO_ORIGINAL_FILE", missing.code());
+
+    // Streams 接口有时把每条曲线包一层 {data:[...]}，同样要能重建。
+    http.reply(
+        200,
+        "{\"time\":{\"data\":[0,15]},\"distance\":{\"data\":[0,80.5]},"
+            + "\"heartrate\":{\"data\":[130,135]},\"moving\":{\"data\":[true,true]}}");
+    ConnectorResult<FitDownload> wrapped = connector.downloadFit(session, run);
+    assertEquals(SUCCESS, wrapped.status());
+    com.fitsync.fitcore.ParsedFit rebuilt =
+        new com.fitsync.fitcore.FitParser().parse(wrapped.value().bytes());
+    assertEquals("RUNNING", rebuilt.sportType());
+    assertEquals(15, rebuilt.elapsedSeconds());
+    assertEquals(80.5, rebuilt.distanceMeters(), 0.01);
+    assertTrue(rebuilt.track().isEmpty());
   }
 
   @Test

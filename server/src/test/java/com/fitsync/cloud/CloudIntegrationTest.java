@@ -376,7 +376,7 @@ class CloudIntegrationTest {
   }
 
   @Test
-  void stravaOAuthFlowPersistsAccountSkipsDestinationPullAndRejectsReplay() throws Exception {
+  void stravaOAuthFlowPersistsAccountAndRejectsReplay() throws Exception {
     Login login = login();
     mvc.perform(
             post("/api/v1/accounts/oauth/strava/start")
@@ -536,16 +536,14 @@ class CloudIntegrationTest {
     jobs.rule(login.user(), "LOCAL", stravaId, true, true);
     jobs.scheduleRules();
     jobs.sync(login.user(), "LOCAL", List.of(stravaId), List.of(activityId), 90);
+    // Strava OAuth 现在也能通过 Streams 重建参与拉取，投递目标的防重复预拉取照常建任务。
     assertEquals(
-        0,
+        1,
         store.db.queryForObject(
             "SELECT COUNT(*) FROM sync_job WHERE user_id=? AND account_id=? AND kind='PULL'",
             Integer.class,
             login.user(),
             stravaId));
-    assertThrows(
-        ApiException.class,
-        () -> jobs.sync(login.user(), "STRAVA", List.of(), List.of(), 90));
   }
 
   @Test
@@ -1094,12 +1092,14 @@ class CloudIntegrationTest {
   }
 
   @Test
-  void pullSkipsStravaOAuthGracefullyAndDrainsMultiplePagesInSingleRun() throws Exception {
+  void pullDrainsMultiplePagesInSingleRunAndIncludesStravaOAuth() throws Exception {
     Login login = login();
     account(login);
     var stravaMock = mock(StravaConnector.class);
     when(stravaMock.skipPullAsDestination(any())).thenCallRealMethod();
     when(stravaMock.verifyOAuthAccess(any())).thenReturn(ConnectorResult.success("ok"));
+    when(stravaMock.listActivities(any(), anyLong(), any()))
+        .thenReturn(ConnectorResult.success(new ActivityPage(List.of(), null, false)));
     doReturn(stravaMock).when(accounts).connector("STRAVA");
     accounts.persistOAuth(
         login.user(),
@@ -1134,36 +1134,33 @@ class CloudIntegrationTest {
     when(connector.downloadFit(any(), argThat(a -> a != null && "p2-1".equals(a.remoteActivityId()))))
         .thenReturn(ConnectorResult.success(new FitDownload(p2Ride, "p2.fit")));
 
-    // 单独请求 Strava OAuth 拉取被明确拒绝；全量拉取时自动跳过 Strava 仅拉取 COROS。
-    mvc.perform(
-            post("/api/v1/activities/pull")
-                .header("Authorization", "Bearer " + login.token())
-                .contentType("application/json")
-                .content("{\"platforms\":[\"STRAVA\"]}"))
-        .andExpect(status().isBadRequest());
-
+    // Strava OAuth 通过 Streams 重建也能拉取；全量拉取包含 COROS 与 STRAVA 两个任务。
     String pullJson =
         mvc.perform(
                 post("/api/v1/activities/pull")
                     .header("Authorization", "Bearer " + login.token()))
-            .andExpect(status().isOk())
-            .andExpect(jsonPath("$.accounts.length()").value(1))
-            .andExpect(jsonPath("$.accounts[0].platform").value("COROS"))
-            .andExpect(jsonPath("$.skippedPlatforms.length()").value(1))
-            .andExpect(jsonPath("$.skippedPlatforms[0].platform").value("STRAVA"))
-            .andReturn()
-            .getResponse()
-            .getContentAsString();
-    String jobId = store.json.readTree(pullJson).get("jobIds").get(0).asText();
-    jobs.runOne(jobId);
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.accounts.length()").value(2))
+        .andExpect(jsonPath("$.accounts[0].platform").value("COROS"))
+        .andExpect(jsonPath("$.accounts[1].platform").value("STRAVA"))
+        .andExpect(jsonPath("$.skippedPlatforms.length()").value(0))
+        .andReturn()
+        .getResponse()
+        .getContentAsString();
+    var jobIdNodes = store.json.readTree(pullJson).get("jobIds");
+    for (int i = 0; i < jobIdNodes.size(); i++) jobs.runOne(jobIdNodes.get(i).asText());
 
+    StringBuilder jobIdsParam = new StringBuilder();
+    for (int i = 0; i < jobIdNodes.size(); i++) {
+      if (i > 0) jobIdsParam.append(",");
+      jobIdsParam.append(jobIdNodes.get(i).asText());
+    }
     mvc.perform(
             get("/api/v1/activities/pull")
-                .param("jobIds", jobId)
+                .param("jobIds", jobIdsParam.toString())
                 .header("Authorization", "Bearer " + login.token()))
         .andExpect(status().isOk())
-        .andExpect(jsonPath("$.jobs[0].status").value("SUCCEEDED"))
-        .andExpect(jsonPath("$.totals.pages").value(2))
+        .andExpect(jsonPath("$.totals.pages").value(3))
         .andExpect(jsonPath("$.totals.imported").value(2));
   }
 
