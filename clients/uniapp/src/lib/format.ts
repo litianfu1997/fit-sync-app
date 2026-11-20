@@ -29,8 +29,8 @@ export const sportCategoryOptions = [
   { code: "RUNNING", label: "跑步" },
   { code: "OTHER", label: "其他" },
 ] as const;
-export function sportTypesSummary(sportTypes?: string[]): string {
-  if (!sportTypes || !sportTypes.length) return "全部类型";
+export function sportTypeLabels(sportTypes?: string[]): string[] {
+  if (!sportTypes || !sportTypes.length) return [];
   const mapped = new Set<string>();
   for (const raw of sportTypes) {
     const token = String(raw || "").toUpperCase();
@@ -41,7 +41,12 @@ export function sportTypesSummary(sportTypes?: string[]): string {
   const labels = sportCategoryOptions
     .filter((opt) => mapped.has(opt.code))
     .map((opt) => opt.label);
-  if (!labels.length || labels.length === sportCategoryOptions.length) return "全部类型";
+  return labels.length === sportCategoryOptions.length ? [] : labels;
+}
+export function sportTypesSummary(sportTypes?: string[]): string {
+  if (!sportTypes || !sportTypes.length) return "全部类型";
+  const labels = sportTypeLabels(sportTypes);
+  if (!labels.length) return "全部类型";
   return labels.length === 1 ? `仅${labels[0]}` : labels.join("、");
 }
 export const km = (meters?: number | null) =>

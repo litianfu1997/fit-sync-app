@@ -545,6 +545,8 @@ image { display: block; flex-shrink: 0; }
 .rule-info { flex: 1; min-width: 0; }
 .rule-arrow { color: var(--fit-muted); margin: 0 4px; }
 .rule-info .tiny { margin-top: 4px; }
+.rule-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.rule-meta .tiny { margin-top: 0; }
 .rule-form { padding-top: 24px; }
 .rule-sport-field { margin-top: 16px; }
 .rule-sport-field .tiny { margin-top: 8px; }

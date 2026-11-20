@@ -15,6 +15,7 @@ import {
   platformName,
   platformInitials,
   sportCategoryOptions,
+  sportTypeLabels,
   sportTypesSummary,
   statusLabel,
 } from "../../lib/format";
@@ -167,6 +168,11 @@ const ruleDestinationLabel = computed(() => {
   return account
     ? `${platformName(account.platform)} · ${account.displayName}`
     : "";
+});
+const ruleSportSummary = computed(() => {
+  if (!ruleSportTypes.value.length) return "";
+  const labels = sportTypeLabels(ruleSportTypes.value);
+  return labels.length ? labels.join("、") : "全部类型";
 });
 function applyDefaultSyncSportTypes() {
   if (syncSportTouched.value) return;
@@ -574,7 +580,7 @@ const accountPlatform = (id: string) =>
                 class="status-dot" /></view></view
           ><text class="tiny muted block"
             >高驰、iGPSPORT、迈金、行者、Garmin 中国站支持系统内直接登录；Strava
-            通过官方 OAuth 2.0 授权并自动刷新令牌，无需手动复制 Cookie 或 Token。</text
+            通过官方 OAuth 2.0 授权并自动刷新令牌，支持拉取活动（重建 FIT）与上传，无需手动复制 Cookie 或 Token。</text
           ><view v-if="accounts.length" class="connected-hint-row"
             ><text class="tiny muted">已连接账号可直接前往活动列表一键去重拉取。</text
             ><button class="text-button" @click="go('activities')">
@@ -850,13 +856,15 @@ const accountPlatform = (id: string) =>
                   {{
                     platformName(accountPlatform(rule.destinationAccountId))
                   }}</text
-                ><text class="tiny muted"
-                  >{{ sportTypesSummary(rule.sportTypes) }} ·
-                  {{
+                ><view class="rule-meta"
+                  ><text class="tag rule-type-tag">{{
+                    sportTypesSummary(rule.sportTypes)
+                  }}</text
+                  ><text class="tiny muted">{{
                     rule.includeHistory
                       ? "包含已有活动"
                       : "仅规则创建后的新活动"
-                  }}</text
+                  }}</text></view
                 ></view
               ><switch
                 :color="themeColors.primary"
@@ -921,6 +929,8 @@ const accountPlatform = (id: string) =>
                   >提示：迈金一般仅支持骑行类活动。</text
                 ><text v-else-if="ruleDestinationIsOnelap" class="tiny muted"
                   >迈金一般仅支持骑行类活动，已默认仅同步骑行。</text
+                ><text v-else class="tiny muted"
+                  >将自动同步：{{ ruleSportSummary }}活动。</text
                 ></view
               ><checkbox-group
                 @change="
