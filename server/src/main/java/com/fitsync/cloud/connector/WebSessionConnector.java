@@ -13,9 +13,13 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** 网页会话连接器的公共边界：显式导入、受限请求、绝不自动重放已受理的上传。 */
 abstract class WebSessionConnector extends ConnectorHttpSupport {
+  private static final Logger LOG = LoggerFactory.getLogger(WebSessionConnector.class);
+
   WebSessionConnector(HttpClient client, URI apiBase, String origin, Set<String> objectHosts, Clock clock) {
     super(client, apiBase, origin, objectHosts, clock);
   }
@@ -249,6 +253,13 @@ abstract class WebSessionConnector extends ConnectorHttpSupport {
                 : "1";
         offset = 0;
       }
+      // 确认轮询每分钟都会执行，未命中时输出列表规模便于定位"平台返回空列表/解析不出条目"类问题。
+      LOG.info(
+          "{} 上传确认未命中：页 {} 返回 {} 条，比对 {} 条",
+          platform(),
+          cursor,
+          items.size(),
+          inspected);
       return ConnectorResult.processing(
           encodeWebConfirmation(
               platform(), token.sha256(), next, token.submittedAt(), offset));

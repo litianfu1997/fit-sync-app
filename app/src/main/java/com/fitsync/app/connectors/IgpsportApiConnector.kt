@@ -29,8 +29,8 @@ import java.net.URI
  * 业务请求 401 时由 [withRelogin] 用账号密码静默重登并重试一次——实现「全自动」。
  *
  * 四方向（base `https://prod.zh.igpsport.com`）：
- * - 列表：`GET /service/web-gateway/web-analyze/activity/queryMyActivity?reqType=1&sportType=0&pageNo=&pageSize=&sort=1`
- * - 详情（列表行未带 fitUrl 时回退）：`GET .../activity/queryActivityDetail/{rideId}`
+ * - 列表：`GET /service/web-gateway/web-analyze/activity/queryMyActivity?reqType=0&pageNo=&pageSize=&sort=1&sortType=1`
+ * - 详情（列表行未带 fitUrl 时回退）：`GET .../activity/queryActivityDetail/{rideId}` 与 `.../activity/getDownloadUrl/{rideId}`
  * - 下载：`GET <fitUrl>`（阿里云 OSS 公共读，匿名）
  * - 上传：① `GET /service/sportg/third-party-server/oss/getSignedUrl?fileExtension=.fit` → {ossId,signedUrl}
  *        ② `PUT` FIT 字节到 signedUrl（匿名，签名自带鉴权）
@@ -98,7 +98,7 @@ internal class IgpsportApiConnector(
         cursor: SyncCursor?,
     ): ConnectorResult<ActivityPage> = withRelogin {
         val pageNo = cursor?.raw?.toIntOrNull()?.coerceAtLeast(1) ?: 1
-        val url = "$LIST_URL?reqType=1&sportType=0&pageNo=$pageNo&pageSize=$PAGE_SIZE&sort=1"
+        val url = "$LIST_URL?reqType=0&pageNo=$pageNo&pageSize=$PAGE_SIZE&sort=1&sortType=1"
         runCatching {
             execute(apiRequest(url).get().build()).use { resp ->
                 when {
@@ -111,7 +111,14 @@ internal class IgpsportApiConnector(
                                 "iGPSPORT 活动列表响应格式异常",
                             )
                         // 默认按时间倒序：仅保留窗口内活动；整页都被剔除说明已越过下界，停止翻页。
-                        val items = all.filter { it.startTimeEpochMs == null || it.startTimeEpochMs >= sinceEpochMs }
+                        val items = all.filter {
+                            val start = it.startTimeEpochMs ?: return@filter true
+                            if (it.metadata["start_time_precision"] == "DATE") {
+                                start + 86_400_000L > sinceEpochMs
+                            } else {
+                                start >= sinceEpochMs
+                            }
+                        }
                         val hasMore = all.size >= PAGE_SIZE && items.isNotEmpty()
                         ConnectorResult.Success(
                             ActivityPage(items, SyncCursor((pageNo + 1).toString()), hasMore),
@@ -181,10 +188,26 @@ internal class IgpsportApiConnector(
     override suspend fun checkUpload(remoteUploadId: String): ConnectorResult<RemoteCopy> =
         pendingAsyncUploadConfirmation(remoteUploadId, platform)
 
-    /** 列表行未带 fitUrl 时，查 detail 拿 fitUrl/fitOssPath。 */
+    /** 列表行未带 fitUrl 时，查 detail 拿 fitUrl/fitOssPath；若 detail 无地址再回退 getDownloadUrl。 */
     private suspend fun resolveFitUrlByDetail(rideId: String): ConnectorResult<String> = withRelogin {
         runCatching {
             execute(apiRequest("$DETAIL_URL/$rideId").get().build()).use { resp ->
+                when {
+                    resp.code == 401 || resp.code == 403 -> return@withRelogin requiresLogin()
+                    resp.code == 404 || resp.code == 410 -> return@withRelogin ConnectorResult.PermanentFailure(
+                        "NO_ORIGINAL_FILE",
+                        "iGPSPORT 未保留该活动的原始 FIT",
+                    )
+                    !resp.isSuccessful -> return@withRelogin failureStatus(resp)
+                    else -> {
+                        val url = parseIgpsportFitUrl(resp.body?.string().orEmpty())
+                        if (url != null) {
+                            return@withRelogin ConnectorResult.Success(url)
+                        }
+                    }
+                }
+            }
+            execute(apiRequest("$GET_DOWNLOAD_URL/$rideId").get().build()).use { resp ->
                 when {
                     resp.code == 401 || resp.code == 403 -> requiresLogin()
                     resp.code == 404 || resp.code == 410 -> ConnectorResult.PermanentFailure(
@@ -326,6 +349,8 @@ internal class IgpsportApiConnector(
             "$API_BASE/service/web-gateway/web-analyze/activity/queryMyActivity"
         private const val DETAIL_URL =
             "$API_BASE/service/web-gateway/web-analyze/activity/queryActivityDetail"
+        private const val GET_DOWNLOAD_URL =
+            "$API_BASE/service/web-gateway/web-analyze/activity/getDownloadUrl"
         private const val GET_SIGNED_URL =
             "$API_BASE/service/sportg/third-party-server/oss/getSignedUrl"
         private const val UPLOAD_BY_OSS_URL =

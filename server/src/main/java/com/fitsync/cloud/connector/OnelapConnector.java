@@ -16,12 +16,21 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** 迈金 ONELAP 账号密码直接登录、网页会话、活动读取、原文件下载和 FIT 上传。 */
 public final class OnelapConnector extends WebSessionConnector {
+  private static final Logger LOG = LoggerFactory.getLogger(OnelapConnector.class);
   private static final int PAGE_SIZE = 10;
   private static final String BASE = "https://otm.onelap.cn";
   private static final String SIGN_KEY = "fe9f8382418fcdeb136461cac6acae7b";
+  /**
+   * 迈金列表接口的 start_date 不接受纪元起点（会返回空列表），查询"全部"时
+   * 以平台上线前的年份为下限，既保持不过滤语义，又避免病态的时间范围。
+   */
+  private static final long MIN_SINCE_EPOCH_MS =
+      LocalDate.of(2015, 1, 1).atStartOfDay(CHINA).toInstant().toEpochMilli();
 
   public OnelapConnector() {
     this(defaultClient(), URI.create(BASE), Clock.systemUTC());
@@ -177,9 +186,10 @@ public final class OnelapConnector extends WebSessionConnector {
       Session session, long sinceEpochMs, String cursor) {
     if (session == null || blank(session.accessToken())) return needsLogin();
     int page = pageNumber(cursor);
+    long sinceMs = Math.max(MIN_SINCE_EPOCH_MS, sinceEpochMs);
     try {
       String today = LocalDate.now(clock.withZone(CHINA)).format(DateTimeFormatter.ISO_LOCAL_DATE);
-      String since = java.time.Instant.ofEpochMilli(Math.max(0, sinceEpochMs))
+      String since = java.time.Instant.ofEpochMilli(sinceMs)
           .atZone(CHINA).toLocalDate().format(DateTimeFormatter.ISO_LOCAL_DATE);
       byte[] body = JSON.writeValueAsBytes(Map.of(
           "page", page, "limit", PAGE_SIZE, "start_date", since, "end_date", today));
@@ -193,7 +203,7 @@ public final class OnelapConnector extends WebSessionConnector {
         String id = nestedText(row, "workout_id", "ride_record_id", "record_id", "jilu_id", "id");
         if (blank(id)) continue;
         Long start = nestedStartTime(row, "start_riding_time", "start_time", "startTime", "start_date", "timestamp", "create_time");
-        if (start != null && start < sinceEpochMs) continue;
+        if (start != null && start < sinceMs) continue;
         String fit = nestedText(row, "fit_url", "fitUrl", "file_url", "download_url");
         Map<String, String> metadata = fit == null ? Map.of() : Map.of("fit_url", fit);
         Double dist = nestedDistance(row, "distance", "distance_meter", "total_distance");
@@ -296,6 +306,10 @@ public final class OnelapConnector extends WebSessionConnector {
           last = fail(PERMANENT_FAILURE, "ONELAP_FILE_FIELD_REJECTED", "迈金未识别上传文件字段");
           continue;
         }
+        LOG.info(
+            "迈金上传已受理但未返回活动编号（code={}，message={}），转入远端确认",
+            businessCode(root),
+            message);
         return pendingUpload(fitBytes);
       } catch (Exception e) {
         return pendingUpload(fitBytes);

@@ -317,7 +317,7 @@ abstract class ConnectorHttpSupport implements PlatformConnector {
       Session session, URI uri, byte[] body, String contentType, String token) {
     ConnectorResult<JsonNode> result = call(session, "POST", uri, body, contentType);
     if (result.status() == SUCCESS || result.status() == RETRYABLE_FAILURE)
-      return ConnectorResult.processing(token);
+      return ConnectorResult.processing(token, 15_000);
     return result.castFailure();
   }
 
@@ -514,37 +514,58 @@ abstract class ConnectorHttpSupport implements PlatformConnector {
     return value == null || value.isBlank();
   }
 
+  record ParsedStartTime(long epochMs, boolean dateOnly) {}
+
   static Long startTime(JsonNode root, String... keys) {
+    ParsedStartTime parsed = startTimeDetail(root, keys);
+    return parsed == null ? null : parsed.epochMs();
+  }
+
+  static ParsedStartTime startTimeDetail(JsonNode root, String... keys) {
     String raw = text(root, keys);
     if (raw == null) return null;
+    raw = raw.trim();
     try {
       long value = Long.parseLong(raw);
-      return value <= 9_999_999_999L ? value * 1000 : value;
+      return new ParsedStartTime(value <= 9_999_999_999L ? value * 1000 : value, false);
     } catch (RuntimeException ignored) {
     }
     try {
-      return Instant.parse(raw).toEpochMilli();
+      return new ParsedStartTime(Instant.parse(raw).toEpochMilli(), false);
     } catch (RuntimeException ignored) {
     }
     try {
-      return OffsetDateTime.parse(raw).toInstant().toEpochMilli();
+      return new ParsedStartTime(OffsetDateTime.parse(raw).toInstant().toEpochMilli(), false);
     } catch (RuntimeException ignored) {
     }
     for (DateTimeFormatter formatter :
         List.of(
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"),
             DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss"),
+            DateTimeFormatter.ofPattern("yyyy.MM.dd HH:mm:ss"),
             DateTimeFormatter.ISO_LOCAL_DATE_TIME)) {
       try {
-        return LocalDateTime.parse(raw, formatter).atZone(CHINA).toInstant().toEpochMilli();
+        return new ParsedStartTime(
+            LocalDateTime.parse(raw, formatter).atZone(CHINA).toInstant().toEpochMilli(), false);
       } catch (RuntimeException ignored) {
       }
     }
     try {
-      return LocalDate.parse(raw.replace('.', '-')).atStartOfDay(CHINA).toInstant().toEpochMilli();
+      return new ParsedStartTime(
+          LocalDate.parse(raw.replace('.', '-').replace('/', '-'))
+              .atStartOfDay(CHINA)
+              .toInstant()
+              .toEpochMilli(),
+          true);
     } catch (RuntimeException ignored) {
       return null;
     }
+  }
+
+  static boolean isBeforeSince(ParsedStartTime parsed, long sinceEpochMs) {
+    if (parsed == null || sinceEpochMs <= 0) return false;
+    if (!parsed.dateOnly()) return parsed.epochMs() < sinceEpochMs;
+    return parsed.epochMs() + Duration.ofDays(1).toMillis() <= sinceEpochMs;
   }
 
   static int pageNumber(String cursor) {

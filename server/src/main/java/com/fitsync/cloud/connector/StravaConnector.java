@@ -144,6 +144,61 @@ public final class StravaConnector extends WebSessionConnector {
         new Session(null, null, account, password, storeCredentials, values));
   }
 
+  /**
+   * 授权完成后立即用访问令牌做一次只读校验。Strava 拒绝时把真实原因带回客户端，
+   * 避免账号"刚连接就显示登录失效"却看不出是权限还是令牌问题。
+   */
+  public ConnectorResult<String> verifyOAuthAccess(Session session) {
+    if (!isOAuth(session))
+      return fail(PERMANENT_FAILURE, "STRAVA_OAUTH_REQUIRED", "该 Strava 账号不是 OAuth 连接");
+    ConnectorResult<WireResponse> resp =
+        sendOAuthGet(session, apiBase.resolve("/api/v3/athlete"), "Strava 账号校验");
+    if (resp.status() != SUCCESS) return resp.castFailure();
+    WireResponse wire = resp.value();
+    if (wire.status() == 401 || wire.status() == 403)
+      return oauthDenied(wire, "访问令牌校验").castFailure();
+    if (wire.status() == 408 || wire.status() == 429 || wire.status() >= 500)
+      return rateLimitOrServerFailure(wire, "Strava 账号校验");
+    if (wire.status() < 200 || wire.status() >= 300)
+      return fail(
+          PERMANENT_FAILURE, "HTTP_" + wire.status(), "Strava 账号校验失败（HTTP " + wire.status() + "）");
+    return ConnectorResult.success("ok");
+  }
+
+  /** 401/403 时把 Strava 返回的 message/errors 带进消息，避免只显示笼统的"登录已失效"。 */
+  private static ConnectorResult<WireResponse> oauthDenied(WireResponse wire, String what) {
+    String detail = oauthErrorDetail(wire);
+    String message =
+        "Strava 拒绝了" + what + "（HTTP " + wire.status() + "）"
+            + (detail.isBlank() ? "，请重新连接并确认已勾选活动读取与上传权限" : "：" + detail);
+    if (detail.toLowerCase(Locale.ROOT).contains("application status inactive"))
+      message += "；请在 strava.com/settings/api 检查开发者应用状态与 API 订阅，应用恢复为 Active 后再连接";
+    return fail(REQUIRES_LOGIN, "AUTH_EXPIRED", message);
+  }
+
+  private static String oauthErrorDetail(WireResponse wire) {
+    try {
+      JsonNode root = JSON.readTree(wire.bytes());
+      String message = root.path("message").asText("").trim();
+      List<String> parts = new ArrayList<>();
+      for (JsonNode error : root.path("errors")) {
+        String text =
+            (error.path("resource").asText("").trim()
+                    + " "
+                    + error.path("field").asText("").trim()
+                    + " "
+                    + error.path("code").asText("").trim())
+                .trim()
+                .replaceAll("\\s+", " ");
+        if (!text.isBlank()) parts.add(text);
+      }
+      String detail = parts.isEmpty() ? message : String.join("；", parts);
+      return detail.length() > 160 ? detail.substring(0, 160) : detail;
+    } catch (Exception e) {
+      return "";
+    }
+  }
+
   public static boolean hasRequiredOAuthScopes(String scope) {
     if (blank(scope)) return false;
     Set<String> granted = new java.util.HashSet<>();
@@ -156,10 +211,12 @@ public final class StravaConnector extends WebSessionConnector {
   }
 
   public static String authorizeUrl(String clientId, String redirectUri, String state) {
+    // 必须用 force：auto 在账号此前已授权过时会跳过授权页，用户没有机会补勾 activity:write，
+    // 换到的令牌只能读不能传，表现为"刚连上就提示登录失效"。
     return BASE
         + "/oauth/authorize?client_id=" + q(clientId.trim())
         + "&redirect_uri=" + q(redirectUri.trim())
-        + "&response_type=code&approval_prompt=auto&scope=" + q(REQUIRED_OAUTH_SCOPE)
+        + "&response_type=code&approval_prompt=force&scope=" + q(REQUIRED_OAUTH_SCOPE)
         + "&state=" + q(state);
   }
 
@@ -202,6 +259,15 @@ public final class StravaConnector extends WebSessionConnector {
       long expiresAt = root.path("expires_at").asLong(0L);
       if (access.isBlank() || refresh.isBlank())
         return fail(PERMANENT_FAILURE, "STRAVA_OAUTH_FAILED", "Strava 未返回有效的访问令牌");
+      // 令牌响应里的 scope 才是真正授予的范围（文档：可能少于请求值），回调参数仅作兜底。
+      String tokenScope = root.path("scope").asText("").trim();
+      String effectiveScope = tokenScope.isBlank() ? grantedScope : tokenScope;
+      if (!hasRequiredOAuthScopes(effectiveScope))
+        return fail(
+            PERMANENT_FAILURE,
+            "STRAVA_SCOPE_MISSING",
+            "Strava 授权未包含上传权限（需要 " + REQUIRED_OAUTH_SCOPE + "），请在授权页勾选"
+                + "“查看全部活动/上传活动”后重新连接；已授权过的账号需在 Strava 设置里撤销本应用后再授权");
       JsonNode athlete = root.path("athlete");
       long athleteNum = athlete.path("id").asLong(0L);
       String athleteId = athleteNum > 0 ? Long.toString(athleteNum) : null;
@@ -215,7 +281,7 @@ public final class StravaConnector extends WebSessionConnector {
       values.put("authType", "OAUTH");
       values.put("refreshToken", refresh);
       if (expiresAt > 0) values.put("expiresAt", Long.toString(expiresAt));
-      if (!blank(grantedScope)) values.put("scope", grantedScope.trim());
+      if (!blank(effectiveScope)) values.put("scope", effectiveScope.trim());
       values.put("displayName", full);
       if (persistAppCredentials) {
         values.put("clientId", cid);
@@ -270,7 +336,14 @@ public final class StravaConnector extends WebSessionConnector {
       ConnectorResult<WireResponse> result = sendWeb(request, "Strava OAuth 刷新令牌");
       if (result.status() != SUCCESS) return result.castFailure();
       WireResponse wire = result.value();
-      if (wire.status() == 400 || wire.status() == 401 || wire.status() == 403) return needsLogin();
+      if (wire.status() == 400 || wire.status() == 401 || wire.status() == 403) {
+        String detail = oauthErrorDetail(wire);
+        return fail(
+            REQUIRES_LOGIN,
+            "AUTH_EXPIRED",
+            "Strava 刷新访问令牌被拒绝（HTTP " + wire.status() + "）"
+                + (detail.isBlank() ? "，请重新连接" : "：" + detail));
+      }
       if (wire.status() == 408 || wire.status() == 429 || wire.status() >= 500)
         return statusFailure(wire.status(), "Strava 刷新令牌");
       if (wire.status() < 200 || wire.status() >= 300) return needsLogin();
@@ -280,9 +353,10 @@ public final class StravaConnector extends WebSessionConnector {
         String nextRefresh = root.path("refresh_token").asText("").trim();
         long nextExpires = root.path("expires_at").asLong(0L);
         if (nextAccess.isBlank()) return needsLogin();
-        session.setAccessToken(nextAccess);
+        // 先写刷新令牌与过期时间，最后写访问令牌：任一步落库时磁盘上都是一组可用凭据。
         if (!nextRefresh.isBlank()) session.setAttribute("refreshToken", nextRefresh);
         if (nextExpires > 0) session.setAttribute("expiresAt", Long.toString(nextExpires));
+        session.setAccessToken(nextAccess);
         return ConnectorResult.success(nextAccess);
       } catch (Exception e) {
         return fail(RETRYABLE_FAILURE, "INVALID_RESPONSE", "Strava 刷新令牌响应无法解析");
@@ -355,7 +429,7 @@ public final class StravaConnector extends WebSessionConnector {
     ConnectorResult<WireResponse> resp = sendOAuthGet(session, uri, "Strava 活动列表");
     if (resp.status() != SUCCESS) return resp.castFailure();
     WireResponse wire = resp.value();
-    if (wire.status() == 401 || wire.status() == 403) return needsLogin();
+    if (wire.status() == 401 || wire.status() == 403) return oauthDenied(wire, "活动列表请求").castFailure();
     if (wire.status() == 408 || wire.status() == 429 || wire.status() >= 500)
       return rateLimitOrServerFailure(wire, "Strava 活动列表");
     if (wire.status() < 200 || wire.status() >= 300)
@@ -788,7 +862,8 @@ public final class StravaConnector extends WebSessionConnector {
 
   private ConnectorResult<UploadResult> parseOAuthUploadResponse(
       WireResponse wire, String fallbackUploadId, boolean checking) {
-    if (wire.status() == 401 || wire.status() == 403) return needsLogin();
+    if (wire.status() == 401 || wire.status() == 403)
+      return oauthDenied(wire, "上传请求").castFailure();
     if (wire.status() == 408 || wire.status() == 429 || wire.status() >= 500)
       return rateLimitOrServerFailure(wire, "Strava 上传");
     try {

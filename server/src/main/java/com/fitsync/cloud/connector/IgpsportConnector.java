@@ -83,11 +83,11 @@ public final class IgpsportConnector extends ConnectorHttpSupport {
             "GET",
             api(
                 ACTIVITY
-                    + "queryMyActivity?reqType=1&sportType=0&pageNo="
+                    + "queryMyActivity?reqType=0&pageNo="
                     + page
                     + "&pageSize="
                     + PAGE_SIZE
-                    + "&sort=1"),
+                    + "&sort=1&sortType=1"),
             null,
             null);
     if (result.status() != SUCCESS) return result.castFailure();
@@ -100,13 +100,18 @@ public final class IgpsportConnector extends ConnectorHttpSupport {
       String id = text(row, "rideId", "idStr", "id");
       if (blank(id)) continue;
       validIds++;
-      Long start = startTime(row, "startTime", "rideStartTime", "beginTime", "createTime");
-      if (start != null && start < sinceEpochMs) continue;
+      ParsedStartTime parsedStart =
+          startTimeDetail(row, "startTime", "rideStartTime", "beginTime", "createTime");
+      if (isBeforeSince(parsedStart, sinceEpochMs)) continue;
+      Long start = parsedStart == null ? null : parsedStart.epochMs();
       String url = fitUrl(row);
       Map<String, String> metadata = new HashMap<>();
       String sport = text(row, "exerciseType");
       if (sport != null) metadata.put("exercise_type", sport);
       if (url != null) metadata.put("fit_url", url);
+      if (parsedStart != null && parsedStart.dateOnly()) {
+        metadata.put("start_time_precision", "DATE");
+      }
       items.add(
           new RemoteActivity(
               id, start, text(row, "title", "name"), distance(row, "rideDistance"), url, metadata));
@@ -135,6 +140,27 @@ public final class IgpsportConnector extends ConnectorHttpSupport {
       if (detail.status() != SUCCESS) return detail.castFailure();
       url = fitUrl(detail.value().path("data"));
       if (blank(url)) url = fitUrl(detail.value());
+      if (blank(url)) {
+        ConnectorResult<JsonNode> download =
+            call(
+                session,
+                "GET",
+                api(ACTIVITY + "getDownloadUrl/" + q(activity.remoteActivityId())),
+                null,
+                null);
+        if (download.status() == REQUIRES_LOGIN || download.status() == RETRYABLE_FAILURE) {
+          return download.castFailure();
+        }
+        if (download.status() == SUCCESS && download.value() != null) {
+          JsonNode data = download.value().path("data");
+          if (data.isTextual() && !data.asText().isBlank()) {
+            url = data.asText().trim();
+          } else {
+            url = fitUrl(data);
+            if (blank(url)) url = fitUrl(download.value());
+          }
+        }
+      }
     }
     if (blank(url)) return fail(PERMANENT_FAILURE, "NO_ORIGINAL_FILE", "iGPSPORT 未返回该活动的 FIT 下载地址");
     return downloadObject(url, "igpsport_" + activity.remoteActivityId() + ".fit");

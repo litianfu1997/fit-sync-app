@@ -41,6 +41,7 @@ data class CorosStsCredentials(
     val bucket: String,
     val region: String,
     val expiration: String?,
+    val serviceName: String = "aliyun",
 )
 
 /**
@@ -117,9 +118,9 @@ internal fun parseCorosFitUrl(jsonText: String): String? {
 }
 
 /**
- * 解析 `GET faq.coros.com/openapi/oss/sts` 响应。
+ * 解析 `GET trainingcn.coros.com/api/proxy/oss/sts` 响应。
  *
- * 成功形如 `{"code":200,"data":{"credentials":"<被盐污染的 base64>"}}`：先 [OSS_SALT] replace 掉，
+ * 成功形如 `{"code":200,"data":{"credentials":"<被盐污染的 base64>","service":"aliyun"}}`：先 [OSS_SALT] replace 掉，
  * 再 base64 解码得 JSON `{AccessKeyId, AccessKeySecret, SecurityToken, Bucket, Region, Expiration}`。
  * code!=200 或任一关键字段缺失 → null（调用方降级为 PermanentFailure("COROS_STS_UNAVAILABLE")）。
  */
@@ -128,6 +129,11 @@ internal fun parseCorosSts(jsonText: String): CorosStsCredentials? {
     if (root.optInt("code", -1) != 200) return null
     val data = root.optJSONObject("data") ?: return null
     val raw = data.optString("credentials").takeIf { it.isNotBlank() && it != "null" } ?: return null
+    val serviceName = data.optString("service")
+        .takeIf { it.isNotBlank() && it != "null" }
+        ?.trim()
+        ?.lowercase()
+        ?: "aliyun"
     val cleaned = raw.replace(OSS_SALT, "")
     val json = runCatching {
         String(Base64.getDecoder().decode(cleaned), Charsets.UTF_8)
@@ -136,10 +142,20 @@ internal fun parseCorosSts(jsonText: String): CorosStsCredentials? {
     val accessKeyId = creds.optString("AccessKeyId").takeIf { it.isNotBlank() && it != "null" } ?: return null
     val accessKeySecret = creds.optString("AccessKeySecret").takeIf { it.isNotBlank() && it != "null" } ?: return null
     val securityToken = creds.optString("SecurityToken").takeIf { it.isNotBlank() && it != "null" } ?: return null
-    val bucket = creds.optString("Bucket").takeIf { it.isNotBlank() && it != "null" } ?: COROS_OSS_BUCKET_DEFAULT
-    val region = creds.optString("Region").takeIf { it.isNotBlank() && it != "null" } ?: "oss-cn-beijing"
+    val bucket = creds.optString("Bucket")
+        .takeIf { it.isNotBlank() && it != "null" }
+        ?.trim()
+        ?.lowercase()
+        ?: COROS_OSS_BUCKET_DEFAULT
+    val region = creds.optString("Region")
+        .takeIf { it.isNotBlank() && it != "null" }
+        ?.trim()
+        ?.lowercase()
+        ?.removeSuffix(".aliyuncs.com")
+        ?.takeIf { it.isNotBlank() }
+        ?: "oss-cn-beijing"
     val expiration = creds.optString("Expiration").takeIf { it.isNotBlank() && it != "null" }
-    return CorosStsCredentials(accessKeyId, accessKeySecret, securityToken, bucket, region, expiration)
+    return CorosStsCredentials(accessKeyId, accessKeySecret, securityToken, bucket, region, expiration, serviceName)
 }
 
 /**

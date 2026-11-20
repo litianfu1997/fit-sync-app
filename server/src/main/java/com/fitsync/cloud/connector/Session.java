@@ -10,6 +10,7 @@ public final class Session {
   private final String password;
   private final boolean storeCredentials;
   private Map<String, String> attributes;
+  private Runnable changeListener;
 
   public Session(
       String accessToken,
@@ -66,18 +67,36 @@ public final class Session {
 
   public void setAccessToken(String value) {
     this.accessToken = value;
+    notifyChanged();
   }
 
-  public void setAttribute(String key, String value) {    var updated = new java.util.LinkedHashMap<>(attributes);
+  public void setAttribute(String key, String value) {
+    var updated = new java.util.LinkedHashMap<>(attributes);
     if (value == null || value.isBlank()) updated.remove(key);
     else updated.put(key, value);
     attributes = Map.copyOf(updated);
+    // 只有会轮换的刷新令牌需要立即落库；Cookie 等高频字段仍由任务结束时统一保存。
+    if ("refreshToken".equals(key)) notifyChanged();
+  }
+
+  /**
+   * 令牌变化后立即通知调用方落库。标准 OAuth（如 Strava）一旦换发新的 refresh token，
+   * 旧值会立刻失效，因此新值不能等到任务结束才保存。
+   */
+  public void onTokensChanged(Runnable listener) {
+    this.changeListener = listener;
+  }
+
+  private void notifyChanged() {
+    Runnable listener = changeListener;
+    if (listener != null) listener.run();
   }
 
   public void updateFrom(Session refreshed) {
     this.accessToken = refreshed.accessToken;
     if (refreshed.externalUserId != null) this.externalUserId = refreshed.externalUserId;
     this.attributes = refreshed.attributes;
+    notifyChanged();
   }
 
   @Override

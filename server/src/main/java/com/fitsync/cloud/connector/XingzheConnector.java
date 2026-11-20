@@ -100,8 +100,14 @@ public final class XingzheConnector extends WebSessionConnector {
       return fail(PERMANENT_FAILURE, "XINGZHE_LOGIN_FAILED", "行者账号或密码错误");
     if (wire.status() == 408 || wire.status() == 429 || wire.status() >= 500)
       return statusFailure(wire.status(), "行者登录");
-    if (wire.status() < 200 || wire.status() >= 300)
-      return fail(PERMANENT_FAILURE, "HTTP_" + wire.status(), "行者登录失败");
+    if (wire.status() < 200 || wire.status() >= 300) {
+      // 行者对账号/密码错误等业务失败返回 HTTP 400 + {"code":1,"msg":"..."}，需把原因透出给用户。
+      String reason = errorMessage(wire);
+      return fail(
+          PERMANENT_FAILURE,
+          "HTTP_" + wire.status(),
+          blank(reason) ? "行者登录失败（HTTP " + wire.status() + "）" : "行者登录失败：" + reason);
+    }
     String cookie = mergeCookies(null, wire.cookies());
     JsonNode root = null;
     if (wire.bytes() != null && wire.bytes().length > 0) {
@@ -175,6 +181,8 @@ public final class XingzheConnector extends WebSessionConnector {
     ConnectorResult<WireResponse> response = sendWeb(request, "行者活动列表");
     if (response.status() != SUCCESS) return response.castFailure();
     captureCookies(session, response.value());
+    // 行者会话失效时列表接口返回 400 {"msg":"not allowed"}，而不是 401/403，必须按需要登录处理。
+    if (isNotAllowed(response.value())) return needsLogin();
     ConnectorResult<JsonNode> decoded = json(response.value(), "行者活动列表");
     if (decoded.status() != SUCCESS) return decoded.castFailure();
     JsonNode root = decoded.value();
@@ -272,6 +280,26 @@ public final class XingzheConnector extends WebSessionConnector {
     } catch (Exception e) {
       return uncertainUpload(fitBytes, "1");
     }
+  }
+
+  /** 读取行者错误响应里的 msg/message，响应不是 JSON 时返回 null。 */
+  private static String errorMessage(WireResponse wire) {
+    if (wire.bytes() == null || wire.bytes().length == 0) return null;
+    try {
+      JsonNode root = JSON.readTree(wire.bytes());
+      if (root == null || !root.isObject()) return null;
+      String message = text(root, "msg", "message", "detail");
+      return message == null || message.length() > 120 ? null : message;
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
+  /** 行者对未登录或已过期的会话在部分接口返回 HTTP 400 + msg=not allowed。 */
+  private static boolean isNotAllowed(WireResponse wire) {
+    if (wire.status() != 400) return false;
+    String message = errorMessage(wire);
+    return message != null && message.toLowerCase().contains("not allowed");
   }
 
   private static boolean looksLikeLoginPage(byte[] bytes) {

@@ -13,9 +13,12 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
@@ -23,13 +26,20 @@ import javax.crypto.spec.SecretKeySpec;
 public final class CorosConnector extends ConnectorHttpSupport {
   private static final int PAGE_SIZE = 200;
   private static final String OSS_SALT = "9y78gpoERW4lBNYL";
+  private static final String DEFAULT_STS_ORIGIN = "https://trainingcn.coros.com";
+  private static final String COOKIE_TOKEN = "CPL-coros-token";
+  private static final String COOKIE_REGION = "CPL-coros-region";
+  private static final Pattern OSS_BUCKET_PATTERN = Pattern.compile("^coros[a-z0-9-]{0,58}$");
+  private static final Pattern OSS_REGION_PATTERN = Pattern.compile("^oss-[a-z0-9-]{2,32}$");
+  private static final Pattern COROS_OSS_HOST_PATTERN =
+      Pattern.compile("^coros[a-z0-9-]{0,58}\\.oss-[a-z0-9-]{2,32}\\.aliyuncs\\.com$");
   private final URI stsUrl;
 
   public CorosConnector() {
     this(
         defaultClient(),
         URI.create("https://teamcnapi.coros.com"),
-        URI.create("https://faq.coros.com/openapi/oss/sts"),
+        URI.create("https://trainingcn.coros.com/api/proxy/oss/sts"),
         Clock.systemUTC());
   }
 
@@ -49,6 +59,23 @@ public final class CorosConnector extends ConnectorHttpSupport {
   @Override
   public String platform() {
     return "COROS";
+  }
+
+  @Override
+  protected boolean trustedObjectUrl(String url) {
+    if (super.trustedObjectUrl(url)) return true;
+    try {
+      URI uri = URI.create(url);
+      String host = uri.getHost();
+      return "https".equalsIgnoreCase(uri.getScheme())
+          && uri.getUserInfo() == null
+          && uri.getFragment() == null
+          && (uri.getPort() == -1 || uri.getPort() == 443)
+          && host != null
+          && COROS_OSS_HOST_PATTERN.matcher(host.toLowerCase(Locale.ROOT)).matches();
+    } catch (RuntimeException e) {
+      return false;
+    }
   }
 
   @Override
@@ -112,20 +139,31 @@ public final class CorosConnector extends ConnectorHttpSupport {
       String id = text(row, "labelId");
       if (blank(id)) continue;
       validIds++;
-      Long start = startTime(row, "startTime", "timestamp", "startTimeStamp", "createTime");
-      if (start == null) {
+      ParsedStartTime parsedStart =
+          startTimeDetail(row, "startTime", "timestamp", "startTimeStamp", "createTime");
+      if (parsedStart == null) {
         String date = text(row, "date");
         try {
-          start =
-              LocalDate.parse(date, DateTimeFormatter.BASIC_ISO_DATE)
-                  .atStartOfDay(CHINA)
-                  .toInstant()
-                  .toEpochMilli();
+          if (date != null) {
+            parsedStart =
+                new ParsedStartTime(
+                    LocalDate.parse(date.trim(), DateTimeFormatter.BASIC_ISO_DATE)
+                        .atStartOfDay(CHINA)
+                        .toInstant()
+                        .toEpochMilli(),
+                    true);
+          }
         } catch (RuntimeException ignored) {
         }
       }
-      if (start != null && start < sinceEpochMs) continue;
+      if (isBeforeSince(parsedStart, sinceEpochMs)) continue;
+      Long start = parsedStart == null ? null : parsedStart.epochMs();
       String sport = text(row, "sportType");
+      Map<String, String> metadata = new HashMap<>();
+      if (sport != null) metadata.put("sport_type", sport);
+      if (parsedStart != null && parsedStart.dateOnly()) {
+        metadata.put("start_time_precision", "DATE");
+      }
       items.add(
           new RemoteActivity(
               id,
@@ -133,7 +171,7 @@ public final class CorosConnector extends ConnectorHttpSupport {
               text(row, "name"),
               distance(row, "distance"),
               null,
-              sport == null ? Map.of() : Map.of("sport_type", sport)));
+              metadata));
     }
     if (!rows.isEmpty() && validIds == 0)
       return fail(RETRYABLE_FAILURE, "MISSING_ACTIVITY_IDS", "COROS 活动缺少真实 ID");
@@ -172,8 +210,9 @@ public final class CorosConnector extends ConnectorHttpSupport {
       Session session, byte[] fitBytes, String fileName) {
     ConnectorResult<Void> valid = validateUpload(fitBytes);
     if (valid.status() != SUCCESS) return valid.castFailure();
-    if (session == null || blank(session.externalUserId())) return needsLogin();
-    ConnectorResult<Sts> stsResult = fetchSts();
+    if (session == null || blank(session.externalUserId()) || blank(session.accessToken()))
+      return needsLogin();
+    ConnectorResult<Sts> stsResult = fetchSts(session);
     if (stsResult.status() != SUCCESS) return stsResult.castFailure();
     Sts sts = stsResult.value();
     try {
@@ -233,7 +272,7 @@ public final class CorosConnector extends ConnectorHttpSupport {
                   "object",
                   key,
                   "serviceName",
-                  "oss",
+                  sts.serviceName,
                   "oriFileName",
                   name));
       String boundary = "FitSync" + java.util.UUID.randomUUID().toString().replace("-", "");
@@ -261,41 +300,73 @@ public final class CorosConnector extends ConnectorHttpSupport {
     }
   }
 
-  private ConnectorResult<Sts> fetchSts() {
+  private ConnectorResult<Sts> fetchSts(Session session) {
+    ConnectorResult<Sts> first = fetchStsOnce(session);
+    if (first.status() != REQUIRES_LOGIN
+        || session == null
+        || !session.storeCredentials()
+        || blank(session.username())
+        || blank(session.password())) return first;
+    ConnectorResult<Session> renewed = login(session.username(), session.password(), true);
+    if (renewed.status() != SUCCESS) return renewed.castFailure();
+    session.updateFrom(renewed.value());
+    return fetchStsOnce(session);
+  }
+
+  private ConnectorResult<Sts> fetchStsOnce(Session session) {
+    if (session == null || blank(session.accessToken())) return needsLogin();
     try {
-      URI uri =
-          URI.create(
-              stsUrl.toString()
-                  + "?bucket=coros-oss&service=aliyun&app_id=1660188068672619112&sign=9AD4AA35AAFEE6BB1E847A76848D58DF&v=2");
+      String authority = stsUrl.getRawAuthority();
+      String stsOrigin =
+          blank(stsUrl.getScheme()) || blank(authority)
+              ? DEFAULT_STS_ORIGIN
+              : stsUrl.getScheme() + "://" + authority;
       WireResponse response =
           send(
-              HttpRequest.newBuilder(uri)
+              HttpRequest.newBuilder(stsUrl)
                   .timeout(java.time.Duration.ofSeconds(30))
-                  .header("Accept", "application/json")
+                  .header("Accept", "application/json, text/plain, */*")
+                  .header("Origin", stsOrigin)
+                  .header("Referer", stsOrigin + "/")
+                  .header("User-Agent", USER_AGENT)
+                  .header(
+                      "Cookie",
+                      COOKIE_TOKEN + "=" + session.accessToken() + "; " + COOKIE_REGION + "=2")
                   .GET()
                   .build(),
               MAX_JSON_BYTES);
+      if (response.status() == 401 || response.status() == 403) return needsLogin();
       if (response.status() < 200 || response.status() >= 300)
         return statusFailure(response.status(), "COROS 上传凭证");
       JsonNode root = JSON.readTree(response.bytes());
-      String encoded = text(root.path("data"), "credentials");
-      if (root.path("code").asInt(-1) != 200 || blank(encoded))
+      int code = root.path("code").asInt(-1);
+      if (code == 401 || code == 403) return needsLogin();
+      JsonNode data = root.path("data");
+      String encoded = text(data, "credentials");
+      if (code != 200 || blank(encoded))
         return fail(PERMANENT_FAILURE, "STS_UNAVAILABLE", "COROS 上传凭证接口发生变化");
+      String rawService = text(data, "service");
+      String serviceName = blank(rawService) ? "aliyun" : rawService.trim().toLowerCase(Locale.ROOT);
+      if (!Set.of("aliyun", "oss").contains(serviceName))
+        return fail(PERMANENT_FAILURE, "UNSUPPORTED_STS_SERVICE", "COROS 返回了暂不支持的存储服务类型");
       JsonNode value = JSON.readTree(Base64.getDecoder().decode(encoded.replace(OSS_SALT, "")));
       String id = text(value, "AccessKeyId"),
           secret = text(value, "AccessKeySecret"),
           token = text(value, "SecurityToken");
       String bucket = text(value, "Bucket"), region = text(value, "Region");
-      if (blank(bucket)) bucket = "coros-oss";
-      if (blank(region)) region = "oss-cn-beijing";
+      bucket = blank(bucket) ? "coros-oss" : bucket.trim().toLowerCase(Locale.ROOT);
+      region = blank(region) ? "oss-cn-beijing" : region.trim().toLowerCase(Locale.ROOT);
+      if (region.endsWith(".aliyuncs.com")) {
+        region = region.substring(0, region.length() - ".aliyuncs.com".length());
+      }
       if (blank(id)
           || blank(secret)
           || blank(token)
-          || !"coros-oss".equals(bucket)
-          || !Set.of("oss-cn-beijing", "oss-cn-hangzhou").contains(region)) {
+          || !OSS_BUCKET_PATTERN.matcher(bucket).matches()
+          || !OSS_REGION_PATTERN.matcher(region).matches()) {
         return fail(PERMANENT_FAILURE, "INVALID_STS", "COROS 未返回安全有效的上传凭证");
       }
-      return ConnectorResult.success(new Sts(id, secret, token, bucket, region));
+      return ConnectorResult.success(new Sts(id, secret, token, bucket, region, serviceName));
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       return fail(RETRYABLE_FAILURE, "INTERRUPTED", "COROS 上传凭证请求被中断");
@@ -309,5 +380,6 @@ public final class CorosConnector extends ConnectorHttpSupport {
       String accessKeySecret,
       String securityToken,
       String bucket,
-      String region) {}
+      String region,
+      String serviceName) {}
 }

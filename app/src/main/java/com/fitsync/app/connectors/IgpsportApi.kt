@@ -90,16 +90,20 @@ internal fun parseIgpsportActivities(jsonText: String): List<RemoteActivitySumma
                 item,
                 "fitUrl", "fitOssPath", "fit_url", "fileUrl", "downloadUrl",
             )
+            val parsedStart = igpsportStartTimeDetail(item)
             add(
                 RemoteActivitySummary(
                     remoteActivityId = id,
-                    startTimeEpochMs = igpsportStartEpoch(item),
+                    startTimeEpochMs = parsedStart?.epochMs,
                     name = item.optString("title").takeIf { it.isNotBlank() && it != "null" },
                     sportType = null,
                     distanceMeters = item.optDouble("rideDistance", 0.0).takeIf { it > 0.0 },
                     downloadUrl = fitUrl,
                     metadata = buildMap {
                         if (fitUrl != null) put("fit_url", fitUrl)
+                        if (parsedStart?.dateOnly == true) {
+                            put("start_time_precision", "DATE")
+                        }
                         item.optInt("exerciseType", -1).takeIf { it >= 0 }
                             ?.let { put("exercise_type", it.toString()) }
                         item.optString("dataStatus").takeIf { it.isNotBlank() && it != "null" }
@@ -132,11 +136,13 @@ private fun firstNonBlankString(root: JSONObject, vararg keys: String): String? 
 }
 
 /**
- * 解析 `GET .../queryActivityDetail/{rideId}`（或 merge-activity/detail）响应里的 FIT 下载地址。
- * 同时查 root 与 root.data 两层，兼容 fitUrl/fitOssPath 等多种字段名。
+ * 解析 `GET .../queryActivityDetail/{rideId}`（或 merge-activity/detail / getDownloadUrl）响应里的 FIT 下载地址。
+ * 同时查 root 与 root.data 两层，兼容 data 直接返回字符串及 fitUrl/fitOssPath 等多种字段名。
  */
 internal fun parseIgpsportFitUrl(jsonText: String): String? {
     val root = runCatching { JSONObject(jsonText) }.getOrNull() ?: return null
+    val dataText = (root.opt("data") as? String)?.trim()?.takeIf { it.startsWith("http") }
+    if (dataText != null) return dataText
     val data = root.optJSONObject("data")
     for (obj in listOfNotNull(data, root)) {
         firstNonBlankString(
@@ -147,36 +153,52 @@ internal fun parseIgpsportFitUrl(jsonText: String): String? {
     return null
 }
 
+internal data class IgpsportParsedStartTime(
+    val epochMs: Long,
+    val dateOnly: Boolean,
+)
+
 /**
  * iGPSPORT startTime 多格式兼容：ISO8601（带 Z 或偏移）/ `yyyy-MM-dd HH:mm:ss` / 毫秒或秒戳。
  * 解析失败返回 null（窗口过滤与去重对其容错）。
  */
-internal fun parseIgpsportStartTime(raw: Any?): Long? {
+internal fun parseIgpsportStartTime(raw: Any?): Long? = parseIgpsportStartTimeDetail(raw)?.epochMs
+
+internal fun parseIgpsportStartTimeDetail(raw: Any?): IgpsportParsedStartTime? {
     if (raw == null) return null
     if (raw is Number) {
         val v = raw.toLong()
-        return if (v in 1..9_999_999_999L) v * 1000 else v
+        val ms = if (v in 1..9_999_999_999L) v * 1000 else v
+        return IgpsportParsedStartTime(ms, dateOnly = false)
     }
     val text = raw.toString().trim()
     if (text.isBlank()) return null
-    text.toLongOrNull()?.let { return if (it in 1..9_999_999_999L) it * 1000 else it }
-    return runCatching { Instant.parse(text).toEpochMilli() }.getOrNull()
-        ?: runCatching { OffsetDateTime.parse(text).toInstant().toEpochMilli() }.getOrNull()
-        ?: runCatching {
-            LocalDateTime.parse(text, DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+    text.toLongOrNull()?.let {
+        val ms = if (it in 1..9_999_999_999L) it * 1000 else it
+        return IgpsportParsedStartTime(ms, dateOnly = false)
+    }
+    runCatching { Instant.parse(text).toEpochMilli() }.getOrNull()
+        ?.let { return IgpsportParsedStartTime(it, dateOnly = false) }
+    runCatching { OffsetDateTime.parse(text).toInstant().toEpochMilli() }.getOrNull()
+        ?.let { return IgpsportParsedStartTime(it, dateOnly = false) }
+    for (pattern in listOf("yyyy-MM-dd HH:mm:ss", "yyyy/MM/dd HH:mm:ss", "yyyy.MM.dd HH:mm:ss")) {
+        runCatching {
+            LocalDateTime.parse(text, DateTimeFormatter.ofPattern(pattern))
                 .atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
-        }.getOrNull()
-        ?: runCatching {
-            // list 行只给到日期精度："2026.03.07" 或 "2026-03-07"（精确时间在 detail 接口才有）
-            LocalDate.parse(text.replace('.', '-'), DateTimeFormatter.ISO_LOCAL_DATE)
-                .atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
-        }.getOrNull()
+        }.getOrNull()?.let { return IgpsportParsedStartTime(it, dateOnly = false) }
+    }
+    return runCatching {
+        // list 行只给到日期精度："2026.03.07" 或 "2026-03-07"（精确时间在 detail 接口才有）
+        val ms = LocalDate.parse(text.replace('.', '-').replace('/', '-'), DateTimeFormatter.ISO_LOCAL_DATE)
+            .atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        IgpsportParsedStartTime(ms, dateOnly = true)
+    }.getOrNull()
 }
 
-private fun igpsportStartEpoch(item: JSONObject): Long? {
+private fun igpsportStartTimeDetail(item: JSONObject): IgpsportParsedStartTime? {
     for (key in listOf("startTime", "rideStartTime", "beginTime", "createTime")) {
         if (item.has(key) && !item.isNull(key)) {
-            parseIgpsportStartTime(item.opt(key))?.let { return it }
+            parseIgpsportStartTimeDetail(item.opt(key))?.let { return it }
         }
     }
     return null

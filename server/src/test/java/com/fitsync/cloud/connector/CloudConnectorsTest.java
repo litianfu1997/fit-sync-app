@@ -144,13 +144,24 @@ class CloudConnectorsTest {
         "{\"AccessKeyId\":\"ak\",\"AccessKeySecret\":\"sk\",\"SecurityToken\":\"sts-token\",\"Bucket\":\"coros-oss\",\"Region\":\"oss-cn-beijing\"}";
     String encoded = Base64.getEncoder().encodeToString(creds.getBytes(StandardCharsets.UTF_8));
     http.reply(
-        200, "{\"code\":200,\"data\":{\"credentials\":\"9y78gpoERW4lBNYL" + encoded + "\"}}");
+        200,
+        "{\"code\":200,\"data\":{\"credentials\":\"9y78gpoERW4lBNYL"
+            + encoded
+            + "\",\"service\":\"aliyun\"}}");
     http.reply(200, "");
     http.reply(200, "{\"result\":\"0000\",\"data\":{}}");
     CorosConnector connector = coros(http);
     Session session = session(false);
     ConnectorResult<UploadResult> upload = connector.uploadFit(session, fit(), "activity.fit");
     assertEquals(PROCESSING, upload.status());
+    HttpRequest stsRequest = http.requests.get(0);
+    assertEquals("https://trainingcn.coros.com/api/proxy/oss/sts", stsRequest.uri().toString());
+    String stsCookie = stsRequest.headers().firstValue("Cookie").orElseThrow();
+    assertTrue(stsCookie.contains("CPL-coros-token=old-token"));
+    assertTrue(stsCookie.contains("CPL-coros-region=2"));
+    assertEquals(
+        "https://trainingcn.coros.com",
+        stsRequest.headers().firstValue("Origin").orElseThrow());
     assertEquals(
         "application/octet-stream",
         http.requests.get(1).headers().firstValue("Content-Type").orElseThrow());
@@ -165,7 +176,7 @@ class CloudConnectorsTest {
         "sts-token",
         http.requests.get(1).headers().firstValue("x-oss-security-token").orElseThrow());
     assertFalse(http.requests.get(1).headers().firstValue("accesstoken").isPresent());
-    assertTrue(body(http.requests.get(2)).contains("\"serviceName\":\"oss\""));
+    assertTrue(body(http.requests.get(2)).contains("\"serviceName\":\"aliyun\""));
     assertTrue(body(http.requests.get(2)).contains("fit_zip/u1/"));
     http.reply(
         200,
@@ -182,6 +193,101 @@ class CloudConnectorsTest {
         http.requests.stream()
             .filter(r -> r.uri().getPath().equals("/activity/fit/import"))
             .count());
+  }
+
+  @Test
+  void corosSts401ReloginsOnceAndRetriesUpload() throws Exception {
+    StubClient http = new StubClient();
+    String creds =
+        "{\"AccessKeyId\":\"ak\",\"AccessKeySecret\":\"sk\",\"SecurityToken\":\"sts-token\",\"Bucket\":\"coros-oss\",\"Region\":\"oss-cn-beijing\"}";
+    String encoded = Base64.getEncoder().encodeToString(creds.getBytes(StandardCharsets.UTF_8));
+    http.reply(401, "{\"code\":401,\"msg\":\"unauthorized\",\"reason\":\"token_invalid\"}");
+    http.reply(
+        200,
+        "{\"result\":\"0000\",\"data\":{\"accessToken\":\"fresh-token\",\"userId\":\"u1\",\"regionId\":2}}");
+    http.reply(
+        200,
+        "{\"code\":200,\"data\":{\"credentials\":\"9y78gpoERW4lBNYL"
+            + encoded
+            + "\",\"service\":\"aliyun\"}}");
+    http.reply(200, "");
+    http.reply(200, "{\"result\":\"0000\",\"data\":{}}");
+    Session session = session(true);
+    ConnectorResult<UploadResult> upload = coros(http).uploadFit(session, fit(), "activity.fit");
+    assertEquals(PROCESSING, upload.status());
+    assertEquals("fresh-token", session.accessToken());
+    assertEquals(5, http.requests.size());
+    assertEquals("/account/login", http.requests.get(1).uri().getPath());
+    assertTrue(
+        http.requests
+            .get(2)
+            .headers()
+            .firstValue("Cookie")
+            .orElseThrow()
+            .contains("CPL-coros-token=fresh-token"));
+    assertEquals(
+        "fresh-token",
+        http.requests.get(4).headers().firstValue("accesstoken").orElseThrow());
+
+    StubClient noSaveHttp = new StubClient();
+    noSaveHttp.reply(401, "{\"code\":401,\"msg\":\"unauthorized\",\"reason\":\"token_invalid\"}");
+    ConnectorResult<UploadResult> failed =
+        coros(noSaveHttp).uploadFit(session(false), fit(), "activity.fit");
+    assertEquals(REQUIRES_LOGIN, failed.status());
+    assertEquals(1, noSaveHttp.requests.size());
+  }
+
+  @Test
+  void corosStsNormalizesRegionAndRejectsUntrustedBucketOrService() {
+    StubClient http = new StubClient();
+    String validCreds =
+        "{\"AccessKeyId\":\"ak\",\"AccessKeySecret\":\"sk\",\"SecurityToken\":\"sts-token\",\"Bucket\":\"coros-cn-oss\",\"Region\":\"oss-cn-shanghai.aliyuncs.com\"}";
+    String validEncoded =
+        Base64.getEncoder().encodeToString(validCreds.getBytes(StandardCharsets.UTF_8));
+    http.reply(
+        200,
+        "{\"code\":200,\"data\":{\"credentials\":\"9y78gpoERW4lBNYL"
+            + validEncoded
+            + "\",\"service\":\"aliyun\"}}");
+    http.reply(200, "");
+    http.reply(200, "{\"result\":\"0000\",\"data\":{}}");
+    ConnectorResult<UploadResult> valid = coros(http).uploadFit(session(false), fit(), "ride.fit");
+    assertEquals(PROCESSING, valid.status());
+    assertTrue(
+        http.requests
+            .get(1)
+            .uri()
+            .toString()
+            .startsWith("https://coros-cn-oss.oss-cn-shanghai.aliyuncs.com/fit_zip/u1/"));
+
+    for (String badJson :
+        List.of(
+            "{\"code\":200,\"data\":{\"credentials\":\""
+                + Base64.getEncoder()
+                    .encodeToString(
+                        "{\"AccessKeyId\":\"ak\",\"AccessKeySecret\":\"sk\",\"SecurityToken\":\"st\",\"Bucket\":\"evil-oss\",\"Region\":\"oss-cn-beijing\"}"
+                            .getBytes(StandardCharsets.UTF_8))
+                + "\",\"service\":\"aliyun\"}}",
+            "{\"code\":200,\"data\":{\"credentials\":\""
+                + Base64.getEncoder()
+                    .encodeToString(
+                        "{\"AccessKeyId\":\"ak\",\"AccessKeySecret\":\"sk\",\"SecurityToken\":\"st\",\"Bucket\":\"coros-oss\",\"Region\":\"oss-cn-beijing.evil.com\"}"
+                            .getBytes(StandardCharsets.UTF_8))
+                + "\",\"service\":\"aliyun\"}}",
+            "{\"code\":200,\"data\":{\"credentials\":\""
+                + Base64.getEncoder()
+                    .encodeToString(
+                        "{\"AccessKeyId\":\"ak\",\"AccessKeySecret\":\"sk\",\"SecurityToken\":\"st\",\"Bucket\":\"coros-oss\",\"Region\":\"oss-cn-beijing\"}"
+                            .getBytes(StandardCharsets.UTF_8))
+                + "\",\"service\":\"aws\"}}")) {
+      StubClient badHttp = new StubClient();
+      badHttp.reply(200, badJson);
+      ConnectorResult<UploadResult> rejected =
+          coros(badHttp).uploadFit(session(false), fit(), "ride.fit");
+      assertEquals(PERMANENT_FAILURE, rejected.status());
+      assertEquals(1, badHttp.requests.size());
+      assertTrue(badHttp.requests.stream().noneMatch(r -> "PUT".equals(r.method())));
+    }
   }
 
   @Test
@@ -482,6 +588,42 @@ class CloudConnectorsTest {
     assertEquals(SUCCESS, page.status());
     assertEquals("sessionid=xz-sess-2", session.attribute("cookie"));
     assertEquals(4, http.requests.size());
+  }
+
+  @Test
+  void xingzheListTreatsNotAllowed400AsExpiredSessionAndRelogins() throws Exception {
+    StubClient http = new StubClient();
+    http.reply(
+        200,
+        "{\"code\":0,\"data\":{\"userid\":\"xz-100\"}}",
+        Map.of("Set-Cookie", List.of("sessionid=xz-sess-1; Path=/; HttpOnly")));
+    Session session = xingzhe(http).login("13900139000", "xz-secret", true).value();
+
+    // 真实行者会话失效时返回 400 + not allowed，而不是 401/403。
+    http.reply(400, "{\"code\":400,\"data\":{},\"msg\":\"not allowed\"}");
+    http.reply(
+        200,
+        "{\"code\":0,\"data\":{\"userid\":\"xz-100\"}}",
+        Map.of("Set-Cookie", List.of("sessionid=xz-sess-2; Path=/; HttpOnly")));
+    http.reply(200, "[]");
+    ConnectorResult<ActivityPage> page = xingzhe(http).listActivities(session, 0, null);
+    assertEquals(SUCCESS, page.status());
+    assertEquals("sessionid=xz-sess-2", session.attribute("cookie"));
+
+    // 未托管密码时应返回需要登录，而不是永久失败。
+    Session webOnly =
+        new Session(null, "xz-100", null, null, false, Map.of("cookie", "sessionid=old"));
+    http.reply(400, "{\"code\":400,\"data\":{},\"msg\":\"not allowed\"}");
+    assertEquals(REQUIRES_LOGIN, xingzhe(http).listActivities(webOnly, 0, null).status());
+  }
+
+  @Test
+  void xingzheLoginSurfacesPlatformMessageOn400() throws Exception {
+    StubClient http = new StubClient();
+    http.reply(400, "{\"code\":1,\"data\":{},\"msg\":\"account: 无效的手机号\"}");
+    ConnectorResult<Session> result = xingzhe(http).login("123", "pw", false);
+    assertEquals(PERMANENT_FAILURE, result.status());
+    assertTrue(result.message().contains("无效的手机号"));
   }
 
   @Test
@@ -786,6 +928,119 @@ class CloudConnectorsTest {
   }
 
   @Test
+  void stravaOAuthDeniedRequestsSurfaceStravaReason() throws Exception {
+    StubClient http = new StubClient();
+    long expiresFuture = CLOCK.millis() / 1000L + 3600L;
+    String denied =
+        "{\"message\":\"Authorization Error\",\"errors\":[{\"resource\":\"Upload\","
+            + "\"field\":\"activity:write\",\"code\":\"missing\"}]}";
+    http.reply(
+        200,
+        "{\"access_token\":\"acc-1\",\"refresh_token\":\"ref-1\",\"expires_at\":"
+            + expiresFuture
+            + ",\"athlete\":{\"id\":778899,\"firstname\":\"Lin\",\"lastname\":\"Rider\"}}");
+    StravaConnector connector =
+        new StravaConnector("183007", "app-secret", http, URI.create("https://www.strava.com"), CLOCK);
+    Session session =
+        connector
+            .exchangeOAuthCode(
+                "183007", "app-secret", "auth-code-1", "read,activity:read_all,activity:write", false)
+            .value();
+
+    http.reply(401, denied);
+    http.reply(
+        200,
+        "{\"access_token\":\"acc-2\",\"refresh_token\":\"ref-2\",\"expires_at\":"
+            + (expiresFuture + 3600L)
+            + "}");
+    http.reply(401, denied);
+    ConnectorResult<ActivityPage> page = connector.listActivities(session, 0L, null);
+    assertEquals(REQUIRES_LOGIN, page.status());
+    assertTrue(page.message().contains("activity:write"));
+    assertTrue(page.message().contains("401"));
+
+    http.reply(401, denied);
+    http.reply(
+        200,
+        "{\"access_token\":\"acc-3\",\"refresh_token\":\"ref-3\",\"expires_at\":"
+            + (expiresFuture + 7200L)
+            + "}");
+    http.reply(401, denied);
+    ConnectorResult<String> probe = connector.verifyOAuthAccess(session);
+    assertEquals(REQUIRES_LOGIN, probe.status());
+    assertTrue(probe.message().contains("activity:write"));
+    assertEquals("/api/v3/athlete", http.requests.get(4).uri().getPath());
+  }
+
+  @Test
+  void stravaOAuthProbeSucceedsForUsableToken() throws Exception {
+    StubClient http = new StubClient();
+    long expiresFuture = CLOCK.millis() / 1000L + 3600L;
+    http.reply(
+        200,
+        "{\"access_token\":\"acc-1\",\"refresh_token\":\"ref-1\",\"expires_at\":"
+            + expiresFuture
+            + ",\"athlete\":{\"id\":778899,\"firstname\":\"Lin\",\"lastname\":\"Rider\"}}");
+    StravaConnector connector =
+        new StravaConnector("183007", "app-secret", http, URI.create("https://www.strava.com"), CLOCK);
+    Session session =
+        connector
+            .exchangeOAuthCode(
+                "183007", "app-secret", "auth-code-1", "read,activity:read_all,activity:write", false)
+            .value();
+    http.reply(200, "{\"id\":778899,\"firstname\":\"Lin\"}");
+    ConnectorResult<String> probe = connector.verifyOAuthAccess(session);
+    assertEquals(SUCCESS, probe.status());
+    assertEquals("/api/v3/athlete", http.requests.get(1).uri().getPath());
+    assertEquals(
+        "Bearer acc-1", http.requests.get(1).headers().firstValue("Authorization").orElseThrow());
+  }
+
+  @Test
+  void stravaAuthorizeUrlForcesConsentAndRejectsTokenWithoutUploadScope() throws Exception {
+    String url = StravaConnector.authorizeUrl("183007", "https://fit.example.com/cb", "state-1");
+    assertTrue(url.contains("approval_prompt=force"));
+    assertTrue(url.contains("scope=read%2Cactivity%3Aread_all%2Cactivity%3Awrite"));
+
+    StubClient http = new StubClient();
+    http.reply(
+        200,
+        "{\"access_token\":\"acc-1\",\"refresh_token\":\"ref-1\",\"expires_at\":"
+            + (CLOCK.millis() / 1000L + 3600L)
+            + ",\"scope\":\"read,activity:read_all\",\"athlete\":{\"id\":1,\"firstname\":\"A\"}}");
+    StravaConnector connector =
+        new StravaConnector("183007", "app-secret", http, URI.create("https://www.strava.com"), CLOCK);
+    ConnectorResult<Session> exchanged =
+        connector.exchangeOAuthCode(
+            "183007", "app-secret", "code-1", "read,activity:read_all,activity:write", false);
+    assertEquals(PERMANENT_FAILURE, exchanged.status());
+    assertEquals("STRAVA_SCOPE_MISSING", exchanged.code());
+    assertTrue(exchanged.message().contains("activity:write"));
+  }
+
+  @Test
+  void stravaInactiveApplicationIsReportedWithActionableHint() throws Exception {
+    StubClient http = new StubClient();
+    http.reply(
+        200,
+        "{\"access_token\":\"acc-1\",\"refresh_token\":\"ref-1\",\"expires_at\":"
+            + (CLOCK.millis() / 1000L + 3600L)
+            + ",\"scope\":\"read,activity:read_all,activity:write\",\"athlete\":{\"id\":1}}");
+    StravaConnector connector =
+        new StravaConnector("183007", "app-secret", http, URI.create("https://www.strava.com"), CLOCK);
+    Session session =
+        connector
+            .exchangeOAuthCode(
+                "183007", "app-secret", "code-1", "read,activity:read_all,activity:write", false)
+            .value();
+    http.reply(403, "{\"message\":\"Application Status Inactive\"}");
+    ConnectorResult<String> probe = connector.verifyOAuthAccess(session);
+    assertEquals(REQUIRES_LOGIN, probe.status());
+    assertTrue(probe.message().contains("Application Status Inactive"));
+    assertTrue(probe.message().contains("strava.com/settings/api"));
+  }
+
+  @Test
   void stravaGzipHtmlResponseDecompressesBounded() throws Exception {
     StubClient http = new StubClient();
     ByteArrayOutputStream gz = new ByteArrayOutputStream();
@@ -814,6 +1069,21 @@ class CloudConnectorsTest {
         http.requests.get(0).headers().firstValue("Accept-Encoding").orElseThrow());
     assertTrue(body(http.requests.get(1)).contains("authenticity_token=gz-csrf-1"));
     assertTrue(res.value().attribute("cookie").contains("_strava4_session=gz-auth"));
+  }
+
+  @Test
+  void onelapListClampsSinceToPlatformEraInsteadOfEpochZero() throws Exception {
+    StubClient http = new StubClient();
+    Session session = new Session("ol-jwt", "u1", null, null, false);
+    http.reply(200, "{\"code\":200,\"data\":{\"list\":[]}}");
+    ConnectorResult<ActivityPage> page = onelap(http).listActivities(session, 0, null);
+    assertEquals(SUCCESS, page.status());
+    assertTrue(page.value().items().isEmpty());
+    // since=0（确认上传时"不过滤"）不能直译成 start_date=1970-01-01：
+    // 迈金对跨 56 年的时间范围会返回空列表，导致确认流程永远找不到新活动。
+    String listBody = body(http.requests.getFirst());
+    assertFalse(listBody.contains("1970-01-01"));
+    assertTrue(listBody.contains("2015-01-01"));
   }
 
   @Test
@@ -907,6 +1177,66 @@ class CloudConnectorsTest {
     assertEquals("42", legacyChecked.value().remoteActivityId());
   }
 
+  @Test
+  void igpsportListQueriesAllSportTypesMarksDatePrecisionAndFallsBackToGetDownloadUrl()
+      throws Exception {
+    StubClient http = new StubClient();
+    signedReply(http);
+    http.reply(200, "");
+    http.reply(200, "{\"code\":0,\"data\":{}}");
+    IgpsportConnector connector = igp(http);
+    Session session = session(false);
+    ConnectorResult<UploadResult> upload = connector.uploadFit(session, fit(), "run.fit");
+    assertEquals(PROCESSING, upload.status());
+    assertEquals(15_000L, upload.retryAfterMillis());
+
+    String listJson =
+        "{\"code\":0,\"data\":{\"rows\":["
+            + "{\"rideId\":101,\"title\":\"基础训练\",\"startTime\":\"2026.08.22\","
+            + "\"rideDistance\":8187.88,\"exerciseType\":5},"
+            + "{\"rideId\":102,\"title\":\"周末骑行\",\"startTime\":\"2026-08-22 17:48:08\","
+            + "\"rideDistance\":42195.0,\"exerciseType\":0,\"fitUrl\":\""
+            + IGP_FIT
+            + "\"}"
+            + "]}}";
+    http.reply(200, listJson);
+    long sameDayMorning = java.time.Instant.parse("2026-08-22T02:00:00Z").toEpochMilli();
+    ConnectorResult<ActivityPage> sameDayPage =
+        connector.listActivities(session, sameDayMorning, null);
+    assertEquals(SUCCESS, sameDayPage.status());
+    String query = http.requests.get(3).uri().getRawQuery();
+    assertTrue(query.contains("reqType=0"));
+    assertTrue(query.contains("sort=1"));
+    assertTrue(query.contains("sortType=1"));
+    assertFalse(query.contains("sportType=0"));
+    assertEquals(2, sameDayPage.value().items().size());
+    RemoteActivity dateOnlyItem = sameDayPage.value().items().get(0);
+    RemoteActivity exactTimeItem = sameDayPage.value().items().get(1);
+    assertEquals("101", dateOnlyItem.remoteActivityId());
+    assertEquals("DATE", dateOnlyItem.metadata().get("start_time_precision"));
+    assertFalse(exactTimeItem.metadata().containsKey("start_time_precision"));
+
+    http.reply(200, listJson);
+    long nextDayMidnight = java.time.Instant.parse("2026-08-22T16:00:00Z").toEpochMilli();
+    ConnectorResult<ActivityPage> nextDayPage =
+        connector.listActivities(session, nextDayMidnight, null);
+    assertEquals(SUCCESS, nextDayPage.status());
+    assertTrue(nextDayPage.value().items().isEmpty());
+
+    http.reply(200, "{\"code\":0,\"data\":{\"rideId\":101}}");
+    http.reply(200, "{\"code\":0,\"data\":\"" + IGP_FIT + "\"}");
+    http.reply(200, fit());
+    ConnectorResult<FitDownload> downloaded = connector.downloadFit(session, dateOnlyItem);
+    assertEquals(SUCCESS, downloaded.status());
+    assertArrayEquals(fit(), downloaded.value().bytes());
+    assertTrue(
+        http.requests.stream()
+            .anyMatch(r -> r.uri().getPath().endsWith("/activity/queryActivityDetail/101")));
+    assertTrue(
+        http.requests.stream()
+            .anyMatch(r -> r.uri().getPath().endsWith("/activity/getDownloadUrl/101")));
+  }
+
   private static byte[] fitWithByte(int marker) {
     byte[] value = fit();
     value[12] = (byte) marker;
@@ -945,7 +1275,7 @@ class CloudConnectorsTest {
     return new CorosConnector(
         http,
         URI.create("https://teamcnapi.coros.com"),
-        URI.create("https://faq.coros.com/openapi/oss/sts"),
+        URI.create("https://trainingcn.coros.com/api/proxy/oss/sts"),
         CLOCK);
   }
 
