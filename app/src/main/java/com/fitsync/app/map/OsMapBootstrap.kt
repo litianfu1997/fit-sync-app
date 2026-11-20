@@ -3,9 +3,10 @@ package com.fitsync.app.map
 import android.content.Context
 import org.osmdroid.config.Configuration
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * osmdroid 全局配置。必须在任何 MapView 创建之前调用 [initialize]。
+ * osmdroid 全局配置。必须在任何 MapView 创建之前调用 [initialize] 或 [ensureInitialized]。
  *
  * 两个关键点：
  * 1. 瓦片缓存放 cacheDir——可被系统在存储紧张时回收、不参与备份，且避免 API 26-28
@@ -15,7 +16,20 @@ import java.io.File
  */
 class OsMapBootstrap(private val context: Context) {
 
-    /** 幂等，只做配置赋值与建目录，可以在启动路径上安全调用。 */
+    private val initialized = AtomicBoolean(false)
+
+    /** 幂等，未初始化时才真正执行目录、prefs 与 osmdroid 配置。 */
+    fun ensureInitialized() {
+        if (initialized.get()) return
+        synchronized(this) {
+            if (!initialized.get()) {
+                initialize()
+            }
+        }
+    }
+
+    /** 幂等，只做配置赋值与建目录，可以在后台线程安全调用。 */
+    @Synchronized
     fun initialize() {
         val config = Configuration.getInstance()
         val base = File(context.cacheDir, CACHE_DIR_NAME).also { it.mkdirs() }
@@ -31,17 +45,20 @@ class OsMapBootstrap(private val context: Context) {
         prefs.edit()
             .putString(PREF_BASE_PATH, base.absolutePath)
             .putString(PREF_CACHE_PATH, tileCache.absolutePath)
-            .commit()
+            .apply()
 
         config.load(context, prefs)
         // load() 会把 UA 重置成包名；OSM 政策要求可识别且带版本的 UA，必须在其后覆盖
         config.userAgentValue = buildUserAgent()
         config.tileFileSystemCacheMaxBytes = MAX_TILE_CACHE_BYTES
         config.tileFileSystemCacheTrimBytes = TRIM_TILE_CACHE_BYTES
+        initialized.set(true)
     }
 
     /** 清空瓦片缓存。调用方保证在 IO 线程执行。 */
+    @Synchronized
     fun clearTileCache() {
+        initialized.set(false)
         runCatching { File(context.cacheDir, CACHE_DIR_NAME).deleteRecursively() }
         // 目录被删掉后必须重建并重新指向，否则 osmdroid 会拒绝写入瓦片
         initialize()

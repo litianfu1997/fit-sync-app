@@ -48,6 +48,7 @@ import com.fitsync.app.data.db.entity.PlatformAccountEntity
 import com.fitsync.app.domain.model.AccountStatus
 import com.fitsync.app.domain.model.Platform
 import com.fitsync.app.ui.components.FitCard
+import com.fitsync.app.ui.components.FitRefreshBanner
 import com.fitsync.app.ui.components.FitSkeletonListRow
 import com.fitsync.app.ui.components.FitTopBar
 import com.fitsync.app.ui.components.PlatformAvatar
@@ -56,6 +57,7 @@ import com.fitsync.app.ui.components.StatusTone
 import com.fitsync.app.ui.components.accountStatusText
 import com.fitsync.app.ui.components.accountStatusTone
 import com.fitsync.app.ui.components.executionText
+import com.fitsync.app.ui.state.AppSharedUiViewModel
 import com.fitsync.app.ui.theme.FitSpacing
 import com.fitsync.app.ui.theme.FitType
 import com.fitsync.app.web.PlatformWebActivity
@@ -68,12 +70,23 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 @Composable
-fun PlatformsScreen(onBack: () -> Unit = {}) {
+fun PlatformsScreen(
+    sharedViewModel: AppSharedUiViewModel,
+    onBack: () -> Unit = {},
+) {
     val app = FitSyncApp.instance
-    val accountsState by app.database.platformAccountDao().observeAll()
-        .collectAsStateWithLifecycle(initialValue = null)
-    val accounts = accountsState.orEmpty()
-    val bound = accounts.filter { it.status != AccountStatus.DISABLED }.associateBy { it.platform }
+    val sharedState by sharedViewModel.state.collectAsStateWithLifecycle()
+    val accounts = sharedState.accounts
+    val bound = remember(accounts) {
+        accounts.filter { it.status != AccountStatus.DISABLED }.associateBy { it.platform }
+    }
+    val knownPlatforms = remember(bound, sharedState.isLoaded) {
+        if (!sharedState.isLoaded) {
+            emptyList()
+        } else {
+            PlatformCapabilityRegistry.allKnownPlatforms().sortedBy { if (bound.containsKey(it)) 0 else 1 }
+        }
+    }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var busyPlatform by remember { mutableStateOf<Platform?>(null) }
@@ -82,11 +95,6 @@ fun PlatformsScreen(onBack: () -> Unit = {}) {
     var expandedPlatform by remember { mutableStateOf<Platform?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
     val dateFormat = remember { SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()) }
-    val knownPlatforms = if (accountsState == null) {
-        emptyList()
-    } else {
-        PlatformCapabilityRegistry.allKnownPlatforms().sortedBy { if (bound.containsKey(it)) 0 else 1 }
-    }
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
@@ -105,7 +113,10 @@ fun PlatformsScreen(onBack: () -> Unit = {}) {
                 ),
                 verticalArrangement = Arrangement.spacedBy(FitSpacing.md),
             ) {
-                if (accountsState == null) {
+                if (!sharedState.isLoaded) {
+                    item(key = "platforms-loading-banner") {
+                        FitRefreshBanner(message = "正在加载平台连接状态…")
+                    }
                     items(5, key = { "platform-skeleton-$it" }) {
                         FitSkeletonListRow()
                     }
@@ -119,8 +130,10 @@ fun PlatformsScreen(onBack: () -> Unit = {}) {
                     }
                     items(knownPlatforms, key = { it.name }) { platform ->
                         val account = bound[platform]
-                        val caps = ConnectorCapabilities.deserialize(account?.capabilitySnapshot)
-                            ?: PlatformCapabilityRegistry.capabilities(platform)
+                        val caps = remember(account?.capabilitySnapshot, platform) {
+                            ConnectorCapabilities.deserialize(account?.capabilitySnapshot)
+                                ?: PlatformCapabilityRegistry.capabilities(platform)
+                        }
                         PlatformRow(
                             platform = platform,
                             account = account,

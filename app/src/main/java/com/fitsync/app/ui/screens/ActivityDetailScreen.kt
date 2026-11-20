@@ -4,13 +4,14 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -18,14 +19,15 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
@@ -40,13 +42,15 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.fitsync.app.FitSyncApp
 import com.fitsync.app.data.db.entity.ActivityVariantEntity
 import com.fitsync.app.data.db.entity.CanonicalActivityEntity
@@ -59,59 +63,76 @@ import com.fitsync.app.domain.model.AccountStatus
 import com.fitsync.app.domain.model.DedupStatus
 import com.fitsync.app.domain.model.DeliveryJobStatus
 import com.fitsync.app.domain.model.Platform
+import com.fitsync.app.fit.LatLng
 import com.fitsync.app.sync.SyncScheduler
+import com.fitsync.app.ui.components.EmptyStateVariant
+import com.fitsync.app.ui.components.FitActivityDetailSkeleton
 import com.fitsync.app.ui.components.FitCard
 import com.fitsync.app.ui.components.FitCardTone
+import com.fitsync.app.ui.components.FitEmptyState
 import com.fitsync.app.ui.components.FitListRow
+import com.fitsync.app.ui.components.FitMapLoadingOverlay
 import com.fitsync.app.ui.components.FitTopBar
 import com.fitsync.app.ui.components.HeroStatStrip
 import com.fitsync.app.ui.components.IconBadge
 import com.fitsync.app.ui.components.IconBadgeSize
+import com.fitsync.app.ui.components.LocalAppSnackbar
 import com.fitsync.app.ui.components.PlatformAvatar
 import com.fitsync.app.ui.components.SectionHeader
+import com.fitsync.app.ui.components.SeriesChart
 import com.fitsync.app.ui.components.StatGrid
 import com.fitsync.app.ui.components.StatTileSpec
-import com.fitsync.app.ui.components.SeriesChart
 import com.fitsync.app.ui.components.StatusPill
 import com.fitsync.app.ui.components.StatusTone
 import com.fitsync.app.ui.components.TrackMap
+import com.fitsync.app.ui.components.TrackPreview
 import com.fitsync.app.ui.components.deliveryStatusText
 import com.fitsync.app.ui.components.deliveryStatusTone
-import com.fitsync.app.ui.components.LocalAppSnackbar
-import com.fitsync.app.fit.TrackCodec
+import com.fitsync.app.ui.state.ActivityDetailViewModel
 import com.fitsync.app.ui.theme.FitGradients
 import com.fitsync.app.ui.theme.FitShape
 import com.fitsync.app.ui.theme.FitSpacing
 import com.fitsync.app.ui.theme.FitType
 import com.fitsync.app.ui.theme.fitHero
 import com.fitsync.app.web.PlatformWebActivity
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun ActivityDetailScreen(activityId: Long, onBack: () -> Unit, onOpenMap: () -> Unit) {
     val app = FitSyncApp.instance
-    val activity by app.database.canonicalActivityDao().observeById(activityId)
-        .collectAsStateWithLifecycle(initialValue = null)
-    val variants by app.database.activityVariantDao().observeByCanonical(activityId)
-        .collectAsStateWithLifecycle(initialValue = emptyList())
-    val copies by app.database.platformCopyDao().observeByCanonical(activityId)
-        .collectAsStateWithLifecycle(initialValue = emptyList())
-    val jobs by app.database.deliveryJobDao().observeByCanonical(activityId)
-        .collectAsStateWithLifecycle(initialValue = emptyList())
-    val accounts by app.database.platformAccountDao().observeAll()
-        .collectAsStateWithLifecycle(initialValue = emptyList())
+    val detailViewModel: ActivityDetailViewModel = viewModel(
+        factory = remember(activityId) { ActivityDetailViewModel.factory(app.database, activityId) },
+    )
+    val uiState by detailViewModel.state.collectAsStateWithLifecycle()
+    val activity = uiState.activity
+    val variants = uiState.variants
+    val copies = uiState.copies
+    val jobs = uiState.jobs
+    val accounts = uiState.accounts
+    val reviewCandidate = uiState.reviewCandidate
+
     var actionMessage by remember { mutableStateOf<String?>(null) }
     var showDeleteConfirmation by remember { mutableStateOf(false) }
     var showMergeConfirmation by remember { mutableStateOf(false) }
     var isDeleting by remember { mutableStateOf(false) }
     var isMerging by remember { mutableStateOf(false) }
+    var busyAccountIds by remember { mutableStateOf<Set<Long>>(emptySet()) }
     var backRequested by remember { mutableStateOf(false) }
-    var reviewCandidate by remember { mutableStateOf<CanonicalActivityEntity?>(null) }
+
+    // 延迟挂载 osmdroid.MapView，让出 150ms 导航转场帧，期间用矢量预览 + loading 占位。
+    var mapMounted by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        withFrameNanos { }
+        delay(160)
+        mapMounted = true
+    }
+
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val appSnackbar = LocalAppSnackbar.current
@@ -133,23 +154,12 @@ fun ActivityDetailScreen(activityId: Long, onBack: () -> Unit, onOpenMap: () -> 
         }
     }
 
-    LaunchedEffect(activity?.reviewCandidateCanonicalId, activity?.dedupStatus) {
-        val candidateId = activity?.reviewCandidateCanonicalId
-        reviewCandidate = if (
-            activity?.dedupStatus == DedupStatus.NEEDS_REVIEW && candidateId != null
-        ) {
-            withContext(Dispatchers.IO) { app.database.canonicalActivityDao().getById(candidateId) }
-        } else {
-            null
-        }
-    }
-
     var hasObservedActivity by remember { mutableStateOf(false) }
 
-    LaunchedEffect(activity) {
+    LaunchedEffect(uiState.isLoading, activity) {
         if (activity != null) {
             hasObservedActivity = true
-        } else if (hasObservedActivity && !isDeleting && !isMerging) {
+        } else if (!uiState.isLoading && hasObservedActivity && !isDeleting && !isMerging) {
             navigateBackOnce()
         }
     }
@@ -249,160 +259,207 @@ fun ActivityDetailScreen(activityId: Long, onBack: () -> Unit, onOpenMap: () -> 
     Column(Modifier.fillMaxSize()) {
         FitTopBar(
             title = "活动详情",
-            subtitle = activity?.let { dateFormat.format(Date(it.startTimeEpochMs)) },
+            subtitle = when {
+                uiState.isLoading -> "正在加载…"
+                activity != null -> dateFormat.format(Date(activity.startTimeEpochMs))
+                else -> null
+            },
             onBack = navigateBackOnce,
         )
-        val distributionAccounts = accounts.filter { it.status != AccountStatus.DISABLED }
-        val problemJobs = jobs.filter { it.status in problemDeliveryStatuses }
-        LazyColumn(
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(
-                start = FitSpacing.screenGutter,
-                top = FitSpacing.sm,
-                end = FitSpacing.screenGutter,
-                bottom = FitSpacing.xxl,
-            ),
-            verticalArrangement = Arrangement.spacedBy(FitSpacing.md),
-        ) {
-            activity?.let { current ->
-                item(key = "hero") { ActivityHero(current) }
-                if (current.dedupStatus == DedupStatus.NEEDS_REVIEW) {
-                    item(key = "review") {
-                        ReviewActionsCard(
-                            candidate = reviewCandidate,
-                            dateFormat = dateFormat,
-                            busy = isMerging,
-                            onMerge = { showMergeConfirmation = true },
-                            onKeepSeparate = {
-                                isMerging = true
-                                scope.launch(Dispatchers.IO) {
-                                    val ok = runCatching {
-                                        app.activityMergeService.keepSeparate(activityId)
-                                    }.getOrDefault(false)
-                                    withContext(Dispatchers.Main) {
-                                        isMerging = false
-                                        if (ok) {
-                                            notify("已保持分离")
-                                            navigateBackOnce()
-                                        } else {
-                                            actionMessage = "操作失败"
-                                        }
-                                    }
-                                }
-                            },
-                        )
-                    }
-                }
-                item(key = "stats") { ActivityStatPanel(current, variants) }
-                item(key = "track") {
-                    ActivityTrackCard(variants, current.primaryVariantId, onOpenMap)
-                }
+        when {
+            uiState.isLoading -> {
+                FitActivityDetailSkeleton()
             }
-            item(key = "distribution-header") {
-                SectionHeader("分发", "同一活动在各平台中的记录")
-            }
-            if (distributionAccounts.isEmpty()) {
-                item(key = "distribution-empty") {
-                    FitCard(tone = FitCardTone.Muted, contentPadding = PaddingValues(FitSpacing.md)) {
-                        Text(
-                            "还没有可用的平台账号",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-            } else {
-                items(distributionAccounts, key = { "distribution-${it.id}" }) { account ->
-                    DistributionRow(
-                        account = account,
-                        copy = copies.firstOrNull { it.platformAccountId == account.id },
-                        job = jobs.firstOrNull { it.destinationAccountId == account.id },
-                        dateFormat = shortDateFormat,
-                        onOpenWeb = { job ->
-                            context.startActivity(
-                                PlatformWebActivity.createIntent(
-                                    context,
-                                    account.platform,
-                                    job.id,
-                                    job.userActionUrl,
-                                ),
-                            )
-                        },
-                        onRetry = { job ->
-                            scope.launch(Dispatchers.IO) {
-                                val result = runCatching {
-                                    app.syncCoordinator.retryJob(job.id)
-                                    SyncScheduler.enqueueNow(context)
-                                }
-                                withContext(Dispatchers.Main) {
-                                    result.fold(
-                                        onSuccess = { notify("已重新加入同步队列") },
-                                        onFailure = { actionMessage = "重试失败：${it.message ?: "请稍后重试"}" },
-                                    )
-                                }
-                            }
-                        },
-                        onDispatch = {
-                            scope.launch(Dispatchers.IO) {
-                                val result = runCatching {
-                                    val id = app.syncCoordinator.enqueueManual(activityId, account.id)
-                                    SyncScheduler.enqueueNow(context)
-                                    id
-                                }
-                                withContext(Dispatchers.Main) {
-                                    result.fold(
-                                        onSuccess = { id ->
-                                            if (id > 0) {
-                                                notify("已加入 ${account.platform.displayName} 队列")
-                                            } else {
-                                                actionMessage = "该平台已有副本或任务"
-                                            }
-                                        },
-                                        onFailure = { actionMessage = "补发失败：${it.message ?: "请稍后重试"}" },
-                                    )
-                                }
-                            }
-                        },
+
+            activity == null -> {
+                Box(
+                    modifier = Modifier.fillMaxSize().padding(FitSpacing.lg),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    FitEmptyState(
+                        title = "未找到活动",
+                        body = "该活动可能已被删除或合并。",
+                        variant = EmptyStateVariant.NoResults,
+                        actionLabel = "返回",
+                        onAction = navigateBackOnce,
                     )
                 }
             }
-            item(key = "variants-header") { SectionHeader("原始 FIT", "原始文件与采集来源") }
-            item(key = "variants") {
-                VariantsCard(variants, activity?.primaryVariantId)
-            }
-            if (problemJobs.isNotEmpty()) {
-                item(key = "jobs-header") {
-                    SectionHeader("投递记录", "仅显示需要关注的异常任务")
+
+            else -> {
+                val distributionAccounts = remember(accounts) {
+                    accounts.filter { it.status != AccountStatus.DISABLED }
                 }
-                items(problemJobs, key = { "job-${it.id}" }) { job ->
-                    val account = accounts.firstOrNull { it.id == job.destinationAccountId }
-                    JobProblemRow(job = job, account = account)
+                val problemJobs = remember(jobs) {
+                    jobs.filter { it.status in problemDeliveryStatuses }
                 }
-            }
-            actionMessage?.let { message ->
-                item(key = "action-message") {
-                    StatusPill(message, StatusTone.ERROR)
-                }
-            }
-            item(key = "delete") {
-                Box(
-                    modifier = Modifier.fillMaxWidth().padding(top = FitSpacing.lg),
-                    contentAlignment = Alignment.Center,
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(
+                        start = FitSpacing.screenGutter,
+                        top = FitSpacing.sm,
+                        end = FitSpacing.screenGutter,
+                        bottom = FitSpacing.xxl,
+                    ),
+                    verticalArrangement = Arrangement.spacedBy(FitSpacing.md),
                 ) {
-                    TextButton(
-                        enabled = !isDeleting,
-                        onClick = { showDeleteConfirmation = true },
+                    item(key = "hero") { ActivityHero(activity) }
+                    if (activity.dedupStatus == DedupStatus.NEEDS_REVIEW) {
+                        item(key = "review") {
+                            ReviewActionsCard(
+                                candidate = reviewCandidate,
+                                dateFormat = dateFormat,
+                                busy = isMerging,
+                                onMerge = { showMergeConfirmation = true },
+                                onKeepSeparate = {
+                                    isMerging = true
+                                    scope.launch(Dispatchers.IO) {
+                                        val ok = runCatching {
+                                            app.activityMergeService.keepSeparate(activityId)
+                                        }.getOrDefault(false)
+                                        withContext(Dispatchers.Main) {
+                                            isMerging = false
+                                            if (ok) {
+                                                notify("已保持分离")
+                                                navigateBackOnce()
+                                            } else {
+                                                actionMessage = "操作失败"
+                                            }
+                                        }
+                                    }
+                                },
+                            )
+                        }
+                    }
+                    item(key = "stats") { ActivityStatPanel(activity, variants) }
+                    if (
+                        uiState.previewTrack.size >= 2 ||
+                        uiState.speedSeries.size >= 2 ||
+                        uiState.altitudeSeries.size >= 2
                     ) {
-                        Icon(
-                            Icons.Default.Delete,
-                            contentDescription = null,
-                            modifier = Modifier.size(FitSpacing.iconSm),
-                        )
-                        Text(
-                            "删除本地活动",
-                            modifier = Modifier.padding(start = FitSpacing.sm),
-                            color = MaterialTheme.colorScheme.error,
-                        )
+                        item(key = "track") {
+                            ActivityTrackCard(
+                                previewTrack = uiState.previewTrack,
+                                speedSeries = uiState.speedSeries,
+                                altitudeSeries = uiState.altitudeSeries,
+                                mapMounted = mapMounted,
+                                onOpenMap = onOpenMap,
+                            )
+                        }
+                    }
+                    item(key = "distribution-header") {
+                        SectionHeader("分发", "同一活动在各平台中的记录")
+                    }
+                    if (distributionAccounts.isEmpty()) {
+                        item(key = "distribution-empty") {
+                            FitCard(tone = FitCardTone.Muted, contentPadding = PaddingValues(FitSpacing.md)) {
+                                Text(
+                                    "还没有可用的平台账号",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    } else {
+                        items(distributionAccounts, key = { "distribution-${it.id}" }) { account ->
+                            val isBusy = account.id in busyAccountIds
+                            DistributionRow(
+                                account = account,
+                                copy = copies.firstOrNull { it.platformAccountId == account.id },
+                                job = jobs.firstOrNull { it.destinationAccountId == account.id },
+                                busy = isBusy,
+                                dateFormat = shortDateFormat,
+                                onOpenWeb = { job ->
+                                    context.startActivity(
+                                        PlatformWebActivity.createIntent(
+                                            context,
+                                            account.platform,
+                                            job.id,
+                                            job.userActionUrl,
+                                        ),
+                                    )
+                                },
+                                onRetry = { job ->
+                                    busyAccountIds = busyAccountIds + account.id
+                                    scope.launch(Dispatchers.IO) {
+                                        val result = runCatching {
+                                            app.syncCoordinator.retryJob(job.id)
+                                            SyncScheduler.enqueueNow(context)
+                                        }
+                                        withContext(Dispatchers.Main) {
+                                            busyAccountIds = busyAccountIds - account.id
+                                            result.fold(
+                                                onSuccess = { notify("已重新加入同步队列") },
+                                                onFailure = { actionMessage = "重试失败：${it.message ?: "请稍后重试"}" },
+                                            )
+                                        }
+                                    }
+                                },
+                                onDispatch = {
+                                    busyAccountIds = busyAccountIds + account.id
+                                    scope.launch(Dispatchers.IO) {
+                                        val result = runCatching {
+                                            val id = app.syncCoordinator.enqueueManual(activityId, account.id)
+                                            SyncScheduler.enqueueNow(context)
+                                            id
+                                        }
+                                        withContext(Dispatchers.Main) {
+                                            busyAccountIds = busyAccountIds - account.id
+                                            result.fold(
+                                                onSuccess = { id ->
+                                                    if (id > 0) {
+                                                        notify("已加入 ${account.platform.displayName} 队列")
+                                                    } else {
+                                                        actionMessage = "该平台已有副本或任务"
+                                                    }
+                                                },
+                                                onFailure = { actionMessage = "补发失败：${it.message ?: "请稍后重试"}" },
+                                            )
+                                        }
+                                    }
+                                },
+                            )
+                        }
+                    }
+                    item(key = "variants-header") { SectionHeader("原始 FIT", "原始文件与采集来源") }
+                    item(key = "variants") {
+                        VariantsCard(variants, activity.primaryVariantId)
+                    }
+                    if (problemJobs.isNotEmpty()) {
+                        item(key = "jobs-header") {
+                            SectionHeader("投递记录", "仅显示需要关注的异常任务")
+                        }
+                        items(problemJobs, key = { "job-${it.id}" }) { job ->
+                            val account = accounts.firstOrNull { it.id == job.destinationAccountId }
+                            JobProblemRow(job = job, account = account)
+                        }
+                    }
+                    actionMessage?.let { message ->
+                        item(key = "action-message") {
+                            StatusPill(message, StatusTone.ERROR)
+                        }
+                    }
+                    item(key = "delete") {
+                        Box(
+                            modifier = Modifier.fillMaxWidth().padding(top = FitSpacing.lg),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            TextButton(
+                                enabled = !isDeleting,
+                                onClick = { showDeleteConfirmation = true },
+                            ) {
+                                Icon(
+                                    Icons.Default.Delete,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(FitSpacing.iconSm),
+                                )
+                                Text(
+                                    "删除本地活动",
+                                    modifier = Modifier.padding(start = FitSpacing.sm),
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -474,53 +531,65 @@ private fun ActivityHero(activity: CanonicalActivityEntity) {
     }
 }
 
-/** 数据面板：距离 / 时长 / 均速 / 爬升 / 均心率 / 数据点。 */
 /**
  * 轨迹与曲线：地图轨迹 + 速度 / 海拔变化。
- * 轨迹优先用高密度地图轨迹（解析器 v8 起写入），老数据回退 21 点摘要；
- * 两者都没有则整块不显示。点击地图进入全屏。
+ * 转场动画前 160ms 先以矢量预览 + Loading 胶囊占位，动画结束再挂载 MapView 防止掉帧。
  */
 @Composable
 private fun ActivityTrackCard(
-    variants: List<ActivityVariantEntity>,
-    primaryVariantId: Long?,
+    previewTrack: List<LatLng>,
+    speedSeries: List<Float>,
+    altitudeSeries: List<Float>,
+    mapMounted: Boolean,
     onOpenMap: () -> Unit,
 ) {
-    val primary = variants.firstOrNull { it.id == primaryVariantId } ?: variants.firstOrNull()
-    val denseTrack = primary?.denseTrackBase64?.takeIf(String::isNotBlank)
-        ?: variants.firstNotNullOfOrNull { it.denseTrackBase64?.takeIf(String::isNotBlank) }
-    val trackJson = primary?.trackSummaryJson
-    val profileJson = primary?.profileJson
-    val track = remember(denseTrack, trackJson) { TrackCodec.decodeBestTrack(denseTrack, trackJson) }
-    val profile = remember(profileJson) { TrackCodec.decodeProfile(profileJson) }
-    val speed = remember(profile) { profile.mapNotNull { it.speedMps }.map { it.toFloat() } }
-    val altitude = remember(profile) { profile.mapNotNull { it.altitudeMeters }.map { it.toFloat() } }
-    if (track.size < 2 && speed.size < 2 && altitude.size < 2) return
     val colors = MaterialTheme.colorScheme
 
     FitCard(contentPadding = PaddingValues(FitSpacing.md)) {
-        if (track.size >= 2) {
-            TrackMap(
-                points = track,
-                modifier = Modifier.fillMaxWidth().height(180.dp).clip(FitShape.control),
-                interactive = false,
-                onTap = onOpenMap,
-            )
+        if (previewTrack.size >= 2) {
+            if (mapMounted) {
+                TrackMap(
+                    points = previewTrack,
+                    modifier = Modifier.fillMaxWidth().height(180.dp).clip(FitShape.control),
+                    interactive = false,
+                    onTap = onOpenMap,
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(180.dp)
+                        .clip(FitShape.control)
+                        .background(colors.surfaceContainerHigh)
+                        .clickable(onClick = onOpenMap),
+                ) {
+                    TrackPreview(
+                        points = previewTrack,
+                        modifier = Modifier.fillMaxSize().padding(FitSpacing.lg),
+                        color = colors.primary,
+                        strokeWidth = 2.dp,
+                    )
+                    FitMapLoadingOverlay(
+                        message = "正在加载地图…",
+                        modifier = Modifier.align(Alignment.Center),
+                    )
+                }
+            }
         }
-        if (speed.size >= 2) {
+        if (speedSeries.size >= 2) {
             ChartBlock(
                 label = "速度",
-                values = speed,
+                values = speedSeries,
                 unit = "km/h",
                 scale = 3.6f,
                 color = colors.tertiary,
-                modifier = Modifier.padding(top = if (track.size >= 2) FitSpacing.md else 0.dp),
+                modifier = Modifier.padding(top = if (previewTrack.size >= 2) FitSpacing.md else 0.dp),
             )
         }
-        if (altitude.size >= 2) {
+        if (altitudeSeries.size >= 2) {
             ChartBlock(
                 label = "海拔",
-                values = altitude,
+                values = altitudeSeries,
                 unit = "m",
                 scale = 1f,
                 color = colors.onSurfaceVariant,
@@ -539,12 +608,15 @@ private fun ChartBlock(
     color: Color,
     modifier: Modifier = Modifier,
 ) {
-    Column(modifier.fillMaxWidth()) {
+    val maxText = remember(values, unit, scale) {
+        "最大 %.1f %s".format(values.max() * scale, unit)
+    }
+    Column(modifier = modifier.fillMaxWidth()) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(label, style = FitType.dataLabel, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.weight(1f))
             Text(
-                "最大 %.1f %s".format(values.max() * scale, unit),
+                maxText,
                 style = FitType.numericSm,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -589,6 +661,7 @@ private fun DistributionRow(
     account: PlatformAccountEntity,
     copy: PlatformCopyEntity?,
     job: DeliveryJobEntity?,
+    busy: Boolean,
     dateFormat: SimpleDateFormat,
     onOpenWeb: (DeliveryJobEntity) -> Unit,
     onRetry: (DeliveryJobEntity) -> Unit,
@@ -607,17 +680,29 @@ private fun DistributionRow(
         trailing = {
             when {
                 copy != null -> StatusPill("已同步", StatusTone.SUCCESS)
-                job == null -> Button(onClick = onDispatch) {
-                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Text("补发", modifier = Modifier.padding(start = FitSpacing.xs))
+                job == null -> Button(enabled = !busy, onClick = onDispatch) {
+                    if (busy) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(14.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary,
+                        )
+                    } else {
+                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null, modifier = Modifier.size(16.dp))
+                    }
+                    Text(if (busy) "提交中…" else "补发", modifier = Modifier.padding(start = FitSpacing.xs))
                 }
                 job.status == DeliveryJobStatus.WAITING_USER -> Button(onClick = { onOpenWeb(job) }) {
                     Text(if (account.platform == Platform.GARMIN) "重新登录" else "继续处理")
                 }
                 job.status == DeliveryJobStatus.FAILED || job.status == DeliveryJobStatus.RETRY_WAIT ->
-                    OutlinedButton(onClick = { onRetry(job) }) {
-                        Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Text("重试", modifier = Modifier.padding(start = FitSpacing.xs))
+                    OutlinedButton(enabled = !busy, onClick = { onRetry(job) }) {
+                        if (busy) {
+                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                        } else {
+                            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                        }
+                        Text(if (busy) "处理中…" else "重试", modifier = Modifier.padding(start = FitSpacing.xs))
                     }
                 else -> StatusPill(deliveryStatusText(job.status), deliveryStatusTone(job.status), compact = true)
             }

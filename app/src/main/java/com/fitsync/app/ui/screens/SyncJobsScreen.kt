@@ -18,16 +18,17 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TriStateCheckbox
-import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -37,9 +38,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.paging.LoadState
-import androidx.paging.Pager
-import androidx.paging.PagingConfig
 import androidx.paging.compose.collectAsLazyPagingItems
 import androidx.paging.compose.itemKey
 import com.fitsync.app.FitSyncApp
@@ -51,17 +51,23 @@ import com.fitsync.app.ui.components.EmptyStateVariant
 import com.fitsync.app.ui.components.FitEmptyState
 import com.fitsync.app.ui.components.FitListRow
 import com.fitsync.app.ui.components.FitPagingFooter
+import com.fitsync.app.ui.components.FitRefreshBanner
+import com.fitsync.app.ui.components.FitSkeletonListRow
 import com.fitsync.app.ui.components.FitTopBar
+import com.fitsync.app.ui.components.LocalAppSnackbar
 import com.fitsync.app.ui.components.PlatformAvatar
 import com.fitsync.app.ui.components.StatusPill
 import com.fitsync.app.ui.components.deliveryStatusText
 import com.fitsync.app.ui.components.deliveryStatusTone
+import com.fitsync.app.ui.state.SyncJobsViewModel
 import com.fitsync.app.ui.theme.FitSpacing
 import com.fitsync.app.ui.theme.FitType
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 enum class SyncJobFilter(
     val routeValue: String,
@@ -117,36 +123,41 @@ fun SyncJobsScreen(
     onOpenActivity: (Long) -> Unit,
 ) {
     val db = FitSyncApp.instance.database
-    val pager = remember(filter) {
-        Pager(
-            config = PagingConfig(
-                pageSize = 30,
-                prefetchDistance = 10,
-                enablePlaceholders = false,
-                maxSize = 150,
-            ),
-            pagingSourceFactory = { db.deliveryJobDao().pagingSource(filter.routeValue) },
-        )
-    }
-    val jobs = pager.flow.collectAsLazyPagingItems()
+    val jobsViewModel: SyncJobsViewModel = viewModel(
+        factory = remember(filter) { SyncJobsViewModel.factory(db, filter) },
+    )
+    val jobs = jobsViewModel.jobs.collectAsLazyPagingItems()
     val dateFormat = remember { SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()) }
 
     // 批量操作的选择状态
     var selectionMode by remember { mutableStateOf(false) }
-    val selectedIds = remember { mutableStateListOf<Long>() }
+    var selectedIds by remember { mutableStateOf<Set<Long>>(emptySet()) }
     var showDeleteDialog by remember { mutableStateOf(false) }
+    var isBatchProcessing by remember { mutableStateOf(false) }
     val coroutineScope = rememberCoroutineScope()
     val context = LocalContext.current
+    val appSnackbar = LocalAppSnackbar.current
     val listState = rememberLazyListState()
+
+    val refreshState = jobs.loadState.refresh
+    val isInitialLoading = refreshState is LoadState.Loading && jobs.itemCount == 0
+    val isRefreshingWithContent = refreshState is LoadState.Loading && jobs.itemCount > 0
+    val isRefreshError = refreshState is LoadState.Error && jobs.itemCount == 0
 
     // 进入选择模式时自动滚回顶部，确保「全选」行立即可见
     LaunchedEffect(selectionMode) {
         if (selectionMode) listState.scrollToItem(0)
     }
 
-    // 全选作用于当前已加载的任务（Paging maxSize=150；滚动加载更多后会自动重算）
-    val loadedIds = remember(jobs.itemCount) {
-        (0 until jobs.itemCount).mapNotNull { jobs[it]?.id }.distinct()
+    // 仅从 itemSnapshotList 读取当前内存里已加载的任务 ID，绝不遍历 jobs[index] 触发级联翻页。
+    val loadedIds by remember(selectionMode) {
+        derivedStateOf {
+            if (!selectionMode) {
+                emptyList()
+            } else {
+                jobs.itemSnapshotList.items.map { it.id }.distinct()
+            }
+        }
     }
     val selectAllState = when {
         selectedIds.isEmpty() -> ToggleableState.Off
@@ -154,43 +165,85 @@ fun SyncJobsScreen(
         else -> ToggleableState.Indeterminate
     }
     fun toggleSelectAll() {
-        if (selectAllState == ToggleableState.On) {
-            selectedIds.clear()
+        if (isBatchProcessing) return
+        selectedIds = if (selectAllState == ToggleableState.On) {
+            emptySet()
         } else {
-            selectedIds.clear()
-            selectedIds.addAll(loadedIds)
+            loadedIds.toSet()
+        }
+    }
+
+    val toggleSelect = remember<(Long) -> Unit> {
+        { id ->
+            selectedIds = if (id in selectedIds) selectedIds - id else selectedIds + id
+        }
+    }
+    val enterSelectionWith = remember<(Long) -> Unit> {
+        { id ->
+            selectionMode = true
+            selectedIds = selectedIds + id
         }
     }
 
     Column(Modifier.fillMaxSize()) {
         FitTopBar(
             title = if (selectionMode) "已选中 ${selectedIds.size} 项" else filter.title,
-            subtitle = if (selectionMode) null else "${jobs.itemCount} 条已加载",
+            subtitle = when {
+                selectionMode -> null
+                isInitialLoading -> "正在加载…"
+                else -> "${jobs.itemCount} 条已加载"
+            },
             onBack = onBack,
             actions = {
                 if (selectionMode) {
-                    IconButton(onClick = {
-                        selectionMode = false
-                        selectedIds.clear()
-                    }) { Icon(Icons.Default.Close, contentDescription = "取消") }
-                    IconButton(onClick = { showDeleteDialog = true }) {
+                    if (isBatchProcessing) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.padding(end = FitSpacing.sm).size(20.dp),
+                            strokeWidth = 2.dp,
+                        )
+                    }
+                    IconButton(
+                        enabled = !isBatchProcessing,
+                        onClick = {
+                            selectionMode = false
+                            selectedIds = emptySet()
+                        },
+                    ) { Icon(Icons.Default.Close, contentDescription = "取消") }
+                    IconButton(
+                        enabled = !isBatchProcessing && selectedIds.isNotEmpty(),
+                        onClick = { showDeleteDialog = true },
+                    ) {
                         Icon(Icons.Default.Delete, contentDescription = "批量删除")
                     }
                     if (filter != SyncJobFilter.COMPLETED) {
-                        IconButton(onClick = {
-                            if (selectedIds.isNotEmpty()) {
+                        IconButton(
+                            enabled = !isBatchProcessing && selectedIds.isNotEmpty(),
+                            onClick = {
+                                val ids = selectedIds.toList()
+                                if (ids.isEmpty()) return@IconButton
+                                isBatchProcessing = true
                                 coroutineScope.launch {
-                                    FitSyncApp.instance.syncCoordinator.retryJobs(selectedIds.toList())
-                                    SyncScheduler.enqueueDeliveryNow(context)
-                                    selectionMode = false
-                                    selectedIds.clear()
+                                    val result = withContext(Dispatchers.IO) {
+                                        runCatching {
+                                            FitSyncApp.instance.syncCoordinator.retryJobs(ids)
+                                            SyncScheduler.enqueueDeliveryNow(context)
+                                        }
+                                    }
+                                    isBatchProcessing = false
+                                    result.onSuccess {
+                                        selectionMode = false
+                                        selectedIds = emptySet()
+                                        appSnackbar?.showSnackbar("已将 ${ids.size} 个任务加入重试队列")
+                                    }.onFailure {
+                                        appSnackbar?.showSnackbar("批量重试失败：${it.message ?: "请稍后重试"}")
+                                    }
                                 }
-                            }
-                        }) {
+                            },
+                        ) {
                             Icon(Icons.Default.Refresh, contentDescription = "批量重试")
                         }
                     }
-                } else {
+                } else if (jobs.itemCount > 0) {
                     IconButton(onClick = { selectionMode = true }) {
                         Icon(Icons.Default.Checklist, contentDescription = "多选")
                     }
@@ -208,91 +261,131 @@ fun SyncJobsScreen(
             ),
             verticalArrangement = Arrangement.spacedBy(FitSpacing.md),
         ) {
-            if (jobs.loadState.refresh is LoadState.NotLoading && jobs.itemCount == 0) {
-                item {
-                    FitEmptyState(
-                        title = filter.emptyTitle,
-                        body = filter.emptyBody,
-                        variant = if (filter == SyncJobFilter.COMPLETED) {
-                            EmptyStateVariant.FirstRun
-                        } else {
-                            EmptyStateVariant.AllDone
-                        },
-                    )
-                }
-            } else {
-                if (selectionMode && jobs.itemCount > 0) {
-                    item(key = "select-all") {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(start = FitSpacing.sm, end = FitSpacing.xs),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(FitSpacing.md),
-                        ) {
-                            TriStateCheckbox(
-                                state = selectAllState,
-                                onClick = { toggleSelectAll() },
-                            )
-                            Text("全选", style = MaterialTheme.typography.titleSmall)
-                            Spacer(Modifier.weight(1f))
-                            Text(
-                                "已选 ${selectedIds.size}/${jobs.itemCount}",
-                                style = FitType.dataLabel,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
+            when {
+                isInitialLoading -> {
+                    item(key = "jobs-first-load-banner") {
+                        FitRefreshBanner(message = "正在加载同步任务…")
+                    }
+                    items(5, key = { "job-skeleton-$it" }) {
+                        FitSkeletonListRow()
                     }
                 }
-                items(
-                    count = jobs.itemCount,
-                    key = jobs.itemKey { it.id },
-                    contentType = { "sync-job" },
-                ) { index ->
-                    jobs[index]?.let { job ->
-                        SyncJobRow(
-                            job = job,
-                            dateFormat = dateFormat,
-                            onOpenActivity = onOpenActivity,
-                            isSelectionMode = selectionMode,
-                            selectedIds = selectedIds,
-                            onToggleSelect = { id ->
-                                if (selectedIds.contains(id)) selectedIds.remove(id) else selectedIds.add(id)
-                            },
-                            onLongSelect = { id ->
-                                selectionMode = true
-                                if (!selectedIds.contains(id)) selectedIds.add(id)
+
+                isRefreshError -> {
+                    item(key = "jobs-error") {
+                        val error = (refreshState as LoadState.Error).error
+                        FitEmptyState(
+                            title = "任务加载失败",
+                            body = error.localizedMessage ?: "读取同步任务队列时发生异常。",
+                            variant = EmptyStateVariant.Error,
+                            actionLabel = "重试",
+                            onAction = { jobs.retry() },
+                        )
+                    }
+                }
+
+                refreshState is LoadState.NotLoading && jobs.itemCount == 0 -> {
+                    item(key = "jobs-empty") {
+                        FitEmptyState(
+                            title = filter.emptyTitle,
+                            body = filter.emptyBody,
+                            variant = if (filter == SyncJobFilter.COMPLETED) {
+                                EmptyStateVariant.FirstRun
+                            } else {
+                                EmptyStateVariant.AllDone
                             },
                         )
                     }
                 }
-                item(key = "paging-footer") {
-                    FitPagingFooter(
-                        append = jobs.loadState.append,
-                        itemCount = jobs.itemCount,
-                        onRetry = { jobs.retry() },
-                    )
+
+                else -> {
+                    if (isRefreshingWithContent) {
+                        item(key = "jobs-refresh-banner") {
+                            FitRefreshBanner(message = "正在更新任务…")
+                        }
+                    }
+                    if (selectionMode && jobs.itemCount > 0) {
+                        item(key = "select-all") {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(start = FitSpacing.sm, end = FitSpacing.xs),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(FitSpacing.md),
+                            ) {
+                                TriStateCheckbox(
+                                    state = selectAllState,
+                                    enabled = !isBatchProcessing,
+                                    onClick = { toggleSelectAll() },
+                                )
+                                Text("全选", style = MaterialTheme.typography.titleSmall)
+                                Spacer(Modifier.weight(1f))
+                                Text(
+                                    "已选 ${selectedIds.size}/${jobs.itemCount}",
+                                    style = FitType.dataLabel,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                    items(
+                        count = jobs.itemCount,
+                        key = jobs.itemKey { it.id },
+                        contentType = { "sync-job" },
+                    ) { index ->
+                        jobs[index]?.let { job ->
+                            SyncJobRow(
+                                job = job,
+                                dateFormat = dateFormat,
+                                onOpenActivity = onOpenActivity,
+                                isSelectionMode = selectionMode,
+                                isSelected = job.id in selectedIds,
+                                onToggleSelect = toggleSelect,
+                                onLongSelect = enterSelectionWith,
+                            )
+                        }
+                    }
+                    item(key = "paging-footer") {
+                        FitPagingFooter(
+                            append = jobs.loadState.append,
+                            itemCount = jobs.itemCount,
+                            onRetry = { jobs.retry() },
+                        )
+                    }
                 }
             }
         }
 
         if (showDeleteDialog && selectedIds.isNotEmpty()) {
             AlertDialog(
-                onDismissRequest = { showDeleteDialog = false },
+                onDismissRequest = { if (!isBatchProcessing) showDeleteDialog = false },
                 title = { Text("删除选中任务？") },
                 text = {
                     Text("确定要删除选中的 ${selectedIds.size} 个同步任务吗？此操作只会删除这些同步任务记录，不会删除已上传到平台的文件，也不会删除本地活动。")
                 },
                 confirmButton = {
-                    TextButton(onClick = {
-                        coroutineScope.launch {
-                            FitSyncApp.instance.syncCoordinator.deleteJobs(selectedIds.toList())
-                            showDeleteDialog = false
-                            selectionMode = false
-                            selectedIds.clear()
-                        }
-                    }) { Text("删除") }
+                    TextButton(
+                        enabled = !isBatchProcessing,
+                        onClick = {
+                            val ids = selectedIds.toList()
+                            isBatchProcessing = true
+                            coroutineScope.launch {
+                                val result = withContext(Dispatchers.IO) {
+                                    runCatching { FitSyncApp.instance.syncCoordinator.deleteJobs(ids) }
+                                }
+                                isBatchProcessing = false
+                                showDeleteDialog = false
+                                result.onSuccess {
+                                    selectionMode = false
+                                    selectedIds = emptySet()
+                                    appSnackbar?.showSnackbar("已删除 ${ids.size} 个任务")
+                                }.onFailure {
+                                    appSnackbar?.showSnackbar("批量删除失败：${it.message ?: "请稍后重试"}")
+                                }
+                            }
+                        },
+                    ) { Text(if (isBatchProcessing) "删除中…" else "删除") }
                 },
                 dismissButton = {
-                    TextButton(onClick = { showDeleteDialog = false }) { Text("取消") }
+                    TextButton(enabled = !isBatchProcessing, onClick = { showDeleteDialog = false }) { Text("取消") }
                 },
             )
         }
@@ -305,7 +398,7 @@ private fun SyncJobRow(
     dateFormat: SimpleDateFormat,
     onOpenActivity: (Long) -> Unit,
     isSelectionMode: Boolean = false,
-    selectedIds: Collection<Long> = emptySet(),
+    isSelected: Boolean = false,
     onToggleSelect: (Long) -> Unit = {},
     onLongSelect: (Long) -> Unit = {},
 ) {
@@ -319,7 +412,7 @@ private fun SyncJobRow(
         leading = {
             if (isSelectionMode) {
                 Checkbox(
-                    checked = selectedIds.contains(job.id),
+                    checked = isSelected,
                     onCheckedChange = { onToggleSelect(job.id) },
                 )
             } else {
@@ -331,7 +424,7 @@ private fun SyncJobRow(
             if (isSelectionMode) onToggleSelect(job.id) else onOpenActivity(job.canonicalActivityId)
         },
         onLongClick = { onLongSelect(job.id) },
-        selected = isSelectionMode && selectedIds.contains(job.id),
+        selected = isSelectionMode && isSelected,
         showChevron = !isSelectionMode,
     )
 }

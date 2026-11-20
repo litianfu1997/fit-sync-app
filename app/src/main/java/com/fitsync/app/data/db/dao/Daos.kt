@@ -90,6 +90,38 @@ interface CanonicalActivityDao {
               ORDER BY v.id LIMIT 1)
           ) AS trackJson
         FROM canonical_activity
+        ORDER BY startTimeEpochMs DESC, id DESC
+        """,
+    )
+    fun pagingSourceAllNewest(): PagingSource<Int, ActivityListItem>
+
+    @Query(
+        """
+        SELECT id, title, sportType, startTimeEpochMs, elapsedSeconds, distanceMeters, dedupStatus,
+          COALESCE(
+            (SELECT v.trackSummaryJson FROM activity_variant v
+              WHERE v.id = canonical_activity.primaryVariantId),
+            (SELECT v.trackSummaryJson FROM activity_variant v
+              WHERE v.canonicalActivityId = canonical_activity.id AND v.trackSummaryJson IS NOT NULL
+              ORDER BY v.id LIMIT 1)
+          ) AS trackJson
+        FROM canonical_activity
+        ORDER BY startTimeEpochMs ASC, id ASC
+        """,
+    )
+    fun pagingSourceAllOldest(): PagingSource<Int, ActivityListItem>
+
+    @Query(
+        """
+        SELECT id, title, sportType, startTimeEpochMs, elapsedSeconds, distanceMeters, dedupStatus,
+          COALESCE(
+            (SELECT v.trackSummaryJson FROM activity_variant v
+              WHERE v.id = canonical_activity.primaryVariantId),
+            (SELECT v.trackSummaryJson FROM activity_variant v
+              WHERE v.canonicalActivityId = canonical_activity.id AND v.trackSummaryJson IS NOT NULL
+              ORDER BY v.id LIMIT 1)
+          ) AS trackJson
+        FROM canonical_activity
         WHERE (
             :query = ''
             OR title LIKE '%' || :query || '%' COLLATE NOCASE
@@ -102,18 +134,56 @@ interface CanonicalActivityDao {
             OR (:filter = 'RUNNING' AND sportType = 'RUNNING')
             OR (:filter = 'REVIEW' AND dedupStatus = 'NEEDS_REVIEW')
           )
-        ORDER BY
-          CASE WHEN :oldestFirst = 1 THEN startTimeEpochMs END ASC,
-          CASE WHEN :oldestFirst = 1 THEN id END ASC,
-          CASE WHEN :oldestFirst = 0 THEN startTimeEpochMs END DESC,
-          CASE WHEN :oldestFirst = 0 THEN id END DESC
+        ORDER BY startTimeEpochMs DESC, id DESC
         """,
     )
+    fun pagingSourceFilteredNewest(
+        query: String,
+        filter: String,
+    ): PagingSource<Int, ActivityListItem>
+
+    @Query(
+        """
+        SELECT id, title, sportType, startTimeEpochMs, elapsedSeconds, distanceMeters, dedupStatus,
+          COALESCE(
+            (SELECT v.trackSummaryJson FROM activity_variant v
+              WHERE v.id = canonical_activity.primaryVariantId),
+            (SELECT v.trackSummaryJson FROM activity_variant v
+              WHERE v.canonicalActivityId = canonical_activity.id AND v.trackSummaryJson IS NOT NULL
+              ORDER BY v.id LIMIT 1)
+          ) AS trackJson
+        FROM canonical_activity
+        WHERE (
+            :query = ''
+            OR title LIKE '%' || :query || '%' COLLATE NOCASE
+            OR (:query LIKE '%骑%' AND sportType IN ('CYCLING', 'INDOOR_CYCLING', 'MTB', 'GRAVEL'))
+            OR (:query LIKE '%跑%' AND sportType = 'RUNNING')
+          )
+          AND (
+            :filter = 'ALL'
+            OR (:filter = 'CYCLING' AND sportType IN ('CYCLING', 'INDOOR_CYCLING', 'MTB', 'GRAVEL'))
+            OR (:filter = 'RUNNING' AND sportType = 'RUNNING')
+            OR (:filter = 'REVIEW' AND dedupStatus = 'NEEDS_REVIEW')
+          )
+        ORDER BY startTimeEpochMs ASC, id ASC
+        """,
+    )
+    fun pagingSourceFilteredOldest(
+        query: String,
+        filter: String,
+    ): PagingSource<Int, ActivityListItem>
+
     fun pagingSource(
         query: String,
         filter: String,
         oldestFirst: Boolean,
-    ): PagingSource<Int, ActivityListItem>
+    ): PagingSource<Int, ActivityListItem> = when {
+        query.isEmpty() && filter == "ALL" -> {
+            if (oldestFirst) pagingSourceAllOldest() else pagingSourceAllNewest()
+        }
+        oldestFirst -> pagingSourceFilteredOldest(query, filter)
+        else -> pagingSourceFilteredNewest(query, filter)
+    }
 
     @Query(
         """
@@ -344,14 +414,57 @@ interface DeliveryJobDao {
         FROM delivery_job job
         LEFT JOIN canonical_activity activity ON activity.id = job.canonicalActivityId
         LEFT JOIN platform_account account ON account.id = job.destinationAccountId
-        WHERE
-          (:filter = 'waiting' AND job.status IN ('PENDING', 'UPLOADING', 'WAITING_REMOTE_PROCESS'))
-          OR (:filter = 'completed' AND job.status IN ('SUCCEEDED', 'DUPLICATE_REMOTE'))
-          OR (:filter = 'failed' AND job.status IN ('FAILED', 'WAITING_USER', 'RETRY_WAIT'))
+        WHERE job.status IN (:statuses)
         ORDER BY job.createdAtEpochMs DESC, job.id DESC
         """,
     )
-    fun pagingSource(filter: String): PagingSource<Int, SyncJobListItem>
+    fun pagingSourceByStatuses(statuses: List<DeliveryJobStatus>): PagingSource<Int, SyncJobListItem>
+
+    @Query(
+        """
+        SELECT
+          job.id AS id,
+          job.canonicalActivityId AS canonicalActivityId,
+          job.destinationAccountId AS destinationAccountId,
+          job.status AS status,
+          job.attemptCount AS attemptCount,
+          job.errorCode AS errorCode,
+          job.errorMessage AS errorMessage,
+          job.updatedAtEpochMs AS updatedAtEpochMs,
+          activity.title AS activityTitle,
+          activity.sportType AS activitySportType,
+          account.platform AS destinationPlatform
+        FROM delivery_job job
+        LEFT JOIN canonical_activity activity ON activity.id = job.canonicalActivityId
+        LEFT JOIN platform_account account ON account.id = job.destinationAccountId
+        WHERE 0
+        """,
+    )
+    fun pagingSourceEmpty(): PagingSource<Int, SyncJobListItem>
+
+    fun pagingSource(filter: String): PagingSource<Int, SyncJobListItem> = when (filter) {
+        "waiting" -> pagingSourceByStatuses(
+            listOf(
+                DeliveryJobStatus.PENDING,
+                DeliveryJobStatus.UPLOADING,
+                DeliveryJobStatus.WAITING_REMOTE_PROCESS,
+            ),
+        )
+        "completed" -> pagingSourceByStatuses(
+            listOf(
+                DeliveryJobStatus.SUCCEEDED,
+                DeliveryJobStatus.DUPLICATE_REMOTE,
+            ),
+        )
+        "failed" -> pagingSourceByStatuses(
+            listOf(
+                DeliveryJobStatus.FAILED,
+                DeliveryJobStatus.WAITING_USER,
+                DeliveryJobStatus.RETRY_WAIT,
+            ),
+        )
+        else -> pagingSourceEmpty()
+    }
 
     @Query(
         """

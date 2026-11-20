@@ -16,9 +16,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Rule
 import androidx.compose.material.icons.filled.AddLink
 import androidx.compose.material.icons.filled.History
-import androidx.compose.material.icons.filled.Rule
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -37,8 +37,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -55,6 +55,8 @@ import com.fitsync.app.sync.SyncScheduler
 import com.fitsync.app.ui.components.EmptyStateVariant
 import com.fitsync.app.ui.components.FitCard
 import com.fitsync.app.ui.components.FitEmptyState
+import com.fitsync.app.ui.components.FitRefreshBanner
+import com.fitsync.app.ui.components.FitSkeletonListRow
 import com.fitsync.app.ui.components.FitTopBar
 import com.fitsync.app.ui.components.PlatformAvatar
 import com.fitsync.app.ui.components.PlatformRouteAvatar
@@ -63,6 +65,7 @@ import com.fitsync.app.ui.components.SettingsDivider
 import com.fitsync.app.ui.components.StatusPill
 import com.fitsync.app.ui.components.StatusTone
 import com.fitsync.app.ui.components.executionText
+import com.fitsync.app.ui.state.AppSharedUiViewModel
 import com.fitsync.app.ui.theme.FitSpacing
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -78,38 +81,45 @@ private data class HistoryConfirmation(
 
 @Composable
 fun SyncRulesScreen(
+    sharedViewModel: AppSharedUiViewModel,
     onBack: () -> Unit = {},
     onOpenPlatforms: () -> Unit = {},
 ) {
     val app = FitSyncApp.instance
-    val accounts by app.database.platformAccountDao().observeAll()
-        .collectAsStateWithLifecycle(initialValue = emptyList())
-    val rules by app.database.syncRuleDao().observeAll()
-        .collectAsStateWithLifecycle(initialValue = emptyList())
+    val sharedState by sharedViewModel.state.collectAsStateWithLifecycle()
+    val accounts = sharedState.accounts
+    val rules = sharedState.rules
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
-    val referencedAccountIds = rules.mapTo(mutableSetOf()) { it.destinationAccountId }
-    val referencedSources = rules.mapTo(mutableSetOf()) { it.sourcePlatform }
-    val connectedAccounts = accounts.filter {
-        it.status == AccountStatus.ACTIVE ||
-            it.status == AccountStatus.EXPERIMENTAL ||
-            it.id in referencedAccountIds ||
-            it.platform in referencedSources
-    }
-    val sources = (
-        listOf(Platform.LOCAL_IMPORT) + connectedAccounts.map { it.platform }.filter { platform ->
-            connectedAccounts.firstOrNull { it.platform == platform }.capabilities().let {
-                it.canListActivities && it.canDownloadOriginalFit
-            }
+
+    val connectedAccounts = remember(accounts, rules) {
+        val referencedAccountIds = rules.mapTo(mutableSetOf()) { it.destinationAccountId }
+        val referencedSources = rules.mapTo(mutableSetOf()) { it.sourcePlatform }
+        accounts.filter {
+            it.status == AccountStatus.ACTIVE ||
+                it.status == AccountStatus.EXPERIMENTAL ||
+                it.id in referencedAccountIds ||
+                it.platform in referencedSources
         }
-        ).distinct()
+    }
+    val sources = remember(connectedAccounts) {
+        (
+            listOf(Platform.LOCAL_IMPORT) + connectedAccounts.map { it.platform }.filter { platform ->
+                connectedAccounts.firstOrNull { it.platform == platform }.capabilities().let {
+                    it.canListActivities && it.canDownloadOriginalFit
+                }
+            }
+            ).distinct()
+    }
     var selectedSource by rememberSaveable { mutableStateOf(Platform.LOCAL_IMPORT) }
     var busyRoute by remember { mutableStateOf<RouteKey?>(null) }
     var historyConfirmation by remember { mutableStateOf<HistoryConfirmation?>(null) }
 
-    LaunchedEffect(sources) {
-        if (selectedSource !in sources) selectedSource = sources.firstOrNull() ?: Platform.LOCAL_IMPORT
+    LaunchedEffect(sources, sharedState.isLoaded) {
+        if (sharedState.isLoaded && selectedSource !in sources) {
+            selectedSource = sources.firstOrNull() ?: Platform.LOCAL_IMPORT
+        }
     }
 
     fun updateRule(source: Platform, destinationId: Long, enabled: Boolean, includeHistory: Boolean) {
@@ -138,9 +148,11 @@ fun SyncRulesScreen(
         }
     }
 
-    val destinations = connectedAccounts.filter { account ->
-        account.platform != selectedSource &&
-            account.capabilities().canUploadActivity
+    val destinations = remember(connectedAccounts, selectedSource) {
+        connectedAccounts.filter { account ->
+            account.platform != selectedSource &&
+                account.capabilities().canUploadActivity
+        }
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -160,8 +172,15 @@ fun SyncRulesScreen(
                 ),
                 verticalArrangement = Arrangement.spacedBy(FitSpacing.md),
             ) {
-                if (connectedAccounts.isEmpty()) {
-                    item {
+                if (!sharedState.isLoaded) {
+                    item(key = "rules-loading-banner") {
+                        FitRefreshBanner(message = "正在加载同步规则…")
+                    }
+                    items(4, key = { "rules-skeleton-$it" }) {
+                        FitSkeletonListRow()
+                    }
+                } else if (connectedAccounts.isEmpty()) {
+                    item(key = "rules-empty") {
                         FitEmptyState(
                             title = "先连接一个平台",
                             body = "连接账号后，就能把本地导入或平台活动自动发送到其他平台。",
@@ -173,8 +192,10 @@ fun SyncRulesScreen(
                         )
                     }
                 } else {
-                    item { SectionHeader("活动从哪里来", "一次只配置一个来源，路径更清楚") }
-                    item {
+                    item(key = "rules-header") {
+                        SectionHeader("活动从哪里来", "一次只配置一个来源，路径更清楚")
+                    }
+                    item(key = "rules-sources") {
                         Row(
                             modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                             horizontalArrangement = Arrangement.spacedBy(FitSpacing.sm),
@@ -193,19 +214,19 @@ fun SyncRulesScreen(
                             }
                         }
                     }
-                    item {
+                    item(key = "rules-source-header") {
                         SourceRouteHeader(
                             source = selectedSource,
                             enabledCount = rules.count { it.sourcePlatform == selectedSource && it.enabled },
                         )
                     }
                     if (destinations.isEmpty()) {
-                        item {
+                        item(key = "rules-no-dest") {
                             FitEmptyState(
                                 title = "没有可用目标",
                                 body = "再连接一个支持上传 FIT 的平台，即可创建自动同步路径。",
                                 variant = EmptyStateVariant.FirstRun,
-                                icon = Icons.Default.Rule,
+                                icon = Icons.AutoMirrored.Filled.Rule,
                                 actionLabel = "管理平台账号",
                                 onAction = onOpenPlatforms,
                             )

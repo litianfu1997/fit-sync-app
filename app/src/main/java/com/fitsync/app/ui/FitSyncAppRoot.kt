@@ -1,13 +1,17 @@
 package com.fitsync.app.ui
 
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.DirectionsBike
 import androidx.compose.material.icons.automirrored.outlined.DirectionsBike
@@ -26,7 +30,9 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -34,17 +40,23 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.unit.dp
-import androidx.navigation.NavGraph.Companion.findStartDestination
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.fitsync.app.FitSyncApp
 import com.fitsync.app.ui.components.LocalAppSnackbar
 import com.fitsync.app.ui.screens.ActivitiesScreen
-import com.fitsync.app.ui.screens.ActivityFilter
 import com.fitsync.app.ui.screens.ActivityDetailScreen
 import com.fitsync.app.ui.screens.BackgroundSettingsScreen
 import com.fitsync.app.ui.screens.HomeScreen
@@ -56,48 +68,80 @@ import com.fitsync.app.ui.screens.SyncJobFilter
 import com.fitsync.app.ui.screens.SyncJobsScreen
 import com.fitsync.app.ui.screens.SyncRulesScreen
 import com.fitsync.app.ui.screens.TrackMapScreen
+import com.fitsync.app.ui.state.ActivitiesViewModel
+import com.fitsync.app.ui.state.AppSharedUiViewModel
+import com.fitsync.app.ui.state.HomeUiViewModel
 import com.fitsync.app.ui.theme.FitShape
 import com.fitsync.app.ui.theme.FitSpacing
 
-private data class MainDestination(
-    val route: String,
+private enum class MainTab(
     val label: String,
     val selectedIcon: ImageVector,
     val icon: ImageVector,
-)
-
-private val destinations = listOf(
-    MainDestination("home", "概览", Icons.Filled.SpaceDashboard, Icons.Outlined.SpaceDashboard),
-    MainDestination(
-        "activities",
+) {
+    HOME("概览", Icons.Filled.SpaceDashboard, Icons.Outlined.SpaceDashboard),
+    ACTIVITIES(
         "活动",
         Icons.AutoMirrored.Filled.DirectionsBike,
         Icons.AutoMirrored.Outlined.DirectionsBike,
     ),
-    MainDestination("settings", "设置", Icons.Filled.Settings, Icons.Outlined.Settings),
-)
+    SETTINGS("设置", Icons.Filled.Settings, Icons.Outlined.Settings),
+}
 
-// 转场时长：足够暗示方向，又不至于让两页并存。
-private const val NavMs = 180
+private const val MAIN_ROUTE = "main"
+
+// 快速轻量转场：缩短两页并行停留时间，缓解重型页面（地图/图表）叠加压力。
+private const val NavMs = 150
+private const val NavExitMs = 90
 
 @Composable
 fun FitSyncAppRoot() {
+    val app = FitSyncApp.instance
+    val activityStoreOwner = checkNotNull(LocalViewModelStoreOwner.current)
+    val sharedViewModel: AppSharedUiViewModel = viewModel(
+        viewModelStoreOwner = activityStoreOwner,
+        factory = remember(app) { AppSharedUiViewModel.factory(app) },
+    )
+    val homeViewModel: HomeUiViewModel = viewModel(
+        viewModelStoreOwner = activityStoreOwner,
+        factory = remember(app) { HomeUiViewModel.factory(app.database) },
+    )
+    val activitiesViewModel: ActivitiesViewModel = viewModel(
+        viewModelStoreOwner = activityStoreOwner,
+        factory = remember(app) { ActivitiesViewModel.factory(app.database) },
+    )
+
     val navController = rememberNavController()
     val backStack by navController.currentBackStackEntryAsState()
     val current = backStack?.destination?.route
-    val showBottomBar = destinations.any { it.route == current }
-    var activityFilter by rememberSaveable { mutableStateOf(ActivityFilter.ALL) }
+    val showBottomBar = current == null || current == MAIN_ROUTE
+    var selectedTab by rememberSaveable { mutableStateOf(MainTab.HOME) }
+    var visitedTabs by remember { mutableStateOf(setOf(selectedTab)) }
+
+    val homeListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
+    val activitiesListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
+    val settingsListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
+
     val appSnackbarHostState = remember { SnackbarHostState() }
+    val focusManager = LocalFocusManager.current
+    val lifecycleOwner = LocalLifecycleOwner.current
 
-    fun navigateToMainDestination(route: String) {
-        if (route == current) return
-        if (route == "home" && navController.popBackStack("home", inclusive = false)) return
-
-        navController.navigate(route) {
-            popUpTo(navController.graph.findStartDestination().id) { saveState = true }
-            launchSingleTop = true
-            restoreState = true
+    // 统一在根部监听 ON_RESUME 刷新后台保护状态，避免各页面重复注册监听并在主线程做 IPC。
+    DisposableEffect(lifecycleOwner, sharedViewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                sharedViewModel.refreshBackgroundStatus()
+            }
         }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    fun selectTab(tab: MainTab) {
+        if (selectedTab == tab) return
+        focusManager.clearFocus()
+        visitedTabs = visitedTabs + tab
+        selectedTab = tab
     }
 
     Scaffold(
@@ -114,18 +158,18 @@ fun FitSyncAppRoot() {
                         containerColor = MaterialTheme.colorScheme.surface,
                         tonalElevation = 0.dp,
                     ) {
-                        destinations.forEach { destination ->
-                            val selected = current == destination.route
+                        MainTab.entries.forEach { tab ->
+                            val selected = selectedTab == tab
                             NavigationBarItem(
                                 selected = selected,
-                                onClick = { navigateToMainDestination(destination.route) },
+                                onClick = { selectTab(tab) },
                                 icon = {
                                     Icon(
-                                        if (selected) destination.selectedIcon else destination.icon,
-                                        contentDescription = destination.label,
+                                        if (selected) tab.selectedIcon else tab.icon,
+                                        contentDescription = tab.label,
                                     )
                                 },
-                                label = { Text(destination.label, style = MaterialTheme.typography.labelMedium) },
+                                label = { Text(tab.label, style = MaterialTheme.typography.labelMedium) },
                                 colors = NavigationBarItemDefaults.colors(
                                     indicatorColor = MaterialTheme.colorScheme.primaryContainer,
                                     selectedIconColor = MaterialTheme.colorScheme.primary,
@@ -143,55 +187,79 @@ fun FitSyncAppRoot() {
         CompositionLocalProvider(LocalAppSnackbar provides appSnackbarHostState) {
             NavHost(
                 navController = navController,
-                startDestination = "home",
+                startDestination = MAIN_ROUTE,
                 modifier = Modifier.padding(padding),
                 enterTransition = {
-                    fadeIn(tween(NavMs)) + slideInHorizontally(tween(NavMs)) { it / 12 }
+                    fadeIn(tween(NavMs, easing = FastOutSlowInEasing)) +
+                        slideInHorizontally(tween(NavMs, easing = FastOutSlowInEasing)) { it / 16 }
                 },
-                exitTransition = { fadeOut(tween(NavMs / 2)) },
+                exitTransition = { fadeOut(tween(NavExitMs)) },
                 popEnterTransition = {
-                    fadeIn(tween(NavMs)) + slideInHorizontally(tween(NavMs)) { -it / 12 }
+                    fadeIn(tween(NavMs, easing = FastOutSlowInEasing)) +
+                        slideInHorizontally(tween(NavMs, easing = FastOutSlowInEasing)) { -it / 16 }
                 },
-                popExitTransition = { fadeOut(tween(NavMs / 2)) },
+                popExitTransition = { fadeOut(tween(NavExitMs)) },
             ) {
-                composable("home") {
-                    HomeScreen(
-                        onOpenActivities = { navigateToMainDestination("activities") },
-                        onOpenJobs = { filter -> navController.navigate("jobs/${filter.routeValue}") },
-                        onOpenPlatforms = { navController.navigate("settings/platforms") },
-                    )
-                }
-                composable("activities") {
-                    ActivitiesScreen(
-                        filter = activityFilter,
-                        onFilterChange = { activityFilter = it },
-                        onOpenActivity = { id -> navController.navigate("activity/$id") },
-                        onOpenPlatforms = { navController.navigate("settings/platforms") },
-                    )
-                }
-                composable("settings") {
-                    SettingsScreen(
-                        onOpenPlatforms = { navController.navigate("settings/platforms") },
-                        onOpenRules = { navController.navigate("settings/rules") },
-                        onOpenBackground = { navController.navigate("settings/background") },
-                        onOpenStorage = { navController.navigate("settings/storage") },
-                        onOpenPrivacy = { navController.navigate("settings/privacy") },
-                    )
+                composable(MAIN_ROUTE) {
+                    BackHandler(enabled = selectedTab != MainTab.HOME) {
+                        selectTab(MainTab.HOME)
+                    }
+                    KeepAliveTabContainer(
+                        selectedTab = selectedTab,
+                        visitedTabs = visitedTabs,
+                        modifier = Modifier.fillMaxSize(),
+                    ) { tab ->
+                        when (tab) {
+                            MainTab.HOME -> HomeScreen(
+                                homeViewModel = homeViewModel,
+                                sharedViewModel = sharedViewModel,
+                                listState = homeListState,
+                                onOpenActivities = { selectTab(MainTab.ACTIVITIES) },
+                                onOpenJobs = { filter -> navController.navigate("jobs/${filter.routeValue}") },
+                                onOpenPlatforms = { navController.navigate("settings/platforms") },
+                            )
+                            MainTab.ACTIVITIES -> ActivitiesScreen(
+                                viewModel = activitiesViewModel,
+                                listState = activitiesListState,
+                                onOpenActivity = { id -> navController.navigate("activity/$id") },
+                                onOpenPlatforms = { navController.navigate("settings/platforms") },
+                            )
+                            MainTab.SETTINGS -> SettingsScreen(
+                                sharedViewModel = sharedViewModel,
+                                listState = settingsListState,
+                                onOpenPlatforms = { navController.navigate("settings/platforms") },
+                                onOpenRules = { navController.navigate("settings/rules") },
+                                onOpenBackground = { navController.navigate("settings/background") },
+                                onOpenStorage = { navController.navigate("settings/storage") },
+                                onOpenPrivacy = { navController.navigate("settings/privacy") },
+                            )
+                        }
+                    }
                 }
                 composable("settings/platforms") {
-                    PlatformsScreen(onBack = { navController.popBackStack() })
+                    PlatformsScreen(
+                        sharedViewModel = sharedViewModel,
+                        onBack = { navController.popBackStack() },
+                    )
                 }
                 composable("settings/rules") {
                     SyncRulesScreen(
+                        sharedViewModel = sharedViewModel,
                         onBack = { navController.popBackStack() },
                         onOpenPlatforms = { navController.navigate("settings/platforms") },
                     )
                 }
                 composable("settings/background") {
-                    BackgroundSettingsScreen(onBack = { navController.popBackStack() })
+                    BackgroundSettingsScreen(
+                        sharedViewModel = sharedViewModel,
+                        onBack = { navController.popBackStack() },
+                    )
                 }
                 composable("settings/storage") {
-                    StorageSettingsScreen(onBack = { navController.popBackStack() })
+                    StorageSettingsScreen(
+                        sharedViewModel = sharedViewModel,
+                        onBack = { navController.popBackStack() },
+                    )
                 }
                 composable("settings/privacy") {
                     PrivacyAboutScreen(onBack = { navController.popBackStack() })
@@ -227,6 +295,45 @@ fun FitSyncAppRoot() {
                     )
                 }
             }
+        }
+    }
+}
+
+/**
+ * 主 Tab 保活容器：
+ * 首次访问时懒挂载并保持在组合树中，切换 Tab 时仅测量和放置当前选中的页面，
+ * 隐藏的 Tab 不触发测量/绘制/触控，彻底消除切换主页面时的重新加载与状态丢失。
+ */
+@Composable
+private fun KeepAliveTabContainer(
+    selectedTab: MainTab,
+    visitedTabs: Set<MainTab>,
+    modifier: Modifier = Modifier,
+    content: @Composable (MainTab) -> Unit,
+) {
+    val activeTabs = remember(visitedTabs, selectedTab) {
+        MainTab.entries.filter { it in visitedTabs || it == selectedTab }
+    }
+    Layout(
+        modifier = modifier,
+        content = {
+            activeTabs.forEach { tab ->
+                key(tab) {
+                    Box(Modifier.fillMaxSize()) {
+                        content(tab)
+                    }
+                }
+            }
+        },
+    ) { measurables, constraints ->
+        val activeIndex = activeTabs.indexOf(selectedTab)
+        val placeable = if (activeIndex in measurables.indices) {
+            measurables[activeIndex].measure(constraints)
+        } else {
+            null
+        }
+        layout(constraints.maxWidth, constraints.maxHeight) {
+            placeable?.placeRelative(0, 0)
         }
     }
 }

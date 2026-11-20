@@ -126,10 +126,17 @@ class FitSyncApp : Application(), Configuration.Provider {
         Trace.beginSection("FitSync:app_onCreate")
         try {
             instance = this
-            // 只做配置赋值与建目录，但必须早于任何 MapView 创建
-            osMapBootstrap.initialize()
-            GarminAuthDiagnostics.init(this)
-            applicationScope.launch { webSessionManager.clearLegacyStravaApiCredentials() }
+            // 耗时 IO、osmdroid 配置、字体预热与旧凭据清理全部异步执行，不阻塞冷启动主线程。
+            applicationScope.launch {
+                osMapBootstrap.ensureInitialized()
+                GarminAuthDiagnostics.init(this@FitSyncApp)
+                WebSessionManager.clearLegacyStravaApiCredentialsOnce(this@FitSyncApp)
+                runCatching {
+                    resources.getFont(R.font.misans_regular)
+                    resources.getFont(R.font.misans_medium)
+                    resources.getFont(R.font.misans_bold)
+                }
+            }
         } finally {
             Trace.endSection()
         }
@@ -139,10 +146,10 @@ class FitSyncApp : Application(), Configuration.Provider {
     fun onFirstFrame() {
         if (!firstFrameHandled.compareAndSet(false, true)) return
         applicationScope.launch {
-            // 自动同步开启时，冷启动不只补注册周期任务，还立即完成一次“拉取 + 规则投递”。
+            // 自动同步开启时，冷启动延迟 2 秒再执行自动拉取，避免与首屏渲染/切页抢占 CPU 与数据库。
             val autoSyncEnabled = runCatching { SyncScheduler.ensureScheduled(this@FitSyncApp) }
                 .getOrDefault(false)
-            if (autoSyncEnabled) SyncScheduler.enqueueAutoNow(this@FitSyncApp)
+            if (autoSyncEnabled) SyncScheduler.enqueueAutoNow(this@FitSyncApp, delayMs = 2_000L)
             MaintenanceScheduler.enqueue(this@FitSyncApp)
         }
     }

@@ -19,7 +19,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
@@ -45,42 +47,23 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.produceState
-import androidx.compose.runtime.withFrameNanos
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.ViewModelProvider
-import androidx.lifecycle.asFlow
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewModelScope
-import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.work.WorkInfo
-import androidx.work.WorkManager
-import com.fitsync.app.FitSyncApp
 import com.fitsync.app.connectors.ConnectorCapabilities
 import com.fitsync.app.connectors.PlatformCapabilityRegistry
-import com.fitsync.app.data.db.FitSyncDatabase
 import com.fitsync.app.data.db.entity.PlatformAccountEntity
-import com.fitsync.app.data.db.entity.AppSettingsEntity
-import com.fitsync.app.data.db.entity.DeliveryJobEntity
-import com.fitsync.app.data.db.entity.ImportJobEntity
-import com.fitsync.app.data.db.entity.SyncRuleEntity
 import com.fitsync.app.domain.model.AccountStatus
 import com.fitsync.app.domain.model.ConnectorExecution
 import com.fitsync.app.domain.model.ImportJobStatus
@@ -89,13 +72,13 @@ import com.fitsync.app.domain.model.SportType
 import com.fitsync.app.sync.BackgroundRunGuard
 import com.fitsync.app.sync.ManualSyncSelection
 import com.fitsync.app.sync.SyncScheduler
-import com.fitsync.app.sync.syncErrorMessage
-import com.fitsync.app.sync.toSyncWorkResult
 import com.fitsync.app.ui.components.EmptyStateVariant
 import com.fitsync.app.ui.components.FitCard
 import com.fitsync.app.ui.components.FitCardTone
 import com.fitsync.app.ui.components.FitEmptyState
 import com.fitsync.app.ui.components.FitListRow
+import com.fitsync.app.ui.components.FitRefreshBanner
+import com.fitsync.app.ui.components.FitSkeletonListRow
 import com.fitsync.app.ui.components.FitTopBar
 import com.fitsync.app.ui.components.HeroStatStrip
 import com.fitsync.app.ui.components.IconBadge
@@ -112,6 +95,10 @@ import com.fitsync.app.ui.components.accountStatusText
 import com.fitsync.app.ui.components.accountStatusTone
 import com.fitsync.app.ui.components.executionText
 import com.fitsync.app.ui.components.importStatusText
+import com.fitsync.app.ui.state.AppSharedUiViewModel
+import com.fitsync.app.ui.state.HomeStats
+import com.fitsync.app.ui.state.HomeUiViewModel
+import com.fitsync.app.ui.state.ManualSyncUiState
 import com.fitsync.app.ui.theme.FitGradients
 import com.fitsync.app.ui.theme.FitOrange
 import com.fitsync.app.ui.theme.FitShape
@@ -119,87 +106,82 @@ import com.fitsync.app.ui.theme.FitSpacing
 import com.fitsync.app.ui.theme.FitType
 import com.fitsync.app.ui.theme.fitHero
 import com.fitsync.app.web.PlatformWebActivity
-import java.text.SimpleDateFormat
-import java.util.Date
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Locale
-import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.SharingStarted
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 @Composable
 fun HomeScreen(
+    homeViewModel: HomeUiViewModel,
+    sharedViewModel: AppSharedUiViewModel,
+    listState: LazyListState = rememberLazyListState(),
     onOpenActivities: () -> Unit = {},
     onOpenJobs: (SyncJobFilter) -> Unit = {},
     onOpenPlatforms: () -> Unit = {},
 ) {
-    val db = FitSyncApp.instance.database
-    val context = LocalContext.current
-    val homeViewModel: HomeViewModel = viewModel(
-        factory = remember(db) { HomeViewModel.factory(db) },
-    )
     val homeState by homeViewModel.state.collectAsStateWithLifecycle()
+    val sharedState by sharedViewModel.state.collectAsStateWithLifecycle()
+    val isLoaded = homeState.isLoaded && sharedState.isLoaded
+
     val stats = homeState.stats
     val recentImports = homeState.recentImports
     val waitingJobs = homeState.waitingJobs
-    val accounts = homeState.accounts
-    val rules = homeState.rules
-    val settings = homeState.settings
-    val manualWorks by produceState(initialValue = emptyList<WorkInfo>(), context) {
-        // 至少让出一个渲染帧，WorkManager 的 SQLite/调度器初始化不进入首屏关键路径。
-        withFrameNanos { }
-        WorkManager.getInstance(context.applicationContext)
-            .getWorkInfosForUniqueWorkLiveData(SyncScheduler.MANUAL_NAME)
-            .asFlow()
-            .collect { value = it }
+    val accounts = sharedState.accounts
+    val rules = sharedState.rules
+    val settings = sharedState.settings
+    val syncState = sharedState.manualSyncState
+
+    val context = LocalContext.current
+    val dateFormat = remember {
+        DateTimeFormatter.ofPattern("MM-dd HH:mm", Locale.getDefault())
+            .withZone(ZoneId.systemDefault())
     }
-    val syncState = remember(manualWorks) { manualSyncUiState(manualWorks.lastOrNull()) }
-    val dateFormat = remember { SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()) }
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
-    val guard = remember(context) { BackgroundRunGuard(context.applicationContext) }
-    var resumeTick by remember { mutableIntStateOf(0) }
     var showManualSyncSheet by remember { mutableStateOf(false) }
-    val enabledRuleCount = rules.count { it.enabled }
-    val activeImportCount = recentImports.count {
-        it.status in setOf(
-            ImportJobStatus.RECEIVED,
-            ImportJobStatus.COPYING,
-            ImportJobStatus.VALIDATING,
-            ImportJobStatus.PARSING,
-            ImportJobStatus.DEDUPLICATING,
-        )
+
+    val enabledRuleCount = remember(rules) { rules.count { it.enabled } }
+    val activeImportCount = remember(recentImports) {
+        recentImports.count {
+            it.status in setOf(
+                ImportJobStatus.RECEIVED,
+                ImportJobStatus.COPYING,
+                ImportJobStatus.VALIDATING,
+                ImportJobStatus.PARSING,
+                ImportJobStatus.DEDUPLICATING,
+            )
+        }
     }
-    val duplicateImportCount = recentImports.count { it.status == ImportJobStatus.DUPLICATE_FILE }
-    val visibleRecentImports = recentImports.filterNot { it.status == ImportJobStatus.DUPLICATE_FILE }.take(6)
+    val duplicateImportCount = remember(recentImports) {
+        recentImports.count { it.status == ImportJobStatus.DUPLICATE_FILE }
+    }
+    val visibleRecentImports = remember(recentImports) {
+        recentImports.filterNot { it.status == ImportJobStatus.DUPLICATE_FILE }.take(6)
+    }
     val autoSyncEnabled = settings?.autoSyncEnabled != false
-    val backgroundStatus = remember(resumeTick, autoSyncEnabled) {
-        guard.evaluate(autoSyncEnabled)
-    }
-    val showRestrictionBanner = remember(resumeTick, backgroundStatus, autoSyncEnabled) {
+    val backgroundStatus = sharedState.backgroundStatus
+    val backgroundRestricted = backgroundStatus?.needsAttention == true
+    val showRestrictionBanner = isLoaded &&
         autoSyncEnabled &&
-            backgroundStatus.needsAttention &&
-            !guard.isBannerDismissedRecently()
-    }
+        backgroundRestricted &&
+        !sharedState.bannerDismissedRecently
+
     val lastSyncAt = remember(accounts) {
         accounts.mapNotNull { it.lastSyncAtEpochMs }.maxOrNull()
     }
-    val lastSyncLabel = lastSyncAt?.let { "上次同步 ${dateFormat.format(Date(it))}" }
-        ?: "尚未完成过自动同步"
-    val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) resumeTick++
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    val lastSyncLabel = when {
+        !isLoaded -> "正在读取状态…"
+        lastSyncAt != null -> "上次同步 ${dateFormat.format(Instant.ofEpochMilli(lastSyncAt))}"
+        else -> "尚未完成过自动同步"
     }
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
             FitTopBar(title = "概览", subtitle = "原始 FIT 只保存在本机")
             LazyColumn(
+                state = listState,
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(
                     start = FitSpacing.screenGutter,
@@ -209,10 +191,11 @@ fun HomeScreen(
                 ),
                 verticalArrangement = Arrangement.spacedBy(FitSpacing.md),
             ) {
-                item {
+                item(key = "hero") {
                     SyncHero(
+                        isLoaded = isLoaded,
                         autoSyncEnabled = autoSyncEnabled,
-                        backgroundRestricted = backgroundStatus.needsAttention,
+                        backgroundRestricted = backgroundRestricted,
                         lastSyncLabel = lastSyncLabel,
                         stats = stats,
                         waitingCount = waitingJobs.size,
@@ -221,8 +204,8 @@ fun HomeScreen(
                         onSync = { showManualSyncSheet = true },
                     )
                 }
-                if (showRestrictionBanner) {
-                    item {
+                if (showRestrictionBanner && backgroundStatus != null) {
+                    item(key = "restriction-banner") {
                         BackgroundRestrictionBanner(
                             summary = BackgroundRunGuard.oemSummary(backgroundStatus.brand),
                             notificationsMissing = !backgroundStatus.notificationsGranted,
@@ -231,28 +214,25 @@ fun HomeScreen(
                                     backgroundStatus.batteryOptimizationIgnored &&
                                     !backgroundStatus.isBackgroundRestricted
                                 ) {
-                                    guard.openNotificationSettings()
+                                    sharedViewModel.openNotificationSettings()
                                 } else {
-                                    guard.openBackgroundSettings(preferBatteryRequest = true)
+                                    sharedViewModel.openBackgroundSettings(preferBatteryRequest = true)
                                 }
-                                resumeTick++
                             },
-                            onDismiss = {
-                                guard.dismissBanner()
-                                resumeTick++
-                            },
+                            onDismiss = { sharedViewModel.dismissBackgroundBanner() },
                         )
                     }
                 }
-                item {
+                item(key = "stats") {
                     StatsPanel(
+                        isLoaded = isLoaded,
                         stats = stats,
                         onOpenActivities = onOpenActivities,
                         onOpenJobs = onOpenJobs,
                     )
                 }
                 if (waitingJobs.isNotEmpty()) {
-                    item {
+                    item(key = "waiting-header") {
                         SectionHeader(
                             title = "需要你处理",
                             subtitle = "登录、验证码或前台网页流程需要确认",
@@ -260,32 +240,33 @@ fun HomeScreen(
                         )
                     }
                     items(waitingJobs.take(4), key = { "waiting-${it.id}" }) { job ->
-                        val account = accounts.firstOrNull { it.id == job.destinationAccountId }
-                        val platform = account?.platform
+                        val platform = accounts.firstOrNull { it.id == job.destinationAccountId }?.platform
+                        val leadingAvatar: (@Composable () -> Unit)? = platform?.let { p ->
+                            { PlatformAvatar(p, 32.dp) }
+                        }
+                        val trailingAction: (@Composable () -> Unit)? = platform?.let { p ->
+                            {
+                                Button(onClick = {
+                                    context.startActivity(
+                                        PlatformWebActivity.createIntent(
+                                            context,
+                                            p,
+                                            job.id,
+                                            job.userActionUrl,
+                                        ),
+                                    )
+                                }) { Text(if (p == Platform.GARMIN) "登录" else "继续") }
+                            }
+                        }
                         FitListRow(
                             title = platform?.displayName ?: "未知平台",
                             subtitle = job.errorMessage ?: "请进入平台网页继续操作",
-                            leading = if (platform != null) {
-                                { PlatformAvatar(platform, 32.dp) }
-                            } else null,
-                            trailing = if (account != null && platform != null) {
-                                {
-                                    Button(onClick = {
-                                        context.startActivity(
-                                            PlatformWebActivity.createIntent(
-                                                context,
-                                                platform,
-                                                job.id,
-                                                job.userActionUrl,
-                                            ),
-                                        )
-                                    }) { Text(if (platform == Platform.GARMIN) "登录" else "继续") }
-                                }
-                            } else null,
+                            leading = leadingAvatar,
+                            trailing = trailingAction,
                         )
                     }
                 }
-                item {
+                item(key = "imports-header") {
                     SectionHeader(
                         title = "最近导入",
                         subtitle = if (stats.review > 0) "${stats.review} 条活动需要复核" else "从平台拉取或分享 FIT 后，记录会出现在这里",
@@ -294,8 +275,15 @@ fun HomeScreen(
                         } else null,
                     )
                 }
-                if (recentImports.isEmpty()) {
-                    item {
+                if (!isLoaded) {
+                    item(key = "imports-loading-banner") {
+                        FitRefreshBanner(message = "正在加载本地活动与导入记录…")
+                    }
+                    items(3, key = { "import-skeleton-$it" }) {
+                        FitSkeletonListRow()
+                    }
+                } else if (recentImports.isEmpty()) {
+                    item(key = "imports-empty") {
                         FitEmptyState(
                             title = "还没有活动",
                             body = "登录平台开始拉取，或从任意骑行 App 将 FIT 文件分享到这里。",
@@ -317,7 +305,7 @@ fun HomeScreen(
                     items(visibleRecentImports, key = { "import-${it.id}" }) { job ->
                         FitListRow(
                             title = job.displayName ?: "未命名 FIT",
-                            subtitle = dateFormat.format(Date(job.createdAtEpochMs)),
+                            subtitle = dateFormat.format(Instant.ofEpochMilli(job.createdAtEpochMs)),
                             leading = {
                                 IconBadge(
                                     Icons.Default.Description,
@@ -729,24 +717,25 @@ private fun manualSyncTypeLabel(sportTypes: Set<SportType>): String =
 
 @Composable
 private fun StatsPanel(
+    isLoaded: Boolean,
     stats: HomeStats,
     onOpenActivities: () -> Unit,
     onOpenJobs: (SyncJobFilter) -> Unit,
 ) {
     val tiles = listOf(
-        StatTileSpec("discovered", stats.discovered.toString(), "本地活动"),
-        StatTileSpec("synced", stats.synced.toString(), "成功投递"),
+        StatTileSpec("discovered", if (isLoaded) stats.discovered.toString() else "--", "本地活动"),
+        StatTileSpec("synced", if (isLoaded) stats.synced.toString() else "--", "成功投递"),
         StatTileSpec(
             "pending",
-            stats.pending.toString(),
+            if (isLoaded) stats.pending.toString() else "--",
             "等待任务",
-            tone = if (stats.pending > 0) StatTone.Warning else StatTone.Default,
+            tone = if (isLoaded && stats.pending > 0) StatTone.Warning else StatTone.Default,
         ),
         StatTileSpec(
             "failed",
-            stats.failed.toString(),
+            if (isLoaded) stats.failed.toString() else "--",
             "同步失败",
-            tone = if (stats.failed > 0) StatTone.Error else StatTone.Default,
+            tone = if (isLoaded && stats.failed > 0) StatTone.Error else StatTone.Default,
         ),
     )
     StatGrid(
@@ -812,6 +801,7 @@ private fun BackgroundRestrictionBanner(
 
 @Composable
 private fun SyncHero(
+    isLoaded: Boolean,
     autoSyncEnabled: Boolean,
     backgroundRestricted: Boolean,
     lastSyncLabel: String,
@@ -822,20 +812,27 @@ private fun SyncHero(
     onSync: () -> Unit,
 ) {
     val statusText = when {
+        !isLoaded -> "正在检查同步状态…"
         !autoSyncEnabled -> "手动同步"
         backgroundRestricted -> "自动同步需要检查"
         enabledRuleCount > 0 -> "自动同步正常"
         else -> "自动同步已开启"
     }
     val statusColor = when {
+        !isLoaded -> FitGradients.onHeroSecondary
         !autoSyncEnabled -> FitGradients.onHeroSecondary
         backgroundRestricted -> FitOrange
         enabledRuleCount > 0 -> MaterialTheme.colorScheme.secondary
         else -> FitOrange
     }
-    // 首帧不播放滚动动画，避免从 0 滚到初始值。
+    // 首屏数据首次到达时直接 snap 到真实值，避免从 0 滚到初始值；后续增量同步才播数字动画。
     var animateStarted by remember { mutableStateOf(false) }
-    LaunchedEffect(Unit) { animateStarted = true }
+    LaunchedEffect(isLoaded) {
+        if (isLoaded && !animateStarted) {
+            withFrameNanos { }
+            animateStarted = true
+        }
+    }
     val animatedCount by animateIntAsState(
         targetValue = stats.discovered,
         animationSpec = if (animateStarted) tween(durationMillis = 600) else snap(),
@@ -854,7 +851,7 @@ private fun SyncHero(
                 Box(Modifier.size(8.dp).clip(CircleShape).background(statusColor))
                 Text(statusText, style = MaterialTheme.typography.titleMedium)
                 Spacer(Modifier.weight(1f))
-                if (waitingCount > 0) {
+                if (isLoaded && waitingCount > 0) {
                     StatusPill("待处理 $waitingCount", StatusTone.WARNING)
                 }
             }
@@ -865,14 +862,14 @@ private fun SyncHero(
                 color = FitGradients.onHeroSecondary,
             )
             Text(
-                "%,d".format(animatedCount),
+                if (isLoaded) "%,d".format(animatedCount) else "--",
                 style = FitType.numericHero,
             )
             HeroStatStrip(
                 stats = listOf(
-                    StatTileSpec("synced", "%,d".format(stats.synced), "已同步"),
-                    StatTileSpec("pending", stats.pending.toString(), "待处理"),
-                    StatTileSpec("failed", stats.failed.toString(), "失败"),
+                    StatTileSpec("synced", if (isLoaded) "%,d".format(stats.synced) else "--", "已同步"),
+                    StatTileSpec("pending", if (isLoaded) stats.pending.toString() else "--", "待处理"),
+                    StatTileSpec("failed", if (isLoaded) stats.failed.toString() else "--", "失败"),
                 ),
                 modifier = Modifier.padding(top = FitSpacing.sm),
             )
@@ -882,7 +879,7 @@ private fun SyncHero(
             ) {
                 Button(
                     onClick = onSync,
-                    enabled = !syncState.isActive,
+                    enabled = isLoaded && !syncState.isActive,
                     modifier = Modifier.height(44.dp),
                 ) {
                     if (syncState.isActive) {
@@ -895,9 +892,10 @@ private fun SyncHero(
                         Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(FitSpacing.iconSm))
                     }
                     Text(
-                        when (syncState) {
-                            ManualSyncUiState.Running -> "正在后台同步"
-                            is ManualSyncUiState.Queued -> "等待后台执行"
+                        when {
+                            !isLoaded -> "正在加载…"
+                            syncState is ManualSyncUiState.Running -> "正在后台同步"
+                            syncState is ManualSyncUiState.Queued -> "等待后台执行"
                             else -> "立即同步"
                         },
                         modifier = Modifier.padding(start = FitSpacing.sm),
@@ -929,91 +927,9 @@ private fun SyncHero(
     }
 }
 
-private sealed class ManualSyncUiState(val isActive: Boolean) {
-    data object Idle : ManualSyncUiState(false)
-    data class Queued(val message: String) : ManualSyncUiState(true)
-    data object Running : ManualSyncUiState(true)
-    data class Finished(val message: String) : ManualSyncUiState(false)
-    data class Failed(val message: String) : ManualSyncUiState(false)
-}
-
-private fun manualSyncUiState(workInfo: WorkInfo?): ManualSyncUiState = when (workInfo?.state) {
-    null -> ManualSyncUiState.Idle
-    WorkInfo.State.ENQUEUED, WorkInfo.State.BLOCKED -> ManualSyncUiState.Queued(
-        if (workInfo.runAttemptCount > 0) "同步暂时未完成，等待系统重试" else "已进入后台同步队列，等待网络条件",
-    )
-    WorkInfo.State.RUNNING -> ManualSyncUiState.Running
-    WorkInfo.State.SUCCEEDED -> ManualSyncUiState.Finished(
-        workInfo.outputData.toSyncWorkResult()?.userMessage() ?: "上次同步已完成",
-    )
-    WorkInfo.State.FAILED -> ManualSyncUiState.Failed(
-        workInfo.outputData.syncErrorMessage()?.let { "同步失败：$it" } ?: "同步失败，请稍后重试",
-    )
-    WorkInfo.State.CANCELLED -> ManualSyncUiState.Failed("同步已取消，可重新发起")
-}
-
 private fun importTone(status: ImportJobStatus): StatusTone = when (status) {
     ImportJobStatus.READY, ImportJobStatus.DUPLICATE_FILE -> StatusTone.SUCCESS
     ImportJobStatus.INVALID -> StatusTone.ERROR
     ImportJobStatus.NEEDS_REVIEW -> StatusTone.WARNING
     else -> StatusTone.INFO
 }
-
-private class HomeViewModel(db: FitSyncDatabase) : ViewModel() {
-    private val content = combine(
-        db.canonicalActivityDao().observeHomeSnapshot(),
-        db.importJobDao().observeRecent(5),
-        db.deliveryJobDao().observeWaitingForUser(4),
-        db.platformAccountDao().observeAll(),
-        db.syncRuleDao().observeAll(),
-    ) { snapshot, imports, waiting, accounts, rules ->
-        HomeUiState(
-            stats = HomeStats(
-                discovered = snapshot.discovered,
-                synced = snapshot.synced,
-                pending = snapshot.pending,
-                review = snapshot.review,
-                failed = snapshot.failed,
-            ),
-            recentImports = imports,
-            waitingJobs = waiting,
-            accounts = accounts,
-            rules = rules,
-        )
-    }
-
-    val state: StateFlow<HomeUiState> = combine(
-        content,
-        db.appSettingsDao().observe(),
-    ) { contentState, settings ->
-        contentState.copy(settings = settings)
-    }.stateIn(
-        scope = viewModelScope,
-        started = SharingStarted.WhileSubscribed(5_000),
-        initialValue = HomeUiState(),
-    )
-
-    companion object {
-        fun factory(db: FitSyncDatabase): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
-            @Suppress("UNCHECKED_CAST")
-            override fun <T : ViewModel> create(modelClass: Class<T>): T = HomeViewModel(db) as T
-        }
-    }
-}
-
-private data class HomeUiState(
-    val stats: HomeStats = HomeStats(),
-    val recentImports: List<ImportJobEntity> = emptyList(),
-    val waitingJobs: List<DeliveryJobEntity> = emptyList(),
-    val accounts: List<PlatformAccountEntity> = emptyList(),
-    val rules: List<SyncRuleEntity> = emptyList(),
-    val settings: AppSettingsEntity? = null,
-)
-
-private data class HomeStats(
-    val discovered: Int = 0,
-    val synced: Int = 0,
-    val pending: Int = 0,
-    val review: Int = 0,
-    val failed: Int = 0,
-)

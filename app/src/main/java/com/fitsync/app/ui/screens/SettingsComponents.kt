@@ -273,9 +273,12 @@ internal fun GarminDiagnosticsCard() {
     }
 }
 
+private val garminDiagTimeFormatter = java.time.format.DateTimeFormatter
+    .ofPattern("MM-dd HH:mm:ss", java.util.Locale.US)
+    .withZone(java.time.ZoneId.systemDefault())
+
 private fun formatGarminDiagEvent(ev: GarminAuthDiagnostics.Event): String {
-    val time = java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US)
-        .format(java.util.Date(ev.timestampEpochMs))
+    val time = garminDiagTimeFormatter.format(java.time.Instant.ofEpochMilli(ev.timestampEpochMs))
     val code = ev.httpCode?.let { " code=$it" }.orEmpty()
     val src = ev.cookieSource.takeIf { it.isNotBlank() }?.let { " src=$it" }.orEmpty()
     val jwt = if (ev.setCookieHasJwtWeb) " setCookie=JWT" else ""
