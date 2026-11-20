@@ -178,6 +178,17 @@ public class StravaOAuthService {
 
     Session session = exchanged.value();
     String displayName = session.attribute("displayName");
+    // 先用令牌做一次只读校验：若 Strava 立刻拒绝，就把真实原因告知用户，不落地一个连上即失效的账号。
+    ConnectorResult<String> probe = connector.verifyOAuthAccess(session);
+    if (probe.status() == ConnectorResult.Status.REQUIRES_LOGIN) {
+      String msg =
+          probe.message() == null || probe.message().isBlank()
+              ? "Strava 已授权，但接口拒绝了访问令牌，请重新连接"
+              : probe.message();
+      if (msg.length() > 200) msg = msg.substring(0, 200);
+      mark(id, "FAILED", msg);
+      return new CallbackOutcome(false, msg, returnUrl);
+    }
     try {
       accounts.persistOAuth(userId, "STRAVA", displayName, session);
     } catch (ApiException e) {

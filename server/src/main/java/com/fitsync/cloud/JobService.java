@@ -16,9 +16,12 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @Service
 public class JobService {
+  private static final Logger LOG = LoggerFactory.getLogger(JobService.class);
   private final CloudStore store;
   private final ActivityService activities;
   private final AccountService accounts;
@@ -27,12 +30,18 @@ public class JobService {
   private final String worker = CloudStore.id();
   private final TransactionTemplate enqueueTransaction;
   private final ExecutorService pullExecutor;
+  private final ExecutorService reconcileExecutor;
+  private final ConcurrentHashMap<String, Long> reconcileCooldowns = new ConcurrentHashMap<>();
   private static final long LEASE = Duration.ofMinutes(15).toMillis();
   private static final int MAX_PULL_PAGES = 20;
   private static final int MAX_CONFIRM_LOOKUP_PAGES = 15;
   private static final int MAX_CONFIRM_DOWNLOADS = 10;
+  private static final int MAX_RECONCILE_PAGES = 10;
+  private static final long RECONCILE_COOLDOWN_MS = Duration.ofMinutes(5).toMillis();
+  private static final long RECONCILE_ACTIVE_JOB_COOLDOWN_MS = 15_000L;
   private static final long CONFIRM_START_TOLERANCE_MS = 2 * 60_000L;
   private static final long CONFIRM_DOWNLOAD_START_TOLERANCE_MS = 15 * 60_000L;
+  private static final long CONFIRM_DATE_ONLY_START_TOLERANCE_MS = 36 * 60 * 60_000L;
   private static final double CONFIRM_DISTANCE_TOLERANCE_METERS = 100.0;
   private static final double CONFIRM_DISTANCE_TOLERANCE_RATIO = 0.005;
   private static final Set<String> PERMANENT_REMOTE_SKIP_CODES =
@@ -67,11 +76,22 @@ public class JobService {
                   return t;
                 })
             : null;
+    this.reconcileExecutor =
+        enabled
+            ? Executors.newFixedThreadPool(
+                4,
+                r -> {
+                  Thread t = new Thread(r, "fitsync-reconcile");
+                  t.setDaemon(true);
+                  return t;
+                })
+            : null;
   }
 
   @PreDestroy
   public void shutdown() {
     if (pullExecutor != null) pullExecutor.shutdownNow();
+    if (reconcileExecutor != null) reconcileExecutor.shutdownNow();
   }
 
   public List<Map<String, Object>> rules(String user) {
@@ -541,12 +561,27 @@ public class JobService {
       }
     }
     if (selected && destinations.isEmpty()) throw ApiException.bad("请选择目标账号");
+    int pullDays = historyDays;
+    if (selected && !activityIds.isEmpty()) {
+      long earliestStart = Long.MAX_VALUE;
+      for (String aid : activityIds) {
+        var row = store.owned("activity", aid, user);
+        if (row.get("start_time") instanceof Number n && n.longValue() > 0 && n.longValue() < earliestStart) {
+          earliestStart = n.longValue();
+        }
+      }
+      if (earliestStart != Long.MAX_VALUE) {
+        long ageDays =
+            Math.max(0L, (System.currentTimeMillis() - earliestStart) / Duration.ofDays(1).toMillis());
+        pullDays = (int) Math.min(365L, Math.max(historyDays, ageDays + 2L));
+      }
+    }
     List<String> ids = new ArrayList<>();
     List<String> pullIds = new ArrayList<>();
     // 目标预拉取先入队；所有拉取完成前不投递，减少跨平台循环。对纯 OAuth 不可导出原文件的目标跳过以节省 API 配额。
     for (String target : destinations) {
       if (!shouldSkipPull(user, target)) {
-        String pullId = pull(user, target, historyDays, List.of(), null, null);
+        String pullId = pull(user, target, pullDays, List.of(), null, null);
         ids.add(pullId);
         pullIds.add(pullId);
       }
@@ -644,8 +679,12 @@ public class JobService {
 
   private String delivery(String user, String activityId, String accountId, String ruleId) {
     var activity = store.owned("activity", activityId, user);
-    store.owned("platform_account", accountId, user);
+    var account = store.owned("platform_account", accountId, user);
     if (Boolean.TRUE.equals(activity.get("needs_review"))) return null;
+    if (!SportTypes.platformAccepts(
+        CloudStore.str(account, "platform"), CloudStore.str(activity, "sport_type"))) {
+      return null;
+    }
     if (store.db.queryForObject(
             "SELECT COUNT(*) FROM platform_copy WHERE user_id=? AND activity_id=? AND account_id=?",
             Integer.class,
@@ -976,7 +1015,7 @@ public class JobService {
       pages++;
       var remotes = result.value().items();
       fetched += remotes.size();
-      reconcileConfirmingFromRemotes(user, accountId, remotes);
+      reconcileConfirmingFromRemotes(user, accountId, platform, remotes);
       Set<String> knownRemoteIds = findKnownRemoteIds(user, accountId, remotes);
 
       for (var remote : remotes) {
@@ -989,6 +1028,7 @@ public class JobService {
         }
         var downloaded = connector.downloadFit(session, remote);
         if (downloaded.status() == ConnectorResult.Status.PERMANENT_FAILURE) {
+          reconcileMissingFitRemote(user, accountId, platform, remote);
           skippedNoFit++;
           String code = downloaded.code();
           if (code == null || PERMANENT_REMOTE_SKIP_CODES.contains(code)) {
@@ -1279,7 +1319,13 @@ public class JobService {
       Session session) {
     String user = CloudStore.str(job, "user_id"),
         activity = CloudStore.str(job, "activity_id"),
-        accountId = CloudStore.str(account, "id");
+        accountId = CloudStore.str(account, "id"),
+        platform = CloudStore.str(account, "platform");
+    if (!SportTypes.platformAccepts(
+        platform, CloudStore.str(store.owned("activity", activity, user), "sport_type"))) {
+      finish(job, "CANCELLED", "该平台仅支持骑行，已取消投递", 0);
+      return;
+    }
     var payload = store.decode(CloudStore.str(job, "payload_json"));
     if (payload.get("ruleId") != null
         && job.get("confirmation_json") == null
@@ -1318,10 +1364,34 @@ public class JobService {
                   && "CONFIRMATION_REQUIRED".equals(result.code())))
           && !connector.skipPullAsDestination(session)) {
         ConnectorResult<UploadResult> reconciled =
-            confirmByActivityLookup(user, job, accountId, connector, session);
+            confirmByActivityLookup(user, job, accountId, platform, connector, session);
         if (reconciled != null) result = reconciled;
       }
+      LOG.info(
+          "投递确认检查 job={} 平台={} 结果={}{}",
+          job.get("id"),
+          platform,
+          result == null ? "未知" : result.status(),
+          result == null || result.message() == null ? "" : "：" + result.message());
     } else {
+      if (connector.skipPullAsDestination(session)) {
+        ConfirmCandidate candidate = loadConfirmCandidateForActivity(user, activity);
+        ConnectorResult<RemoteActivity> preCheck =
+            lookupExistingRemoteForCandidate(
+                user, accountId, platform, candidate, connector, session, MAX_RECONCILE_PAGES);
+        if (preCheck != null && preCheck.status() == ConnectorResult.Status.REQUIRES_LOGIN) {
+          applyFailure(job, preCheck);
+          return;
+        }
+        if (preCheck != null
+            && preCheck.status() == ConnectorResult.Status.SUCCESS
+            && preCheck.value() != null
+            && preCheck.value().remoteActivityId() != null) {
+          activities.mapCopy(user, activity, accountId, preCheck.value().remoteActivityId());
+          finish(job, "SUCCEEDED", "目标平台已存在该活动", 0);
+          return;
+        }
+      }
       // 在任何远端 POST 前持久化不确定标记；进程崩溃后只能核对，不得重传。
       if (store.db.update(
               "UPDATE sync_job SET confirmation_json='UPLOAD_STARTED' WHERE id=? AND lease_owner=?",
@@ -1345,11 +1415,28 @@ public class JobService {
     }
     if (result.status() == ConnectorResult.Status.SUCCESS
         || result.status() == ConnectorResult.Status.DUPLICATE) {
-      if (result.value() == null || result.value().remoteActivityId() == null) {
+      String remoteId = result.value() == null ? null : result.value().remoteActivityId();
+      if (remoteId == null || remoteId.isBlank()) {
+        ConfirmCandidate candidate = loadConfirmCandidateForActivity(user, activity);
+        ConnectorResult<RemoteActivity> postCheck =
+            lookupExistingRemoteForCandidate(
+                user, accountId, platform, candidate, connector, session, MAX_RECONCILE_PAGES);
+        if (postCheck != null && postCheck.status() == ConnectorResult.Status.REQUIRES_LOGIN) {
+          applyFailure(job, postCheck);
+          return;
+        }
+        if (postCheck != null
+            && postCheck.status() == ConnectorResult.Status.SUCCESS
+            && postCheck.value() != null
+            && postCheck.value().remoteActivityId() != null) {
+          activities.mapCopy(user, activity, accountId, postCheck.value().remoteActivityId());
+          finish(job, "SUCCEEDED", "目标平台已存在该活动", 0);
+          return;
+        }
         finish(job, "WAITING_USER", "平台未返回真实活动编号，请核对上传结果", 0);
         return;
       }
-      activities.mapCopy(user, activity, accountId, result.value().remoteActivityId());
+      activities.mapCopy(user, activity, accountId, remoteId);
       finish(job, "SUCCEEDED", "活动已在目标平台确认", 0);
     } else applyFailure(job, result);
   }
@@ -1371,12 +1458,20 @@ public class JobService {
             job.get("id"),
             worker);
     }
-    if (result.status() == ConnectorResult.Status.REQUIRES_LOGIN)
+    if (result.status() == ConnectorResult.Status.REQUIRES_LOGIN) {
+      // 保留连接器给出的真实原因（如 Strava 缺权限/令牌被拒），而不是笼统的"登录已失效"。
+      String reason =
+          result.message() == null || result.message().isBlank()
+              ? "登录已失效，请重新连接"
+              : result.message();
+      if (reason.length() > 280) reason = reason.substring(0, 280);
       store.db.update(
-          "UPDATE platform_account SET status='AUTH_EXPIRED',last_error='登录已失效，请重新连接' WHERE id=?"
+          "UPDATE platform_account SET status='AUTH_EXPIRED',last_error=? WHERE id=?"
               + " AND user_id=?",
+          reason,
           job.get("account_id"),
           job.get("user_id"));
+    }
     finish(
         job,
         state,
@@ -1419,7 +1514,8 @@ public class JobService {
     store.db.update(
         "UPDATE sync_job SET status='SUCCEEDED',message=?,next_run_at=?,updated_at=? WHERE"
             + " user_id=? AND account_id=? AND activity_id=? AND kind='DELIVERY' AND"
-            + " status='CONFIRMING' AND lease_owner IS NULL",
+            + " status IN ('PENDING','RETRY','CONFIRMING','WAITING_USER','FAILED') AND"
+            + " lease_owner IS NULL",
         "目标平台已存在该活动",
         now,
         now,
@@ -1428,8 +1524,334 @@ public class JobService {
         activityId);
   }
 
+  public Map<String, Object> reconcileActivityPlatforms(
+      String user, String activityId, boolean force) {
+    var activity = store.owned("activity", activityId, user);
+    if (Boolean.TRUE.equals(activity.get("needs_review"))) {
+      return Map.of(
+          "checkedCount", 0,
+          "matchedCount", 0,
+          "skippedByCooldown", false,
+          "results", List.of());
+    }
+    List<Map<String, Object>> pendingAccounts =
+        store.db.queryForList(
+            "SELECT a.* FROM platform_account a WHERE a.user_id=? AND a.status='CONNECTED' AND"
+                + " NOT EXISTS (SELECT 1 FROM platform_copy p WHERE p.user_id=a.user_id AND"
+                + " p.activity_id=? AND p.account_id=a.id) ORDER BY a.platform",
+            user,
+            activityId);
+    if (pendingAccounts.isEmpty()) {
+      return Map.of(
+          "checkedCount", 0,
+          "matchedCount", 0,
+          "skippedByCooldown", false,
+          "results", List.of());
+    }
+    String cooldownKey = user + ":" + activityId;
+    long now = System.currentTimeMillis();
+    if (!force) {
+      boolean hasActiveDelivery =
+          store.db.queryForObject(
+                  "SELECT COUNT(*) FROM sync_job WHERE user_id=? AND activity_id=? AND"
+                      + " kind='DELIVERY' AND status IN"
+                      + " ('PENDING','RETRY','CONFIRMING','RUNNING')",
+                  Integer.class,
+                  user,
+                  activityId)
+              > 0;
+      long cooldownMs =
+          hasActiveDelivery ? RECONCILE_ACTIVE_JOB_COOLDOWN_MS : RECONCILE_COOLDOWN_MS;
+      Long lastChecked = reconcileCooldowns.get(cooldownKey);
+      if (lastChecked != null && now - lastChecked < cooldownMs) {
+        return Map.of(
+            "checkedCount", 0,
+            "matchedCount", 0,
+            "skippedByCooldown", true,
+            "results", List.of());
+      }
+    }
+    if (reconcileCooldowns.size() > 2000) {
+      reconcileCooldowns.entrySet().removeIf(e -> now - e.getValue() > RECONCILE_COOLDOWN_MS);
+      if (reconcileCooldowns.size() > 2000) reconcileCooldowns.clear();
+    }
+    reconcileCooldowns.put(cooldownKey, now);
+
+    ConfirmCandidate candidate = loadConfirmCandidateForActivity(user, activityId);
+    if (candidate == null) {
+      return Map.of(
+          "checkedCount", 0,
+          "matchedCount", 0,
+          "skippedByCooldown", false,
+          "results", List.of());
+    }
+
+    List<Map<String, Object>> results = new ArrayList<>(pendingAccounts.size());
+    if (reconcileExecutor == null || pendingAccounts.size() <= 1) {
+      for (var account : pendingAccounts) {
+        results.add(reconcileSingleAccountForActivity(user, activityId, candidate, account));
+      }
+    } else {
+      List<Future<Map<String, Object>>> futures = new ArrayList<>(pendingAccounts.size());
+      for (var account : pendingAccounts) {
+        futures.add(
+            reconcileExecutor.submit(
+                () -> reconcileSingleAccountForActivity(user, activityId, candidate, account)));
+      }
+      long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(25);
+      for (int i = 0; i < pendingAccounts.size(); i++) {
+        var account = pendingAccounts.get(i);
+        Future<Map<String, Object>> future = futures.get(i);
+        long remainMs = Math.max(1L, TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime()));
+        try {
+          results.add(future.get(remainMs, TimeUnit.MILLISECONDS));
+        } catch (TimeoutException timeout) {
+          future.cancel(true);
+          results.add(
+              reconcileResultItem(
+                  CloudStore.str(account, "id"),
+                  CloudStore.str(account, "platform"),
+                  "TIMEOUT",
+                  null,
+                  "检测超时，请稍后再试"));
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          future.cancel(true);
+          results.add(
+              reconcileResultItem(
+                  CloudStore.str(account, "id"),
+                  CloudStore.str(account, "platform"),
+                  "FAILED",
+                  null,
+                  "检测被中断"));
+        } catch (ExecutionException exec) {
+          results.add(
+              reconcileResultItem(
+                  CloudStore.str(account, "id"),
+                  CloudStore.str(account, "platform"),
+                  "FAILED",
+                  null,
+                  "检测平台活动失败"));
+        }
+      }
+    }
+
+    int checkedCount = 0;
+    int matchedCount = 0;
+    for (var item : results) {
+      Object status = item.get("status");
+      if (!"BUSY".equals(status) && !"TIMEOUT".equals(status)) checkedCount++;
+      if ("MATCHED".equals(status)) matchedCount++;
+    }
+    return Map.of(
+        "checkedCount", checkedCount,
+        "matchedCount", matchedCount,
+        "skippedByCooldown", false,
+        "results", results);
+  }
+
+  private Map<String, Object> reconcileSingleAccountForActivity(
+      String user, String activityId, ConfirmCandidate candidate, Map<String, Object> account) {
+    String accountId = CloudStore.str(account, "id");
+    String platform = CloudStore.str(account, "platform");
+    if (!claimAccount(accountId, System.currentTimeMillis())) {
+      return reconcileResultItem(accountId, platform, "BUSY", null, "账号正在同步中，稍后再试");
+    }
+    try {
+      Session session = accounts.session(account);
+      PlatformConnector connector = accounts.connector(platform);
+      try {
+        ConnectorResult<RemoteActivity> lookup =
+            lookupExistingRemoteForCandidate(
+                user, accountId, platform, candidate, connector, session, MAX_RECONCILE_PAGES);
+        if (lookup == null) {
+          return reconcileResultItem(accountId, platform, "FAILED", null, "检查平台活动失败");
+        }
+        if (lookup.status() == ConnectorResult.Status.REQUIRES_LOGIN) {
+          String err =
+              lookup.message() == null || lookup.message().isBlank()
+                  ? "登录状态已失效，请重新连接"
+                  : lookup.message();
+          store.db.update(
+              "UPDATE platform_account SET status='AUTH_EXPIRED',last_error=? WHERE id=? AND"
+                  + " user_id=?",
+              err,
+              accountId,
+              user);
+          return reconcileResultItem(accountId, platform, "AUTH_EXPIRED", null, err);
+        }
+        if (lookup.status() == ConnectorResult.Status.SUCCESS && lookup.value() != null) {
+          String remoteId = lookup.value().remoteActivityId();
+          activities.mapCopy(user, activityId, accountId, remoteId);
+          markDeliveryConfirmedForActivity(user, activityId, accountId);
+          return reconcileResultItem(
+              accountId, platform, "MATCHED", remoteId, "已在目标平台找到该活动");
+        }
+        if (lookup.status() == ConnectorResult.Status.SUCCESS) {
+          return reconcileResultItem(
+              accountId, platform, "NOT_FOUND", null, "目标平台暂未找到该活动");
+        }
+        return reconcileResultItem(
+            accountId,
+            platform,
+            "FAILED",
+            null,
+            lookup.message() == null || lookup.message().isBlank()
+                ? "检查平台活动失败"
+                : lookup.message());
+      } finally {
+        accounts.saveSession(account, session);
+      }
+    } catch (Exception e) {
+      return reconcileResultItem(accountId, platform, "FAILED", null, "检查平台活动失败");
+    } finally {
+      release(accountId);
+    }
+  }
+
+  private static Map<String, Object> reconcileResultItem(
+      String accountId, String platform, String status, String remoteActivityId, String message) {
+    Map<String, Object> item = new LinkedHashMap<>();
+    item.put("accountId", accountId);
+    item.put("platform", platform);
+    item.put("status", status);
+    if (remoteActivityId != null) item.put("remoteActivityId", remoteActivityId);
+    if (message != null) item.put("message", message);
+    return item;
+  }
+
+  private ConnectorResult<RemoteActivity> lookupExistingRemoteForCandidate(
+      String user,
+      String accountId,
+      String platform,
+      ConfirmCandidate candidate,
+      PlatformConnector connector,
+      Session session,
+      int maxPages) {
+    if (candidate == null) return ConnectorResult.success(null);
+    Set<String> claimedRemoteIds = loadClaimedRemoteIds(user, accountId);
+    Long start = candidate.startTimeEpochMs();
+    long sinceEpochMs =
+        start == null ? 0L : Math.max(0L, start - Duration.ofDays(2).toMillis());
+    long stopBeforeEpochMs = start == null ? 0L : start - Duration.ofDays(2).toMillis();
+
+    List<RemoteActivity> collectedRemotes = new ArrayList<>();
+    Set<String> seenRemoteIds = new HashSet<>();
+    List<ConfirmCandidate> singleCandidate = List.of(candidate);
+    String cursor = null;
+    int consecutiveOlderPages = 0;
+
+    for (int page = 0; page < maxPages; page++) {
+      ConnectorResult<ActivityPage> pageResult =
+          connector.listActivities(session, sinceEpochMs, cursor);
+      if (pageResult == null) break;
+      if (pageResult.status() == ConnectorResult.Status.REQUIRES_LOGIN) {
+        return pageResult.castFailure();
+      }
+      if (pageResult.status() != ConnectorResult.Status.SUCCESS || pageResult.value() == null) {
+        if (page == 0) return pageResult.castFailure();
+        break;
+      }
+      List<RemoteActivity> items = pageResult.value().items();
+      if (items == null || items.isEmpty()) break;
+
+      boolean allOlderThanWindow = start != null;
+      for (RemoteActivity remote : items) {
+        if (remote == null || remote.remoteActivityId() == null) continue;
+        Long rs = remote.startTimeEpochMs();
+        if (rs == null || rs >= stopBeforeEpochMs) {
+          allOlderThanWindow = false;
+        }
+        if (!claimedRemoteIds.contains(remote.remoteActivityId())
+            && seenRemoteIds.add(remote.remoteActivityId())) {
+          collectedRemotes.add(remote);
+        }
+      }
+
+      List<ConfirmMatch> stage1 =
+          findHighConfidencePendingMatches(platform, collectedRemotes, singleCandidate);
+      if (!stage1.isEmpty()) {
+        return ConnectorResult.success(stage1.getFirst().remote());
+      }
+
+      consecutiveOlderPages = allOlderThanWindow ? consecutiveOlderPages + 1 : 0;
+      if (consecutiveOlderPages >= 2) break;
+
+      String nextCursor = pageResult.value().nextCursor();
+      if (!pageResult.value().hasMore()
+          || nextCursor == null
+          || Objects.equals(cursor, nextCursor)) {
+        break;
+      }
+      cursor = nextCursor;
+    }
+
+    if (!collectedRemotes.isEmpty() && !connector.skipPullAsDestination(session)) {
+      ConnectorResult<List<ConfirmMatch>> stage2 =
+          matchByDownloadedFit(user, collectedRemotes, singleCandidate, connector, session);
+      if (stage2.status() == ConnectorResult.Status.REQUIRES_LOGIN) {
+        return stage2.castFailure();
+      }
+      if (stage2.status() == ConnectorResult.Status.SUCCESS
+          && stage2.value() != null
+          && !stage2.value().isEmpty()) {
+        return ConnectorResult.success(stage2.value().getFirst().remote());
+      }
+    }
+    return ConnectorResult.success(null);
+  }
+
+  private void reconcileMissingFitRemote(
+      String user, String accountId, String platform, RemoteActivity remote) {
+    if (remote == null
+        || remote.remoteActivityId() == null
+        || remote.remoteActivityId().isBlank()
+        || remote.startTimeEpochMs() == null
+        || isDateOnlyStartTime(remote)) {
+      return;
+    }
+    String remoteId = remote.remoteActivityId();
+    if (store.db.queryForObject(
+            "SELECT COUNT(*) FROM platform_copy WHERE user_id=? AND account_id=? AND remote_id=?",
+            Integer.class,
+            user,
+            accountId,
+            remoteId)
+        > 0) {
+      return;
+    }
+    long windowStart = remote.startTimeEpochMs() - CONFIRM_START_TOLERANCE_MS;
+    long windowEnd = remote.startTimeEpochMs() + CONFIRM_START_TOLERANCE_MS;
+    var rows =
+        store.db.queryForList(
+            "SELECT a.id AS activity_id,a.title,a.start_time,a.distance_meters,a.elapsed_seconds,"
+                + "a.moving_seconds,a.sport_type,a.primary_variant_id,v.sha256 AS"
+                + " primary_sha256 FROM activity a LEFT JOIN activity_variant v ON"
+                + " v.id=a.primary_variant_id AND v.user_id=a.user_id WHERE a.user_id=? AND"
+                + " a.needs_review=FALSE AND a.start_time>=? AND a.start_time<=? AND NOT EXISTS"
+                + " (SELECT 1 FROM platform_copy p WHERE p.user_id=a.user_id AND"
+                + " p.activity_id=a.id AND p.account_id=?)",
+            user,
+            windowStart,
+            windowEnd,
+            accountId);
+    if (rows.isEmpty()) return;
+    List<ConfirmCandidate> candidates = new ArrayList<>(rows.size());
+    for (var row : rows) {
+      String aid = CloudStore.str(row, "activity_id");
+      if (aid != null) candidates.add(toConfirmCandidate("missing-fit-" + aid, aid, null, null, row));
+    }
+    List<ConfirmMatch> matches =
+        findHighConfidencePendingMatches(platform, List.of(remote), candidates);
+    if (matches.size() == 1) {
+      String activityId = matches.getFirst().candidate().activityId();
+      activities.mapCopy(user, activityId, accountId, remoteId);
+      markDeliveryConfirmedForActivity(user, activityId, accountId);
+    }
+  }
+
   private void reconcileConfirmingFromRemotes(
-      String user, String accountId, List<RemoteActivity> remotes) {
+      String user, String accountId, String platform, List<RemoteActivity> remotes) {
     if (remotes == null || remotes.isEmpty()) return;
     List<ConfirmCandidate> candidates = loadConfirmCandidates(user, accountId, null);
     if (candidates.isEmpty()) return;
@@ -1439,7 +1861,7 @@ public class JobService {
             .filter(r -> r != null && r.remoteActivityId() != null && !claimed.contains(r.remoteActivityId()))
             .toList();
     if (available.isEmpty()) return;
-    List<ConfirmMatch> matches = findHighConfidencePendingMatches(available, candidates);
+    List<ConfirmMatch> matches = findHighConfidencePendingMatches(platform, available, candidates);
     applyConfirmMatches(user, accountId, null, matches);
   }
 
@@ -1447,6 +1869,7 @@ public class JobService {
       String user,
       Map<String, Object> currentJob,
       String accountId,
+      String platform,
       PlatformConnector connector,
       Session session) {
     String currentJobId = CloudStore.str(currentJob, "id");
@@ -1506,7 +1929,8 @@ public class JobService {
         }
       }
 
-      List<ConfirmMatch> stage1 = findHighConfidencePendingMatches(collectedRemotes, remaining);
+      List<ConfirmMatch> stage1 =
+          findHighConfidencePendingMatches(platform, collectedRemotes, remaining);
       if (!stage1.isEmpty()) {
         String resolvedCurrent = applyConfirmMatches(user, accountId, currentJobId, stage1);
         if (resolvedCurrent != null) matchedRemoteForCurrent = resolvedCurrent;
@@ -1551,6 +1975,14 @@ public class JobService {
       }
     }
 
+    if (matchedRemoteForCurrent == null) {
+      LOG.info(
+          "投递远端核对未命中 job={} 平台={} 剩余候选={}条 未认领远端={}条",
+          currentJobId,
+          platform,
+          remaining.size(),
+          collectedRemotes.size());
+    }
     return matchedRemoteForCurrent == null
         ? null
         : ConnectorResult.success(new UploadResult(matchedRemoteForCurrent));
@@ -1661,16 +2093,19 @@ public class JobService {
       RemoteActivity remote, List<ConfirmCandidate> candidates, int totalRemotes) {
     Long remoteStart = remote.startTimeEpochMs();
     if (remoteStart == null) return totalRemotes <= 10;
+    long startTolerance =
+        isDateOnlyStartTime(remote)
+            ? CONFIRM_DATE_ONLY_START_TOLERANCE_MS
+            : CONFIRM_DOWNLOAD_START_TOLERANCE_MS;
     for (ConfirmCandidate c : candidates) {
       if (c.startTimeEpochMs() == null) continue;
-      if (Math.abs(remoteStart - c.startTimeEpochMs()) <= CONFIRM_DOWNLOAD_START_TOLERANCE_MS) {
+      if (Math.abs(remoteStart - c.startTimeEpochMs()) <= startTolerance) {
+        // 起始时间已命中就以 FIT 内容比对为准：列表距离字段可能单位不一致（km 被当米）或缺失，
+        // 距离仅用来排除数量级悬殊的明显不同活动，不能反过来挡住权威比对。
         Double ld = c.distanceMeters();
         Double rd = remote.distanceMeters();
-        if (ld != null && ld > 0.0 && rd != null && rd > 0.0) {
-          if (Math.abs(ld - rd) <= Math.max(1000.0, ld * 0.2)) return true;
-        } else {
-          return true;
-        }
+        if (ld == null || ld <= 0.0 || rd == null || rd <= 0.0) return true;
+        if (Math.max(ld, rd) / Math.min(ld, rd) <= 1000.5) return true;
       }
     }
     return false;
@@ -1735,36 +2170,59 @@ public class JobService {
         } catch (Exception ignored) {
         }
       }
-      String variantId =
-          payload.get("variantId") != null
-              ? payload.get("variantId").toString()
-              : CloudStore.str(row, "primary_variant_id");
-      String sha256 =
-          payload.get("sha256") != null
-              ? payload.get("sha256").toString()
-              : CloudStore.str(row, "primary_sha256");
-      Long startTime =
-          row.get("start_time") instanceof Number n ? n.longValue() : null;
-      Double distance =
-          row.get("distance_meters") instanceof Number n ? n.doubleValue() : null;
-      Integer elapsed =
-          row.get("elapsed_seconds") instanceof Number n ? n.intValue() : null;
-      Integer moving =
-          row.get("moving_seconds") instanceof Number n ? n.intValue() : null;
       result.add(
-          new ConfirmCandidate(
+          toConfirmCandidate(
               jobId,
               activityId,
-              variantId,
-              sha256,
-              CloudStore.str(row, "title"),
-              startTime,
-              distance,
-              elapsed,
-              moving,
-              CloudStore.str(row, "sport_type")));
+              payload.get("variantId") != null ? payload.get("variantId").toString() : null,
+              payload.get("sha256") != null ? payload.get("sha256").toString() : null,
+              row));
     }
     return result;
+  }
+
+  private ConfirmCandidate loadConfirmCandidateForActivity(String user, String activityId) {
+    if (activityId == null || activityId.isBlank()) return null;
+    var rows =
+        store.db.queryForList(
+            "SELECT a.id AS activity_id,a.title,a.start_time,a.distance_meters,a.elapsed_seconds,"
+                + "a.moving_seconds,a.sport_type,a.primary_variant_id,v.sha256 AS"
+                + " primary_sha256 FROM activity a LEFT JOIN activity_variant v ON"
+                + " v.id=a.primary_variant_id AND v.user_id=a.user_id WHERE a.id=? AND"
+                + " a.user_id=?",
+            activityId,
+            user);
+    if (rows.isEmpty()) return null;
+    return toConfirmCandidate("reconcile-" + activityId, activityId, null, null, rows.getFirst());
+  }
+
+  private static ConfirmCandidate toConfirmCandidate(
+      String jobId,
+      String activityId,
+      String overrideVariantId,
+      String overrideSha256,
+      Map<String, Object> row) {
+    String variantId =
+        overrideVariantId != null
+            ? overrideVariantId
+            : CloudStore.str(row, "primary_variant_id");
+    String sha256 =
+        overrideSha256 != null ? overrideSha256 : CloudStore.str(row, "primary_sha256");
+    Long startTime = row.get("start_time") instanceof Number n ? n.longValue() : null;
+    Double distance = row.get("distance_meters") instanceof Number n ? n.doubleValue() : null;
+    Integer elapsed = row.get("elapsed_seconds") instanceof Number n ? n.intValue() : null;
+    Integer moving = row.get("moving_seconds") instanceof Number n ? n.intValue() : null;
+    return new ConfirmCandidate(
+        jobId,
+        activityId,
+        variantId,
+        sha256,
+        CloudStore.str(row, "title"),
+        startTime,
+        distance,
+        elapsed,
+        moving,
+        CloudStore.str(row, "sport_type"));
   }
 
   private Set<String> loadClaimedRemoteIds(String user, String accountId) {
@@ -1781,11 +2239,11 @@ public class JobService {
   }
 
   static List<ConfirmMatch> findHighConfidencePendingMatches(
-      List<RemoteActivity> remotes, List<ConfirmCandidate> candidates) {
+      String platform, List<RemoteActivity> remotes, List<ConfirmCandidate> candidates) {
     List<ConfirmMatch> edges = new ArrayList<>();
     for (RemoteActivity remote : remotes) {
       for (ConfirmCandidate candidate : candidates) {
-        if (isHighConfidencePendingMatch(remote, candidate)) {
+        if (isHighConfidencePendingMatch(platform, remote, candidate)) {
           edges.add(new ConfirmMatch(remote, candidate));
         }
       }
@@ -1806,7 +2264,7 @@ public class JobService {
   }
 
   private static boolean isHighConfidencePendingMatch(
-      RemoteActivity remote, ConfirmCandidate candidate) {
+      String platform, RemoteActivity remote, ConfirmCandidate candidate) {
     if (remote == null
         || remote.remoteActivityId() == null
         || remote.remoteActivityId().isBlank()) {
@@ -1816,6 +2274,11 @@ public class JobService {
     if (candidate.sha256() != null
         && ("fitsync-" + candidate.sha256() + ".fit").equals(externalId)) {
       return true;
+    }
+    if (isDateOnlyStartTime(remote)) return false;
+    String remoteSport = SportTypes.inferRemoteSportType(platform, remote);
+    if (!SportTypes.areCompatible(candidate.sportType(), remoteSport)) {
+      return false;
     }
     Long remoteStart = remote.startTimeEpochMs();
     if (remoteStart == null || candidate.startTimeEpochMs() == null) return false;
@@ -1832,6 +2295,10 @@ public class JobService {
     String localTitle = normalizeConfirmTitle(candidate.title());
     String remoteTitle = normalizeConfirmTitle(remote.name());
     return localTitle != null && localTitle.equals(remoteTitle);
+  }
+
+  private static boolean isDateOnlyStartTime(RemoteActivity remote) {
+    return remote != null && "DATE".equals(remote.metadata().get("start_time_precision"));
   }
 
   private static String normalizeConfirmTitle(String value) {

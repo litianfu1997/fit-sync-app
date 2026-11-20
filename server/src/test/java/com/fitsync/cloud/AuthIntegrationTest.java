@@ -217,6 +217,55 @@ class AuthIntegrationTest {
   }
 
   @Test
+  void emailCodeLoginWorksForRegisteredEmailWithoutPassword() throws Exception {
+    // 未注册邮箱不可请求登录验证码。
+    mvc.perform(
+            post("/api/v1/auth/email/code")
+                .contentType("application/json")
+                .content(store.encode(Map.of("email", "nobody@example.com", "purpose", "LOGIN"))))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.message").value("该邮箱尚未注册，请先注册"));
+
+    String id = CloudStore.id();
+    store.db.update(
+        "INSERT INTO app_user(id,email,display_name,created_at) VALUES(?,?,?,?)",
+        id,
+        "code.login@example.com",
+        "验证码用户",
+        System.currentTimeMillis());
+
+    mvc.perform(
+            post("/api/v1/auth/email/code")
+                .contentType("application/json")
+                .content(store.encode(Map.of("email", "Code.Login@example.com", "purpose", "LOGIN"))))
+        .andExpect(status().isOk());
+    String code = extractCodeFromLastMail();
+    String wrong = "000000".equals(code) ? "999999" : "000000";
+
+    mvc.perform(
+            post("/api/v1/auth/login")
+                .contentType("application/json")
+                .content(store.encode(Map.of("email", "code.login@example.com", "code", wrong))))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.message").value("邮箱验证码不正确"));
+
+    JsonNode result =
+        perform(
+            post("/api/v1/auth/login")
+                .contentType("application/json")
+                .content(store.encode(Map.of("email", "CODE.LOGIN@example.com", "code", code))));
+    assertEquals(id, result.get("user").get("id").asText());
+    assertFalse(result.get("token").asText().isBlank());
+
+    // 验证码一次性，不可重放。
+    mvc.perform(
+            post("/api/v1/auth/login")
+                .contentType("application/json")
+                .content(store.encode(Map.of("email", "code.login@example.com", "code", code))))
+        .andExpect(status().isBadRequest());
+  }
+
+  @Test
   void usernameUserCanBindEmailAndLoginWithEither() throws Exception {
     JsonNode created = register("bind_email_user", "user-pass-123", "绑邮测试");
     String token = created.get("token").asText();

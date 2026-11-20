@@ -54,7 +54,7 @@ public class EmailService {
   public String normalizePurpose(String raw) {
     if (raw == null || raw.isBlank()) throw ApiException.bad("验证码用途无效");
     String purpose = raw.strip().toUpperCase(Locale.ROOT);
-    if (!"REGISTER".equals(purpose) && !"BIND".equals(purpose)) {
+    if (!"REGISTER".equals(purpose) && !"LOGIN".equals(purpose) && !"BIND".equals(purpose)) {
       throw ApiException.bad("验证码用途无效");
     }
     return purpose;

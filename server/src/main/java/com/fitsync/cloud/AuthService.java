@@ -81,13 +81,15 @@ public class AuthService {
     return local.length() > 80 ? local.substring(0, 80) : local;
   }
 
-  /** 发送邮箱验证码：REGISTER 验证邮箱未注册；BIND 校验已登录且未绑定邮箱。 */
+  /** 发送邮箱验证码：REGISTER 验证邮箱未注册；LOGIN 验证邮箱已存在；BIND 校验已登录且未绑定邮箱。 */
   public Map<String, Object> sendEmailCode(
       String currentUserId, String rawEmail, String rawPurpose) {
     String email = passwords.validEmail(rawEmail);
     String purpose = emailService.normalizePurpose(rawPurpose);
     if ("REGISTER".equals(purpose)) {
       if (emailTaken(email)) throw ApiException.bad("该邮箱已被注册，请直接登录");
+    } else if ("LOGIN".equals(purpose)) {
+      if (!emailTaken(email)) throw ApiException.bad("该邮箱尚未注册，请先注册");
     } else if ("BIND".equals(purpose)) {
       if (currentUserId == null || currentUserId.isBlank()) {
         throw new ApiException(401, "UNAUTHORIZED", "请先登录");
@@ -145,6 +147,15 @@ public class AuthService {
     return issue(id);
   }
 
+  /** 邮箱验证码登录；不加外层事务以免验证码错误计数随业务异常回滚。 */
+  public Map<String, Object> emailLogin(String rawEmail, String rawCode) {
+    String email = passwords.validEmail(rawEmail);
+    var rows = store.db.queryForList("SELECT id FROM app_user WHERE email=?", email);
+    if (rows.isEmpty()) throw ApiException.bad("该邮箱尚未注册，请先注册");
+    emailService.verifyAndConsume(email, "LOGIN", rawCode);
+    return issue(CloudStore.str(rows.getFirst(), "id"));
+  }
+
   /** 邮箱或用户名加密码登录；不区分大小写。 */
   @Transactional
   public Map<String, Object> passwordLogin(String rawAccount, String rawPassword) {
@@ -158,7 +169,7 @@ public class AuthService {
     if (rows.isEmpty()) throw ApiException.bad("账号或密码错误");
     String hash = CloudStore.str(rows.getFirst(), "password_hash");
     if (hash == null)
-      throw ApiException.bad("该账号尚未设置密码，请使用 Google 或微信登录后在设置页设置密码");
+      throw ApiException.bad("该账号尚未设置密码，请使用邮箱验证码、Google 或微信登录后在设置页设置密码");
     if (!passwords.matches(rawPassword, hash)) throw ApiException.bad("账号或密码错误");
     return issue(CloudStore.str(rows.getFirst(), "id"));
   }

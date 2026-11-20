@@ -456,6 +456,7 @@ class CloudIntegrationTest {
                         "clientSecret", "csec-1",
                         "displayName", "Strava Rider"))));
     when(stravaMock.skipPullAsDestination(any())).thenCallRealMethod();
+    when(stravaMock.verifyOAuthAccess(any())).thenReturn(ConnectorResult.success("ok"));
     doReturn(stravaMock).when(accounts).connector("STRAVA");
 
     var startJson =
@@ -545,6 +546,123 @@ class CloudIntegrationTest {
     assertThrows(
         ApiException.class,
         () -> jobs.sync(login.user(), "STRAVA", List.of(), List.of(), 90));
+  }
+
+  @Test
+  void stravaOAuthRejectedProbeDoesNotPersistBrokenAccount() throws Exception {
+    Login login = login();
+    var stravaMock = mock(com.fitsync.cloud.connector.StravaConnector.class);
+    when(stravaMock.exchangeOAuthCode(
+            eq("cid-2"), eq("csec-2"), eq("code-9"), anyString(), eq(true)))
+        .thenReturn(
+            ConnectorResult.success(
+                new Session(
+                    "strava-access-9",
+                    "778899",
+                    null,
+                    null,
+                    false,
+                    Map.of(
+                        "authType", "OAUTH",
+                        "refreshToken", "strava-refresh-9",
+                        "expiresAt", "2000000000",
+                        "displayName", "Strava Rider"))));
+    when(stravaMock.verifyOAuthAccess(any()))
+        .thenReturn(
+            ConnectorResult.<String>failure(
+                ConnectorResult.Status.REQUIRES_LOGIN,
+                "AUTH_EXPIRED",
+                "Strava 拒绝了访问令牌校验（HTTP 401）：Upload activity:write missing"));
+    when(stravaMock.skipPullAsDestination(any())).thenCallRealMethod();
+    doReturn(stravaMock).when(accounts).connector("STRAVA");
+
+    var startJson =
+        store.json.readTree(
+            mvc.perform(
+                    post("/api/v1/accounts/oauth/strava/start")
+                        .header("Authorization", "Bearer " + login.token())
+                        .contentType("application/json")
+                        .content(
+                            store.encode(
+                                Map.of(
+                                    "clientId",
+                                    "cid-2",
+                                    "clientSecret",
+                                    "csec-2",
+                                    "redirectUri",
+                                    "http://127.0.0.1:8080/api/v1/accounts/oauth/strava/callback",
+                                    "returnUrl",
+                                    "http://127.0.0.1:8080/sync"))))
+                .andExpect(status().isOk())
+                .andReturn()
+                .getResponse()
+                .getContentAsString());
+    String challengeId = startJson.get("challengeId").asText();
+    String state = queryParam(startJson.get("authorizeUrl").asText(), "state");
+
+    mvc.perform(
+            get("/api/v1/accounts/oauth/strava/callback")
+                .param("state", state)
+                .param("code", "code-9")
+                .param("scope", "read,activity:read_all,activity:write"))
+        .andExpect(status().isFound())
+        .andExpect(
+            header()
+                .string(
+                    "Location",
+                    org.hamcrest.Matchers.startsWith(
+                        "http://127.0.0.1:8080/sync?stravaOAuth=error")));
+
+    mvc.perform(get("/api/v1/accounts").header("Authorization", "Bearer " + login.token()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.length()").value(0));
+    var challenge =
+        store.one("SELECT status,message FROM oauth_challenge WHERE id=?", challengeId);
+    assertEquals("FAILED", challenge.get("status"));
+    assertTrue(CloudStore.str(challenge, "message").contains("activity:write"));
+  }
+
+  @Test
+  void rotatedRefreshTokenIsPersistedImmediately() throws Exception {
+    Login login = login();
+    var stravaMock = mock(com.fitsync.cloud.connector.StravaConnector.class);
+    when(stravaMock.login(eq("rider@example.com"), eq("secret"), eq(true)))
+        .thenReturn(
+            ConnectorResult.success(
+                new Session(
+                    "acc-0",
+                    "778899",
+                    "rider@example.com",
+                    "secret",
+                    true,
+                    Map.of(
+                        "authType", "OAUTH",
+                        "refreshToken", "ref-0",
+                        "expiresAt", "2000000000"))));
+    when(stravaMock.skipPullAsDestination(any())).thenCallRealMethod();
+    doReturn(stravaMock).when(accounts).connector("STRAVA");
+
+    String created =
+        mvc.perform(
+                post("/api/v1/accounts")
+                    .header("Authorization", "Bearer " + login.token())
+                    .contentType("application/json")
+                    .content(
+                        "{\"platform\":\"STRAVA\",\"username\":\"rider@example.com\","
+                            + "\"password\":\"secret\",\"storeCredentials\":true}"))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    String accountId = store.json.readTree(created).get("id").asText();
+
+    // Strava 换发新 refresh token 后旧值立即失效，新值必须在轮换当场落库，不能等任务结束。
+    Session live = accounts.session(store.owned("platform_account", accountId, login.user()));
+    live.setAttribute("refreshToken", "ref-rotated");
+
+    Session reloaded =
+        accounts.session(store.owned("platform_account", accountId, login.user()));
+    assertEquals("ref-rotated", reloaded.attribute("refreshToken"));
   }
 
   private static String queryParam(String url, String key) {
@@ -981,6 +1099,7 @@ class CloudIntegrationTest {
     account(login);
     var stravaMock = mock(StravaConnector.class);
     when(stravaMock.skipPullAsDestination(any())).thenCallRealMethod();
+    when(stravaMock.verifyOAuthAccess(any())).thenReturn(ConnectorResult.success("ok"));
     doReturn(stravaMock).when(accounts).connector("STRAVA");
     accounts.persistOAuth(
         login.user(),
@@ -1768,6 +1887,561 @@ class CloudIntegrationTest {
                 login.user(),
                 act,
                 account)
+            .get("remote_id"));
+  }
+
+  @Test
+  void confirmingDeliveryDownloadsFitWhenListDistanceLooksUnitShifted() throws Exception {
+    Login login = login();
+    String account = account(login);
+    long fitEpochOffsetMs = 631_065_600_000L;
+    byte[] uploaded = rideFit(400_000, 2, 3600_000, 3500_000, 2500_000, 145, 1);
+    String act =
+        activities
+            .importFit(login.user(), uploaded, "LOCAL", null, null, "南宁市 - 基础训练")
+            .get("activityId")
+            .toString();
+    String job = jobs.delivery(login.user(), act, account);
+
+    when(connector.uploadFit(any(), any(), any()))
+        .thenReturn(ConnectorResult.processing("token-units"));
+    jobs.runOne(job);
+    assertEquals(
+        "CONFIRMING", store.one("SELECT status FROM sync_job WHERE id=?", job).get("status"));
+    store.db.update("UPDATE sync_job SET next_run_at=0 WHERE id=?", job);
+
+    // 迈金列表若以 km 数值填充 distance 字段，会被按米解析成 1/1000；
+    // 起始时间命中时仍应下载 FIT 用内容比对兜底，而不是被距离门槛挡住。
+    RemoteActivity unitShiftedRemote =
+        new RemoteActivity(
+            "onelap-unit-shift",
+            fitEpochOffsetMs + 400_000L * 1000L,
+            "南宁市 - 基础训练",
+            25_000.0 / 1000.0,
+            "https://files.onelap.cn/unit-shift.fit",
+            Map.of());
+    when(connector.checkUpload(any(), eq("token-units")))
+        .thenReturn(ConnectorResult.processing("token-units-2"));
+    when(connector.listActivities(any(), anyLong(), isNull()))
+        .thenReturn(
+            ConnectorResult.success(
+                new ActivityPage(List.of(unitShiftedRemote), "2", false)));
+    when(connector.downloadFit(any(), eq(unitShiftedRemote)))
+        .thenReturn(ConnectorResult.success(new FitDownload(uploaded, "unit-shift.fit")));
+
+    jobs.runOne(job);
+
+    assertEquals(
+        "SUCCEEDED", store.one("SELECT status FROM sync_job WHERE id=?", job).get("status"));
+    assertEquals(
+        "onelap-unit-shift",
+        store
+            .one(
+                "SELECT remote_id FROM platform_copy WHERE user_id=? AND activity_id=? AND"
+                    + " account_id=?",
+                login.user(),
+                act,
+                account)
+            .get("remote_id"));
+    verify(connector, times(1)).downloadFit(any(), eq(unitShiftedRemote));
+  }
+
+  @Test
+  void runningActivityIsNotDeliveredToCyclingOnlyOnelap() throws Exception {
+    Login login = login();
+    PlatformConnector onelap = mock(PlatformConnector.class);
+    doReturn(onelap).when(accounts).connector("ONELAP");
+    when(onelap.login(anyString(), anyString(), anyBoolean()))
+        .thenReturn(ConnectorResult.success(new Session("o-tok", "o-1", "o@ex.com", "pw", true)));
+    String onelapAccount =
+        store.json
+            .readTree(
+                mvc
+                    .perform(
+                        post("/api/v1/accounts")
+                            .header("Authorization", "Bearer " + login.token())
+                            .contentType("application/json")
+                            .content(
+                                "{\"platform\":\"ONELAP\",\"username\":\"o@ex.com\",\"password\":\"pw\",\"storeCredentials\":true}"))
+                    .andExpect(status().isOk())
+                    .andReturn()
+                    .getResponse()
+                    .getContentAsString())
+            .get("id")
+            .asText();
+
+    byte[] runFit = rideFit(1_156_326_488, 1, 2_700_000, 2_650_000, 818_788, 152, 1);
+    String run =
+        activities
+            .importFit(login.user(), runFit, "LOCAL", null, null, "南宁市 - 基础训练")
+            .get("activityId")
+            .toString();
+    byte[] rideFit = rideFit(1_156_326_488, 2, 3_600_000, 3_500_000, 3_000_000, 145, 1);
+    String ride =
+        activities
+            .importFit(login.user(), rideFit, "LOCAL", null, null, "傍晚骑行")
+            .get("activityId")
+            .toString();
+
+    // 迈金仅支持骑行：跑步活动即便规则未过滤也不生成投递任务，骑行活动照常投递。
+    assertNull(jobs.delivery(login.user(), run, onelapAccount));
+    assertEquals(
+        0,
+        store.db.queryForObject(
+                "SELECT COUNT(*) FROM sync_job WHERE user_id=? AND activity_id=? AND kind='DELIVERY'",
+                Integer.class,
+                login.user(),
+                run)
+            .intValue());
+    String rideJob = jobs.delivery(login.user(), ride, onelapAccount);
+    assertNotNull(rideJob);
+  }
+
+  @Test
+  void queuedRunningDeliveryToOnelapIsCancelledOnPickup() throws Exception {
+    Login login = login();
+    PlatformConnector onelap = mock(PlatformConnector.class);
+    doReturn(onelap).when(accounts).connector("ONELAP");
+    when(onelap.login(anyString(), anyString(), anyBoolean()))
+        .thenReturn(ConnectorResult.success(new Session("o-tok", "o-1", "o@ex.com", "pw", true)));
+    String onelapAccount =
+        store.json
+            .readTree(
+                mvc
+                    .perform(
+                        post("/api/v1/accounts")
+                            .header("Authorization", "Bearer " + login.token())
+                            .contentType("application/json")
+                            .content(
+                                "{\"platform\":\"ONELAP\",\"username\":\"o@ex.com\",\"password\":\"pw\",\"storeCredentials\":true}"))
+                    .andExpect(status().isOk())
+                    .andReturn()
+                    .getResponse()
+                    .getContentAsString())
+            .get("id")
+            .asText();
+
+    byte[] runFit = rideFit(1_156_326_488, 1, 2_700_000, 2_650_000, 818_788, 152, 1);
+    String run =
+        activities
+            .importFit(login.user(), runFit, "LOCAL", null, null, "南宁市 - 基础训练")
+            .get("activityId")
+            .toString();
+
+    // 模拟门槛上线前已入队的跑步投递任务：拾起时直接取消，不再上传。
+    String jobId = CloudStore.id();
+    long now = System.currentTimeMillis();
+    store.db.update(
+        "INSERT INTO"
+            + " sync_job(id,user_id,kind,status,account_id,activity_id,idempotency_key,payload_json,attempt_count,next_run_at,created_at,updated_at)"
+            + " VALUES(?,?,?,'PENDING',?,?,?,?,0,?,?,?)",
+        jobId,
+        login.user(),
+        "DELIVERY",
+        onelapAccount,
+        run,
+        "legacy-run-delivery:" + onelapAccount,
+        store.encode(Map.of()),
+        now,
+        now,
+        now);
+    jobs.runOne(jobId);
+
+    assertEquals(
+        "CANCELLED", store.one("SELECT status FROM sync_job WHERE id=?", jobId).get("status"));
+    assertEquals(
+        "该平台仅支持骑行，已取消投递",
+        store.one("SELECT message FROM sync_job WHERE id=?", jobId).get("message"));
+    verify(onelap, never()).uploadFit(any(), any(), any());
+  }
+
+  @Test
+  void confirmingDeliveryMatchesDateOnlyRemoteActivityViaDownloadedFit() throws Exception {
+    Login login = login();
+    PlatformConnector igpsport = mock(PlatformConnector.class);
+    doReturn(igpsport).when(accounts).connector("IGPSPORT");
+    when(igpsport.login(anyString(), anyString(), anyBoolean()))
+        .thenReturn(
+            ConnectorResult.success(
+                new Session("igp-tok", "2004016", "igp@example.com", "pw", true)));
+    String igpResp =
+        mvc.perform(
+                post("/api/v1/accounts")
+                    .header("Authorization", "Bearer " + login.token())
+                    .contentType("application/json")
+                    .content(
+                        "{\"platform\":\"IGPSPORT\",\"username\":\"igp@example.com\",\"password\":\"secret\",\"storeCredentials\":true}"))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    String igpAccount = store.json.readTree(igpResp).get("id").asText();
+
+    // 2026-08-22 17:48:08+08:00 对应 FIT 时间戳 1_156_326_488，8187.88m 跑步活动。
+    byte[] runFit = rideFit(1_156_326_488, 1, 2_700_000, 2_650_000, 818_788, 152, 1);
+    String act =
+        activities
+            .importFit(login.user(), runFit, "LOCAL", null, null, "南宁市 - 基础训练")
+            .get("activityId")
+            .toString();
+    String job = jobs.delivery(login.user(), act, igpAccount);
+
+    when(igpsport.uploadFit(any(), any(), any()))
+        .thenReturn(ConnectorResult.processing("igp-token-1", 15_000L));
+    jobs.runOne(job);
+    assertEquals(
+        "CONFIRMING", store.one("SELECT status FROM sync_job WHERE id=?", job).get("status"));
+    store.db.update("UPDATE sync_job SET next_run_at=0 WHERE id=?", job);
+
+    // iGPSPORT 列表行仅返回日期精度 "2026.08.22" -> 00:00:00+08:00，且标题不一致。
+    long dateOnlyMidnightMs = java.time.Instant.parse("2026-08-21T16:00:00Z").toEpochMilli();
+    RemoteActivity dateOnlyRemote =
+        new RemoteActivity(
+            "igp-99001",
+            dateOnlyMidnightMs,
+            "2026.08.22 运动",
+            8188.0,
+            null,
+            Map.of("start_time_precision", "DATE", "exercise_type", "5"));
+    when(igpsport.checkUpload(any(), eq("igp-token-1")))
+        .thenReturn(ConnectorResult.processing("igp-token-2"));
+    when(igpsport.listActivities(any(), anyLong(), isNull()))
+        .thenReturn(ConnectorResult.success(new ActivityPage(List.of(dateOnlyRemote), "2", false)));
+    when(igpsport.downloadFit(any(), eq(dateOnlyRemote)))
+        .thenReturn(ConnectorResult.success(new FitDownload(runFit, "igpsport_igp-99001.fit")));
+
+    jobs.runOne(job);
+
+    assertEquals(
+        "SUCCEEDED", store.one("SELECT status FROM sync_job WHERE id=?", job).get("status"));
+    assertEquals(
+        "igp-99001",
+        store
+            .one(
+                "SELECT remote_id FROM platform_copy WHERE user_id=? AND activity_id=? AND"
+                    + " account_id=?",
+                login.user(),
+                act,
+                igpAccount)
+            .get("remote_id"));
+    verify(igpsport, times(1)).downloadFit(any(), eq(dateOnlyRemote));
+  }
+
+  @Test
+  void activityDetailReconcileMapsExistingStravaOAuthAndIgpsportCopiesAndResolvesDeliveryJobs()
+      throws Exception {
+    Login login = login();
+    Login other = login();
+
+    PlatformConnector strava = mock(PlatformConnector.class);
+    doReturn(strava).when(accounts).connector("STRAVA");
+    when(strava.skipPullAsDestination(any())).thenReturn(true);
+    when(strava.login(anyString(), anyString(), anyBoolean()))
+        .thenReturn(
+            ConnectorResult.success(
+                new Session("strava-tok", "strava-u1", "strava@example.com", "pw", true)));
+
+    PlatformConnector igpsport = mock(PlatformConnector.class);
+    doReturn(igpsport).when(accounts).connector("IGPSPORT");
+    when(igpsport.skipPullAsDestination(any())).thenReturn(false);
+    when(igpsport.login(anyString(), anyString(), anyBoolean()))
+        .thenReturn(
+            ConnectorResult.success(
+                new Session("igp-tok", "igp-u1", "igp@example.com", "pw", true)));
+
+    PlatformConnector onelap = mock(PlatformConnector.class);
+    doReturn(onelap).when(accounts).connector("ONELAP");
+    when(onelap.skipPullAsDestination(any())).thenReturn(false);
+    when(onelap.login(anyString(), anyString(), anyBoolean()))
+        .thenReturn(
+            ConnectorResult.success(
+                new Session("onelap-tok", "onelap-u1", "onelap@example.com", "pw", true)));
+
+    String stravaResp =
+        mvc.perform(
+                post("/api/v1/accounts")
+                    .header("Authorization", "Bearer " + login.token())
+                    .contentType("application/json")
+                    .content(
+                        "{\"platform\":\"STRAVA\",\"username\":\"strava@example.com\",\"password\":\"secret\",\"storeCredentials\":true}"))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    String stravaAccount = store.json.readTree(stravaResp).get("id").asText();
+
+    String igpResp =
+        mvc.perform(
+                post("/api/v1/accounts")
+                    .header("Authorization", "Bearer " + login.token())
+                    .contentType("application/json")
+                    .content(
+                        "{\"platform\":\"IGPSPORT\",\"username\":\"igp@example.com\",\"password\":\"secret\",\"storeCredentials\":true}"))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    String igpAccount = store.json.readTree(igpResp).get("id").asText();
+
+    byte[] runFit = rideFit(1_156_326_488, 1, 2_700_000, 2_650_000, 818_788, 152, 1);
+    String act =
+        activities
+            .importFit(login.user(), runFit, "LOCAL", null, null, "南宁市 - 基础训练")
+            .get("activityId")
+            .toString();
+    long actStartMs = ((Number) store.one("SELECT start_time FROM activity WHERE id=?", act).get("start_time")).longValue();
+
+    String igpJob = jobs.delivery(login.user(), act, igpAccount);
+    when(igpsport.uploadFit(any(), any(), any()))
+        .thenReturn(ConnectorResult.processing("igp-token-1", 15_000L));
+    jobs.runOne(igpJob);
+
+    String detailBefore =
+        mvc.perform(
+                get("/api/v1/activities/" + act)
+                    .header("Authorization", "Bearer " + login.token()))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    var detailJsonBefore = store.json.readTree(detailBefore);
+    assertEquals(1, detailJsonBefore.path("deliveries").size());
+    assertEquals(igpJob, detailJsonBefore.path("deliveries").get(0).path("jobId").asText());
+    assertEquals(igpAccount, detailJsonBefore.path("deliveries").get(0).path("accountId").asText());
+    assertEquals("CONFIRMING", detailJsonBefore.path("deliveries").get(0).path("status").asText());
+
+    // Strava OAuth 同时返回同时间同距离但运动类型为 Ride 的活动与匹配 Running 的活动，确保不会误匹配。
+    RemoteActivity stravaWrongSport =
+        new RemoteActivity(
+            "strava-wrong-sport",
+            actStartMs,
+            "早晨骑行",
+            8188.0,
+            null,
+            Map.of("sport_type", "Ride"));
+    RemoteActivity stravaRun =
+        new RemoteActivity(
+            "strava-5511",
+            actStartMs,
+            "南宁市 - 基础训练",
+            8188.0,
+            null,
+            Map.of("sport_type", "Run"));
+    when(strava.listActivities(any(), anyLong(), isNull()))
+        .thenReturn(
+            ConnectorResult.success(
+                new ActivityPage(List.of(stravaWrongSport, stravaRun), null, false)));
+
+    long dateOnlyMidnightMs = java.time.Instant.parse("2026-08-21T16:00:00Z").toEpochMilli();
+    RemoteActivity dateOnlyRemote =
+        new RemoteActivity(
+            "igp-99002",
+            dateOnlyMidnightMs,
+            "2026.08.22 运动",
+            8188.0,
+            null,
+            Map.of("start_time_precision", "DATE", "exercise_type", "5"));
+    when(igpsport.listActivities(any(), anyLong(), isNull()))
+        .thenReturn(ConnectorResult.success(new ActivityPage(List.of(dateOnlyRemote), null, false)));
+    when(igpsport.downloadFit(any(), eq(dateOnlyRemote)))
+        .thenReturn(ConnectorResult.success(new FitDownload(runFit, "igpsport_igp-99002.fit")));
+
+    // 越权访问其他用户的活动返回 404
+    mvc.perform(
+            post("/api/v1/activities/" + act + "/reconcile")
+                .header("Authorization", "Bearer " + other.token()))
+        .andExpect(status().isNotFound());
+
+    String reconcileBody =
+        mvc.perform(
+                post("/api/v1/activities/" + act + "/reconcile")
+                    .header("Authorization", "Bearer " + login.token()))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    var reconcileJson = store.json.readTree(reconcileBody);
+    assertEquals(2, reconcileJson.path("checkedCount").asInt());
+    assertEquals(2, reconcileJson.path("matchedCount").asInt());
+    assertFalse(reconcileJson.path("skippedByCooldown").asBoolean());
+
+    assertEquals(
+        "strava-5511",
+        store
+            .one(
+                "SELECT remote_id FROM platform_copy WHERE user_id=? AND activity_id=? AND"
+                    + " account_id=?",
+                login.user(),
+                act,
+                stravaAccount)
+            .get("remote_id"));
+    assertEquals(
+        "igp-99002",
+        store
+            .one(
+                "SELECT remote_id FROM platform_copy WHERE user_id=? AND activity_id=? AND"
+                    + " account_id=?",
+                login.user(),
+                act,
+                igpAccount)
+            .get("remote_id"));
+    assertEquals(
+        "SUCCEEDED",
+        store.one("SELECT status FROM sync_job WHERE id=?", igpJob).get("status"));
+    verify(strava, never()).downloadFit(any(), any());
+
+    // 添加一个未命中的 ONELAP 账号验证冷却与 force=true 绕过冷却
+    mvc.perform(
+            post("/api/v1/accounts")
+                .header("Authorization", "Bearer " + login.token())
+                .contentType("application/json")
+                .content(
+                    "{\"platform\":\"ONELAP\",\"username\":\"onelap@example.com\",\"password\":\"secret\",\"storeCredentials\":true}"))
+        .andExpect(status().isOk());
+    when(onelap.listActivities(any(), anyLong(), isNull()))
+        .thenReturn(ConnectorResult.success(new ActivityPage(List.of(), null, false)));
+
+    // 上一次 reconcile 刚触发过冷却（因现在有 pending ONELAP），不传 force 会命中冷却；传 force=true 强制核对
+    String skippedBody =
+        mvc.perform(
+                post("/api/v1/activities/" + act + "/reconcile")
+                    .header("Authorization", "Bearer " + login.token()))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    assertTrue(store.json.readTree(skippedBody).path("skippedByCooldown").asBoolean());
+    assertEquals(0, store.json.readTree(skippedBody).path("checkedCount").asInt());
+
+    String forcedBody =
+        mvc.perform(
+                post("/api/v1/activities/" + act + "/reconcile")
+                    .header("Authorization", "Bearer " + login.token())
+                    .contentType("application/json")
+                    .content("{\"force\":true}"))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    var forcedJson = store.json.readTree(forcedBody);
+    assertFalse(forcedJson.path("skippedByCooldown").asBoolean());
+    assertEquals(1, forcedJson.path("checkedCount").asInt());
+    assertEquals(0, forcedJson.path("matchedCount").asInt());
+
+    String detailAfter =
+        mvc.perform(
+                get("/api/v1/activities/" + act)
+                    .header("Authorization", "Bearer " + login.token()))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    var detailJsonAfter = store.json.readTree(detailAfter);
+    assertEquals(2, detailJsonAfter.path("copies").size());
+    assertEquals("SUCCEEDED", detailJsonAfter.path("deliveries").get(0).path("status").asText());
+  }
+
+  @Test
+  void stravaOAuthDeliverySkipsUploadWhenRemoteAlreadyExistsAndDuplicateWithoutIdResolves()
+      throws Exception {
+    Login login = login();
+    PlatformConnector strava = mock(PlatformConnector.class);
+    doReturn(strava).when(accounts).connector("STRAVA");
+    when(strava.skipPullAsDestination(any())).thenReturn(true);
+    when(strava.login(anyString(), anyString(), anyBoolean()))
+        .thenReturn(
+            ConnectorResult.success(
+                new Session("strava-tok2", "strava-u2", "strava2@example.com", "pw", true)));
+
+    String stravaResp =
+        mvc.perform(
+                post("/api/v1/accounts")
+                    .header("Authorization", "Bearer " + login.token())
+                    .contentType("application/json")
+                    .content(
+                        "{\"platform\":\"STRAVA\",\"username\":\"strava2@example.com\",\"password\":\"secret\",\"storeCredentials\":true}"))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    String stravaAccount = store.json.readTree(stravaResp).get("id").asText();
+
+    // 场景 A：OAuth 投递前列表命中同活动，直接跳过 uploadFit 并标为 SUCCEEDED
+    byte[] fit1 = rideFit(1_156_400_000, 2, 1_800_000, 1_750_000, 1_500_000, 140, 220);
+    String act1 =
+        activities
+            .importFit(login.user(), fit1, "LOCAL", null, null, "晨间骑行")
+            .get("activityId")
+            .toString();
+    long start1 = ((Number) store.one("SELECT start_time FROM activity WHERE id=?", act1).get("start_time")).longValue();
+    String job1 = jobs.delivery(login.user(), act1, stravaAccount);
+
+    RemoteActivity existingStrava1 =
+        new RemoteActivity(
+            "strava-existing-1",
+            start1,
+            "晨间骑行",
+            15000.0,
+            null,
+            Map.of("sport_type", "Ride"));
+    when(strava.listActivities(any(), anyLong(), isNull()))
+        .thenReturn(
+            ConnectorResult.success(new ActivityPage(List.of(existingStrava1), null, false)));
+
+    jobs.runOne(job1);
+
+    verify(strava, never()).uploadFit(any(), any(), any());
+    assertEquals(
+        "SUCCEEDED", store.one("SELECT status FROM sync_job WHERE id=?", job1).get("status"));
+    assertEquals(
+        "strava-existing-1",
+        store
+            .one(
+                "SELECT remote_id FROM platform_copy WHERE user_id=? AND activity_id=? AND"
+                    + " account_id=?",
+                login.user(),
+                act1,
+                stravaAccount)
+            .get("remote_id"));
+
+    // 场景 B：预检未命中但 uploadFit 返回 DUPLICATE 且缺少 remoteId，后置检索成功补齐 ID 并标为 SUCCEEDED
+    byte[] fit2 = rideFit(1_156_500_000, 2, 2_000_000, 1_950_000, 2_000_000, 145, 230);
+    String act2 =
+        activities
+            .importFit(login.user(), fit2, "LOCAL", null, null, "傍晚绕圈")
+            .get("activityId")
+            .toString();
+    long start2 = ((Number) store.one("SELECT start_time FROM activity WHERE id=?", act2).get("start_time")).longValue();
+    String job2 = jobs.delivery(login.user(), act2, stravaAccount);
+
+    RemoteActivity existingStrava2 =
+        new RemoteActivity(
+            "strava-dup-2",
+            start2,
+            "傍晚绕圈",
+            20000.0,
+            null,
+            Map.of("sport_type", "Ride"));
+    when(strava.listActivities(any(), anyLong(), isNull()))
+        .thenReturn(ConnectorResult.success(new ActivityPage(List.of(), null, false)))
+        .thenReturn(
+            ConnectorResult.success(new ActivityPage(List.of(existingStrava2), null, false)));
+    when(strava.uploadFit(any(), any(), any()))
+        .thenReturn(ConnectorResult.duplicate(new UploadResult(null)));
+
+    jobs.runOne(job2);
+
+    assertEquals(
+        "SUCCEEDED", store.one("SELECT status FROM sync_job WHERE id=?", job2).get("status"));
+    assertEquals(
+        "strava-dup-2",
+        store
+            .one(
+                "SELECT remote_id FROM platform_copy WHERE user_id=? AND activity_id=? AND"
+                    + " account_id=?",
+                login.user(),
+                act2,
+                stravaAccount)
             .get("remote_id"));
   }
 

@@ -2,6 +2,7 @@ package com.fitsync.cloud;
 
 import com.fitsync.cloud.connector.*;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicReference;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -193,13 +194,19 @@ public class AccountService {
         if (key != null && value != null) attributes.put(key.toString(), value.toString());
       });
     }
-    return new Session(
-        CloudStore.str(data, "accessToken"),
-        CloudStore.str(data, "externalUserId"),
-        CloudStore.str(data, "username"),
-        CloudStore.str(data, "password"),
-        Boolean.TRUE.equals(data.get("storeCredentials")),
-        attributes);
+    Session session =
+        new Session(
+            CloudStore.str(data, "accessToken"),
+            CloudStore.str(data, "externalUserId"),
+            CloudStore.str(data, "username"),
+            CloudStore.str(data, "password"),
+            Boolean.TRUE.equals(data.get("storeCredentials")),
+            attributes);
+    // 刷新令牌会轮换且旧值立即失效，令牌一变就落库，避免进程中断后账号只能重新授权。
+    AtomicReference<String> base =
+        new AtomicReference<>(CloudStore.str(account, "encrypted_session"));
+    session.onTokensChanged(() -> saveSession(account, session, base));
+    return session;
   }
 
   public void saveSession(Map<String, Object> account, Session session) {
@@ -210,6 +217,23 @@ public class AccountService {
         account.get("id"),
         account.get("user_id"),
         account.get("encrypted_session"));
+  }
+
+  /**
+   * 令牌轮换时的增量保存：用自己的密文基线，既能连续保存，又不会让过期快照覆盖新凭据。
+   */
+  private void saveSession(
+      Map<String, Object> account, Session session, AtomicReference<String> base) {
+    String encrypted =
+        encodeSession(CloudStore.str(account, "user_id"), CloudStore.str(account, "id"), session);
+    if (store.db.update(
+            "UPDATE platform_account SET encrypted_session=? WHERE id=? AND user_id=? AND"
+                + " encrypted_session=?",
+            encrypted,
+            account.get("id"),
+            account.get("user_id"),
+            base.get())
+        > 0) base.set(encrypted);
   }
 
   @Transactional

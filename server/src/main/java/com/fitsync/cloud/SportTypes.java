@@ -104,6 +104,23 @@ final class SportTypes {
   }
 
   /**
+   * 仅支持骑行的平台：投递其他运动类型只会被平台解析管线丢弃或长期挂起，
+   * 无论同步规则如何配置都在投递入口直接拦截。
+   */
+  private static final Set<String> CYCLING_ONLY_PLATFORMS = Set.of("ONELAP");
+
+  /** 目标平台是否接受该运动类型；null 平台或未知平台不做限制。 */
+  static boolean platformAccepts(String platform, String sportType) {
+    if (platform == null || platform.isBlank()) return true;
+    if (!CYCLING_ONLY_PLATFORMS.contains(platform.trim().toUpperCase(Locale.ROOT))) return true;
+    String normalized =
+        sportType == null || sportType.isBlank()
+            ? "UNKNOWN"
+            : sportType.trim().toUpperCase(Locale.ROOT);
+    return CYCLING_TYPES.contains(normalized);
+  }
+
+  /**
    * 仅对具备清晰英文运动键值的平台（如 Garmin、Strava）做拉取前预过滤；
    * COROS / iGPSPORT 的数值枚举或未知键值返回 null，留待 FIT 解析后权威判定。
    */
@@ -112,6 +129,16 @@ final class SportTypes {
     if (expandedAllowed == null || remote == null) return true;
     String inferred = inferRemoteSportType(platform, remote);
     return inferred == null || expandedAllowed.contains(inferred);
+  }
+
+  static boolean areCompatible(String localSportType, String remoteInferredSport) {
+    if (remoteInferredSport == null || remoteInferredSport.isBlank()) return true;
+    if (localSportType == null || localSportType.isBlank()) return true;
+    String local = localSportType.trim().toUpperCase(Locale.ROOT);
+    String remote = remoteInferredSport.trim().toUpperCase(Locale.ROOT);
+    if ("UNKNOWN".equals(local) || "UNKNOWN".equals(remote)) return true;
+    if (CYCLING_TYPES.contains(local) && CYCLING_TYPES.contains(remote)) return true;
+    return local.equals(remote);
   }
 
   static String inferRemoteSportType(String platform, RemoteActivity remote) {

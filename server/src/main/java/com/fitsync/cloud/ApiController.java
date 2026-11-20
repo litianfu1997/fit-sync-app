@@ -117,7 +117,8 @@ public class ApiController {
     }
   }
 
-  public record PasswordLogin(String username, String account, String password) {
+  public record PasswordLogin(
+      String username, String account, String email, String code, String password) {
     @Override
     public String toString() {
       return "PasswordLogin[凭据已隐藏]";
@@ -163,6 +164,11 @@ public class ApiController {
 
   @PostMapping("/auth/login")
   public Map<String, Object> passwordLogin(@RequestBody PasswordLogin body) {
+    if (body.code() != null && !body.code().isBlank()) {
+      String mail =
+          (body.email() != null && !body.email().isBlank()) ? body.email() : body.account();
+      return auth.emailLogin(mail, body.code());
+    }
     String acct =
         (body.account() != null && !body.account().isBlank()) ? body.account() : body.username();
     return auth.passwordLogin(acct, body.password());
@@ -343,12 +349,23 @@ public class ApiController {
 
   public record ActivityReview(String decision) {}
 
+  public record ActivityReconcile(Boolean force) {}
+
   @PostMapping("/activities/{id}/review")
   public Map<String, Object> review(
       HttpServletRequest request, @PathVariable String id, @RequestBody ActivityReview body) {
     var result = activities.review(user(request), id, body.decision());
     jobs.plan(user(request), result.get("activityId").toString());
     return result;
+  }
+
+  @PostMapping("/activities/{id}/reconcile")
+  public Map<String, Object> reconcileActivity(
+      HttpServletRequest request,
+      @PathVariable String id,
+      @RequestBody(required = false) ActivityReconcile body) {
+    boolean force = body != null && Boolean.TRUE.equals(body.force());
+    return jobs.reconcileActivityPlatforms(user(request), id, force);
   }
 
   @GetMapping("/accounts")

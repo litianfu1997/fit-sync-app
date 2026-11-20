@@ -452,6 +452,29 @@ public class ActivityService {
             user,
             id);
     result.put("copies", copies);
+    var deliveries =
+        store.db
+            .queryForList(
+                "SELECT j.id AS job_id,j.account_id,a.platform,j.status,j.message,j.updated_at"
+                    + " FROM sync_job j JOIN platform_account a ON a.id=j.account_id WHERE"
+                    + " j.user_id=? AND j.activity_id=? AND j.kind='DELIVERY' ORDER BY"
+                    + " j.updated_at DESC",
+                user,
+                id)
+            .stream()
+            .map(
+                deliveryRow -> {
+                  Map<String, Object> item = new LinkedHashMap<>();
+                  item.put("jobId", CloudStore.str(deliveryRow, "job_id"));
+                  item.put("accountId", CloudStore.str(deliveryRow, "account_id"));
+                  item.put("platform", CloudStore.str(deliveryRow, "platform"));
+                  item.put("status", CloudStore.str(deliveryRow, "status"));
+                  item.put("message", CloudStore.str(deliveryRow, "message"));
+                  item.put("updatedAtEpochMs", CloudStore.number(deliveryRow, "updated_at"));
+                  return item;
+                })
+            .toList();
+    result.put("deliveries", deliveries);
 
     var variants =
         store.db
