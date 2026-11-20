@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { go, session } from "../lib/api";
+import { navigating } from "../lib/nav-progress";
 import { theme, themeStyle } from "../lib/theme";
 const props = defineProps<{ active: string; title: string; subtitle?: string }>();
 const tabs = [
@@ -50,6 +51,14 @@ function iconFor(icon: string, selected: boolean) {
     }"
     :style="themeStyle"
   >
+    <view
+      v-if="navigating"
+      class="nav-progress"
+      role="progressbar"
+      aria-label="页面加载中"
+    >
+      <view class="refresh-bar-fill" />
+    </view>
     <view class="desktop-sidebar">
       <view class="brand"
         ><image class="brand-mark" src="/static/logo.png" /><view

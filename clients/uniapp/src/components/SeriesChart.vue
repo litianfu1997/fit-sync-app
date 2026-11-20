@@ -38,7 +38,13 @@ function hexToRgba(hex: string, alpha: number): string {
 }
 
 function draw() {
-  const pts = props.values.filter((v) => Number.isFinite(v));
+  const raw = props.values.filter((v) => Number.isFinite(v));
+  // 长活动采样点可达数万，按画布宽度抽稀，避免每次重绘全量描边。
+  const step = Math.max(1, Math.ceil(raw.length / 1500));
+  const pts =
+    step > 1
+      ? raw.filter((_, i) => i % step === 0 || i === raw.length - 1)
+      : raw;
   if (pts.length < 2) return;
   const query = uni.createSelectorQuery().in(instance?.proxy);
   query

@@ -10,6 +10,11 @@ import SeriesChart from "../../components/SeriesChart.vue";
 import NativeAd from "../../components/NativeAd.vue";
 import { filterValidPoints } from "../../lib/geo";
 import {
+  fetchAccounts,
+  fetchActivity,
+  invalidate,
+} from "../../lib/data-cache";
+import {
   api,
   apiBase,
   confirm,
@@ -29,8 +34,14 @@ import {
   platformInitials,
   platformName,
   sportLabel,
+  statusLabel,
 } from "../../lib/format";
-import type { Account, Activity } from "../../lib/types";
+import type {
+  Account,
+  Activity,
+  ActivityDelivery,
+  ActivityReconcileResult,
+} from "../../lib/types";
 
 const id = ref(""),
   activity = ref<Activity | null>(null),
@@ -38,7 +49,10 @@ const id = ref(""),
   downloading = ref(false),
   reviewing = ref(false),
   deleting = ref(false),
-  dispatchingId = ref("");
+  dispatchingId = ref(""),
+  retryingJobId = ref(""),
+  reconciling = ref(false);
+let autoReconciledId = "";
 
 const averageSpeed = computed(() => {
   const ride = activity.value;
@@ -76,19 +90,122 @@ function copyForAccount(account: Account) {
   );
 }
 
+function deliveryForAccount(account: Account) {
+  return activity.value?.deliveries?.find(
+    (d) => d.accountId === account.id || d.platform === account.platform,
+  );
+}
+
+function isActiveDelivery(job?: ActivityDelivery) {
+  return !!job && ["PENDING", "RUNNING", "CONFIRMING", "RETRY"].includes(job.status);
+}
+
+function isRetryableDelivery(job?: ActivityDelivery) {
+  return !!job && ["FAILED", "WAITING_USER"].includes(job.status);
+}
+
+function deliveryTone(status: string) {
+  if (status === "SUCCEEDED") return "success";
+  if (status === "FAILED") return "danger";
+  if (["WAITING_USER", "RETRY"].includes(status)) return "amber";
+  return "neutral";
+}
+
+function accountSubtitle(account: Account) {
+  const copy = copyForAccount(account);
+  if (copy) {
+    return `已存在云端记录（远端编号 ${copy.remoteActivityId}）`;
+  }
+  const job = deliveryForAccount(account);
+  if (job && isActiveDelivery(job)) {
+    return job.message
+      ? `${statusLabel(job.status)}：${job.message}`
+      : `同步中（${statusLabel(job.status)}）`;
+  }
+  if (job && isRetryableDelivery(job)) {
+    return job.message
+      ? `${statusLabel(job.status)}：${job.message}`
+      : `同步未完成（${statusLabel(job.status)}）`;
+  }
+  if (account.status === "AUTH_EXPIRED") {
+    return "平台连接已过期，请在设置中重新连接";
+  }
+  if (reconciling.value && account.status === "CONNECTED") {
+    return "正在核对目标平台是否已有该活动…";
+  }
+  return "尚未同步到该平台";
+}
+
 onLoad((query) => {
   id.value = String(query?.id || "");
 });
 
-const { loading, error, reload } = useLoad(async () => {
+const { loading, refreshing, fatalError, staleError, reload } = useLoad(async (force) => {
   if (!id.value) throw new Error("缺少活动编号，请从活动列表重新进入");
   const [act, accs] = await Promise.all([
-    api<Activity>(`/activities/${encodeURIComponent(id.value)}`),
-    api<Account[]>("/accounts").catch(() => [] as Account[]),
+    fetchActivity(id.value, force),
+    fetchAccounts().catch(() => [] as Account[]),
   ]);
   activity.value = act;
   accounts.value = accs;
-});
+  const hasMissingConnected =
+    !act.needsReview &&
+    accs.some(
+      (a) =>
+        a.status === "CONNECTED" &&
+        !act.copies?.some(
+          (c) => c.accountId === a.id || c.platform === a.platform,
+        ),
+    );
+  if (hasMissingConnected && autoReconciledId !== act.id) {
+    autoReconciledId = act.id;
+    void reconcilePlatforms(false);
+  }
+}, { ttl: 60_000, scope: "activity" });
+
+async function reconcilePlatforms(force: boolean) {
+  if (!activity.value || activity.value.needsReview || reconciling.value) return;
+  const targetId = activity.value.id;
+  reconciling.value = true;
+  try {
+    const res = await api<ActivityReconcileResult>(
+      `/activities/${encodeURIComponent(targetId)}/reconcile`,
+      "POST",
+      { force },
+    );
+    if (res.matchedCount > 0) {
+      const [freshAct, freshAccs] = await Promise.all([
+        fetchActivity(targetId, true),
+        fetchAccounts(true).catch(() => accounts.value),
+      ]);
+      if (id.value === targetId) {
+        activity.value = freshAct;
+        accounts.value = freshAccs;
+      }
+      if (force) {
+        toast(`已检测到 ${res.matchedCount} 个平台存在该活动`);
+      }
+    } else if (force) {
+      if (res.results.some((r) => r.status === "AUTH_EXPIRED")) {
+        const freshAccs = await fetchAccounts(true).catch(
+          () => accounts.value,
+        );
+        if (id.value === targetId) {
+          accounts.value = freshAccs;
+        }
+      }
+      toast(
+        res.checkedCount > 0
+          ? "已完成核对，暂未发现新增已同步平台"
+          : "当前没有需要核对的已连接平台",
+      );
+    }
+  } catch (reason) {
+    if (force) toast(messageOf(reason));
+  } finally {
+    reconciling.value = false;
+  }
+}
 
 async function mergeIntoCandidate() {
   const candidate = activity.value?.reviewCandidate;
@@ -108,6 +225,10 @@ async function mergeIntoCandidate() {
       { decision: "MERGE_INTO_CANDIDATE" },
     );
     toast("已合并到候选活动");
+    invalidate("activity");
+    invalidate("activities");
+    invalidate("dashboard");
+    invalidate("jobs");
     uni.redirectTo({
       url: `/pages/activity/index?id=${encodeURIComponent(res.activityId)}`,
     });
@@ -132,7 +253,9 @@ async function keepSeparate() {
       decision: "KEEP_SEPARATE",
     });
     toast("已确认为独立活动");
-    await reload();
+    invalidate("activity");
+    invalidate("activities");
+    await reload(true);
   } catch (reason) {
     toast(messageOf(reason));
   } finally {
@@ -141,7 +264,7 @@ async function keepSeparate() {
 }
 
 async function dispatchToAccount(account: Account) {
-  if (!activity.value || dispatchingId.value) return;
+  if (!activity.value || dispatchingId.value || retryingJobId.value) return;
   if (activity.value.needsReview) {
     toast("请先完成相似活动核对");
     return;
@@ -158,10 +281,29 @@ async function dispatchToAccount(account: Account) {
         ? `已加入 ${platformName(account.platform)} 投递队列`
         : "该平台已有此活动或任务",
     );
+    invalidate("activity");
+    invalidate("jobs");
+    await reload(true);
   } catch (reason) {
     toast(messageOf(reason));
   } finally {
     dispatchingId.value = "";
+  }
+}
+
+async function retryDelivery(job: ActivityDelivery) {
+  if (!activity.value || dispatchingId.value || retryingJobId.value) return;
+  retryingJobId.value = job.jobId;
+  try {
+    await api(`/jobs/${encodeURIComponent(job.jobId)}/retry`, "POST");
+    toast("任务已重新排队");
+    invalidate("activity");
+    invalidate("jobs");
+    await reload(true);
+  } catch (reason) {
+    toast(messageOf(reason));
+  } finally {
+    retryingJobId.value = "";
   }
 }
 
@@ -177,7 +319,11 @@ async function removeActivity() {
   try {
     await api(`/activities/${encodeURIComponent(id.value)}`, "DELETE");
     toast("活动已删除");
-    go("activities");
+    invalidate("activity");
+    invalidate("activities");
+    invalidate("dashboard");
+    invalidate("jobs");
+    go("activities", { kind: "refresh" });
   } catch (reason) {
     toast(messageOf(reason));
   } finally {
@@ -246,8 +392,14 @@ async function download() {
       ><button class="btn secondary small" @click="go('activities')">
         返回活动列表
       </button></template
-    ><SessionGate @ready="reload"
-      ><LoadState :loading="loading" :error="error" @retry="reload"
+    ><SessionGate @ready="reload(true)"
+      ><LoadState
+        :loading="loading"
+        :refreshing="refreshing"
+        :error="fatalError"
+        :stale-error="staleError"
+        skeleton="detail"
+        @retry="reload(true)"
         ><template v-if="activity"
           ><view class="card detail-header activity-hero"
             ><view
@@ -379,7 +531,14 @@ async function download() {
                 ><text class="muted"
                   >查看此活动在各已连接平台的存在状态或单条补发</text
                 ></view
-              ></view
+              ><button
+                class="btn secondary small"
+                :disabled="reconciling || loading || activity.needsReview"
+                :loading="reconciling"
+                @click="reconcilePlatforms(true)"
+              >
+                {{ reconciling ? "检测中…" : "检测状态" }}
+              </button></view
             ><view
               v-for="account in accounts"
               :key="account.id"
@@ -393,18 +552,27 @@ async function download() {
                   ><text class="item-title"
                     >{{ platformName(account.platform) }} ·
                     {{ account.displayName }}</text
-                  ><text class="muted">{{
-                    copyForAccount(account)
-                      ? `已存在云端记录（远端编号 ${copyForAccount(account)?.remoteActivityId}）`
-                      : "尚未同步到该平台"
-                  }}</text></view
+                  ><text class="muted">{{ accountSubtitle(account) }}</text></view
                 ></view
               ><text v-if="copyForAccount(account)" class="tag success"
                 >已同步</text
+              ><text
+                v-else-if="isActiveDelivery(deliveryForAccount(account))"
+                class="tag"
+                :class="deliveryTone(deliveryForAccount(account)!.status)"
+                >{{ statusLabel(deliveryForAccount(account)!.status) }}</text
               ><button
+                v-else-if="isRetryableDelivery(deliveryForAccount(account))"
+                class="btn secondary small"
+                :disabled="!!dispatchingId || !!retryingJobId || activity.needsReview"
+                :loading="retryingJobId === deliveryForAccount(account)!.jobId"
+                @click="retryDelivery(deliveryForAccount(account)!)"
+              >
+                重试
+              </button><button
                 v-else
                 class="btn secondary small"
-                :disabled="!!dispatchingId || activity.needsReview"
+                :disabled="!!dispatchingId || !!retryingJobId || activity.needsReview"
                 :loading="dispatchingId === account.id"
                 @click="dispatchToAccount(account)"
               >

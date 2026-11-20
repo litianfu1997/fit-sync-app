@@ -4,7 +4,8 @@ import { onLoad } from "@dcloudio/uni-app";
 import SessionGate from "../../components/SessionGate.vue";
 import LoadState from "../../components/LoadState.vue";
 import TrackMap from "../../components/TrackMap.vue";
-import { api, detail, go, session } from "../../lib/api";
+import { detail, go, session } from "../../lib/api";
+import { fetchActivity } from "../../lib/data-cache";
 import { useLoad } from "../../lib/page";
 import { date, duration, km } from "../../lib/format";
 import { theme, themeStyle } from "../../lib/theme";
@@ -34,13 +35,24 @@ const summaryPill = computed(() => {
   return `${km(activity.value.distanceMeters)} 公里 · ${duration(activity.value.elapsedSeconds)}`;
 });
 
-const { loading, error, reload } = useLoad(async () => {
+const { loading, refreshing, fatalError, staleError, reload } = useLoad(async (force) => {
   if (!id.value) {
     activity.value = null;
     return;
   }
-  activity.value = await api<Activity>(`/activities/${encodeURIComponent(id.value)}`);
-});
+  activity.value = await fetchActivity(id.value, force);
+}, { ttl: 300_000, scope: "activity" });
+
+const tiles = ref<"loading" | "ready" | "failed">("loading");
+const mapRef = ref<{ retryTiles: () => void } | null>(null);
+
+function onTilesState(state: "loading" | "ready" | "failed") {
+  tiles.value = state;
+}
+function retryTiles() {
+  tiles.value = "loading";
+  mapRef.value?.retryTiles();
+}
 
 onLoad((query) => {
   id.value = query?.id ? decodeURIComponent(String(query.id)) : "";
@@ -79,17 +91,23 @@ function goBack() {
     </view>
 
     <view v-if="!session.token" class="fullscreen-map-state">
-      <SessionGate @ready="reload" />
+      <SessionGate @ready="reload(true)" />
     </view>
 
-    <view v-else-if="loading || error || !activity" class="fullscreen-map-state">
+    <view
+      v-else-if="loading || fatalError || !activity"
+      class="fullscreen-map-state"
+    >
       <LoadState
         :loading="loading"
-        :error="error"
+        :refreshing="refreshing"
+        :error="fatalError"
+        :stale-error="staleError"
         :empty="!activity"
+        skeleton="map"
         empty-title="没有找到这条活动"
         empty-text="它可能已被删除，或暂时无法读取。"
-        @retry="reload"
+        @retry="reload(true)"
       >
         <template #empty-action>
           <button class="btn secondary" @click="goBack">返回活动</button>
@@ -100,10 +118,26 @@ function goBack() {
     <view v-else class="fullscreen-map-body">
       <TrackMap
         v-if="hasTrack"
+        ref="mapRef"
         :points="activity.track"
         :interactive="true"
         height="100%"
+        @tiles-state="onTilesState"
       />
+      <!-- #ifdef H5 -->
+      <view v-if="hasTrack && tiles !== 'ready'" class="map-tile-overlay">
+        <view v-if="tiles === 'failed'" class="card map-tile-card">
+          <text class="empty-title">地图底图加载失败</text>
+          <text class="muted">轨迹仍然可以查看，网络恢复后可重试加载底图。</text>
+          <button class="btn secondary small" @click="retryTiles">
+            重试底图
+          </button>
+        </view>
+        <view v-else class="map-tile-loading" role="status">
+          <view class="spinner" /><text>地图加载中…</text>
+        </view>
+      </view>
+      <!-- #endif -->
       <view v-else class="fullscreen-map-state">
         <view class="card empty-state">
           <image

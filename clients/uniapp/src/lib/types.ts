@@ -73,6 +73,27 @@ export interface ActivityCopy {
   platform: PlatformCode;
   accountId?: string;
 }
+export interface ActivityDelivery {
+  jobId: string;
+  accountId: string;
+  platform: PlatformCode;
+  status: string;
+  message?: string;
+  updatedAtEpochMs?: number;
+}
+export interface ActivityReconcileItem {
+  accountId: string;
+  platform: PlatformCode;
+  status: string;
+  remoteActivityId?: string;
+  message?: string;
+}
+export interface ActivityReconcileResult {
+  checkedCount: number;
+  matchedCount: number;
+  skippedByCooldown: boolean;
+  results: ActivityReconcileItem[];
+}
 export interface ProfilePoint {
   seconds: number;
   speedMps?: number;
@@ -99,6 +120,7 @@ export interface Activity {
   track?: { lat: number; lon: number }[];
   profile?: ProfilePoint[];
   copies?: ActivityCopy[];
+  deliveries?: ActivityDelivery[];
   variants?: ActivityVariant[];
 }
 export interface Account {

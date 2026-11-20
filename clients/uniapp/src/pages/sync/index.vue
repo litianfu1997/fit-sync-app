@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref } from "vue";
 import { themeColors, theme } from "../../lib/theme";
-import { onLoad } from "@dcloudio/uni-app";
+import { onHide, onLoad, onShow } from "@dcloudio/uni-app";
 import AppShell from "../../components/AppShell.vue";
 import SessionGate from "../../components/SessionGate.vue";
 import LoadState from "../../components/LoadState.vue";
 import { api, apiBase, confirm, go, messageOf, session, toast } from "../../lib/api";
 import { useLoad } from "../../lib/page";
+import { cachedQuery } from "../../lib/query-cache";
+import { fetchAccounts, invalidate } from "../../lib/data-cache";
+import { useTabIntent } from "../../lib/tab-intent";
 import {
   date,
   platformName,
@@ -54,18 +57,26 @@ const source = ref<PlatformCode>("LOCAL"),
   syncMessage = ref("");
 const activityIds = ref<string[]>([]);
 const selectedMode = ref(false);
-onLoad((query) => {
-  if (query?.connect) {
-    showConnect.value = true;
-    const requested = String(query.connect).toUpperCase() as PlatformCode;
-    if (
-      ["COROS", "IGPSPORT", "ONELAP", "XINGZHE", "GARMIN", "STRAVA"].includes(
-        requested,
-      )
-    ) {
-      connectPlatform.value = requested;
-    }
+const CONNECT_PLATFORMS = ["COROS", "IGPSPORT", "ONELAP", "XINGZHE", "GARMIN", "STRAVA"];
+
+function applyConnect(platform?: string) {
+  showConnect.value = true;
+  const requested = String(platform || "").toUpperCase() as PlatformCode;
+  if (CONNECT_PLATFORMS.includes(requested)) connectPlatform.value = requested;
+}
+function applyActivityIds(raw: string) {
+  selectedMode.value = true;
+  try {
+    activityIds.value = decodeURIComponent(raw)
+      .split(",")
+      .filter((id) => /^[a-f0-9-]{36}$/i.test(id))
+      .slice(0, 100);
+  } catch {
+    syncError.value = "活动选择信息已失效，请返回活动列表重新选择";
   }
+}
+onLoad((query) => {
+  if (query?.connect) applyConnect(String(query.connect));
   if (query?.stravaOAuth === "success") {
     toast("Strava 已连接");
   } else if (query?.stravaOAuth === "error") {
@@ -79,16 +90,18 @@ onLoad((query) => {
       connectError.value = "Strava 授权未完成，请重试";
     }
   }
-  if (!query?.activityIds) return;
-  selectedMode.value = true;
-  try {
-    activityIds.value = decodeURIComponent(String(query.activityIds))
-      .split(",")
-      .filter((id) => /^[a-f0-9-]{36}$/i.test(id))
-      .slice(0, 100);
-  } catch {
-    syncError.value = "活动选择信息已失效，请返回活动列表重新选择";
-  }
+  if (query?.activityIds) applyActivityIds(String(query.activityIds));
+});
+useTabIntent("sync", (intent) => {
+  if (intent.kind === "connect") applyConnect(intent.platform);
+  else if (intent.kind === "activityIds") applyActivityIds(intent.ids.join(","));
+});
+onShow(() => {
+  if (oauthChallengeId.value && !oauthPollTimer)
+    startOAuthPoll(oauthChallengeId.value);
+});
+onHide(() => {
+  clearOAuthPoll();
 });
 onUnmounted(() => {
   clearOAuthPoll();
@@ -155,10 +168,10 @@ function applyDefaultRuleSportTypes() {
     ? ["CYCLING"]
     : ["CYCLING", "RUNNING", "OTHER"];
 }
-const { loading, error, reload } = useLoad(async () => {
+const { loading, refreshing, fatalError, staleError, reload } = useLoad(async (force) => {
   const [a, r] = await Promise.all([
-    api<Account[]>("/accounts"),
-    api<Rule[]>("/rules"),
+    fetchAccounts(force),
+    cachedQuery("rules", () => api<Rule[]>("/rules"), 30_000, force),
   ]);
   accounts.value = a;
   rules.value = r;
@@ -169,7 +182,7 @@ const { loading, error, reload } = useLoad(async () => {
     ruleDestination.value = ruleDestinations.value[0]?.id || "";
   applyDefaultSyncSportTypes();
   applyDefaultRuleSportTypes();
-});
+}, { ttl: 60_000, scope: "accounts" });
 function chooseSource(index: number) {
   source.value = sourceOptions.value[index].code;
   destinationIds.value = destinationIds.value.filter((id) =>
@@ -227,7 +240,9 @@ function startOAuthPoll(challengeId: string) {
         oauthAuthorizeUrl.value = "";
         showConnect.value = false;
         toast("Strava 已连接");
-        await reload();
+        invalidate("accounts");
+        invalidate("activity");
+        await reload(true);
       } else if (result.status === "FAILED" || result.status === "EXPIRED") {
         clearOAuthPoll();
         connectError.value = result.message || "Strava 授权已过期，请重新发起";
@@ -325,7 +340,9 @@ async function connect() {
     password.value = "";
     showConnect.value = false;
     toast("平台已连接");
-    await reload();
+    invalidate("accounts");
+    invalidate("activity");
+    await reload(true);
   } catch (reason) {
     connectError.value = messageOf(reason);
   } finally {
@@ -362,7 +379,9 @@ async function disconnect(account: Account) {
   try {
     await api(`/accounts/${account.id}`, "DELETE");
     toast("连接已解除");
-    await reload();
+    invalidate("accounts");
+    invalidate("activity");
+    await reload(true);
   } catch (reason) {
     toast(messageOf(reason));
   } finally {
@@ -435,7 +454,7 @@ async function saveRule() {
       sportTypes: ruleSportTypes.value,
     });
     toast("自动同步规则已保存");
-    await reload();
+    await reload(true);
   } catch (reason) {
     ruleError.value = messageOf(reason);
   } finally {
@@ -449,7 +468,7 @@ async function toggleRule(rule: Rule, enabled: boolean) {
   ruleBusy.value = rule.id || "";
   try {
     await api("/rules", "POST", { ...rule, enabled });
-    await reload();
+    await reload(true);
   } catch (reason) {
     toast(messageOf(reason));
   } finally {
@@ -467,7 +486,7 @@ async function deleteRule(rule: Rule) {
   ruleBusy.value = rule.id || "";
   try {
     await api(`/rules/${rule.id}`, "DELETE");
-    await reload();
+    await reload(true);
   } catch (reason) {
     toast(messageOf(reason));
   } finally {
@@ -483,11 +502,21 @@ const accountPlatform = (id: string) =>
     title="同步中心"
     subtitle="管理平台账号与自动同步规则"
     ><template #action
-      ><button class="btn secondary small" :disabled="loading" @click="reload">
-        刷新状态
+      ><button
+        class="btn secondary small"
+        :disabled="loading || refreshing"
+        @click="reload(true)"
+      >
+        {{ refreshing ? "刷新中…" : "刷新状态" }}
       </button></template
-    ><SessionGate @ready="reload"
-      ><LoadState :loading="loading" :error="error" @retry="reload"
+    ><SessionGate @ready="reload(true)"
+      ><LoadState
+        :loading="loading"
+        :refreshing="refreshing"
+        :error="fatalError"
+        :stale-error="staleError"
+        skeleton="list"
+        @retry="reload(true)"
         ><view class="card"
           ><view class="card-heading"
             ><view

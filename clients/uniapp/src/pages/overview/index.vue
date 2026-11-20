@@ -8,18 +8,24 @@ import NativeAd from "../../components/NativeAd.vue";
 import { api, go } from "../../lib/api";
 import { theme } from "../../lib/theme";
 import { useLoad } from "../../lib/page";
+import { cachedQuery } from "../../lib/query-cache";
 import { date, km } from "../../lib/format";
 import type { Activity, Dashboard, Page } from "../../lib/types";
 const dashboard = ref<Dashboard | null>(null),
   recent = ref<Activity[]>([]);
-const { loading, error, reload } = useLoad(async () => {
+const { loading, refreshing, fatalError, staleError, reload } = useLoad(async (force) => {
   const [summary, list] = await Promise.all([
-    api<Dashboard>("/dashboard"),
-    api<Page<Activity>>("/activities?page=0&size=4"),
+    cachedQuery("dashboard", () => api<Dashboard>("/dashboard"), 45_000, force),
+    cachedQuery(
+      "activities:recent",
+      () => api<Page<Activity>>("/activities?page=0&size=4"),
+      45_000,
+      force,
+    ),
   ]);
   dashboard.value = summary;
   recent.value = list.items;
-});
+}, { ttl: 45_000, scope: "dashboard" });
 </script>
 <template>
   <AppShell
@@ -27,11 +33,21 @@ const { loading, error, reload } = useLoad(async () => {
     title="概览"
     subtitle="云端活动、平台连接与同步状态"
     ><template #action
-      ><button class="btn secondary small" :disabled="loading" @click="reload">
-        刷新数据
+      ><button
+        class="btn secondary small"
+        :disabled="loading || refreshing"
+        @click="reload(true)"
+      >
+        {{ refreshing ? "刷新中…" : "刷新数据" }}
       </button></template
-    ><SessionGate @ready="reload"
-      ><LoadState :loading="loading" :error="error" @retry="reload"
+    ><SessionGate @ready="reload(true)"
+      ><LoadState
+        :loading="loading"
+        :refreshing="refreshing"
+        :error="fatalError"
+        :stale-error="staleError"
+        skeleton="hero"
+        @retry="reload(true)"
         ><view class="hero-card">
           <view class="hero-kicker"><view class="small-dot" /><text>云端同步</text></view>
           <text class="hero-data-label">活动总数</text>

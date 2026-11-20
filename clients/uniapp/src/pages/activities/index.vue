@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from "vue";
-import { onHide } from "@dcloudio/uni-app";
+import { onHide, onShow } from "@dcloudio/uni-app";
 import { themeColors, theme } from "../../lib/theme";
 import AppShell from "../../components/AppShell.vue";
 import SessionGate from "../../components/SessionGate.vue";
@@ -8,6 +8,12 @@ import LoadState from "../../components/LoadState.vue";
 import ActivityRow from "../../components/ActivityRow.vue";
 import { api, detail, go, messageOf, toast, uploadFit } from "../../lib/api";
 import { useLoad } from "../../lib/page";
+import { cachedQuery } from "../../lib/query-cache";
+import {
+  fetchAccounts as loadAccounts,
+  invalidate,
+} from "../../lib/data-cache";
+import { useTabIntent } from "../../lib/tab-intent";
 import { platformName, statusLabel } from "../../lib/format";
 import type {
   Account,
@@ -95,10 +101,16 @@ function activitiesQueryUrl() {
   return `/activities?${params.join("&")}`;
 }
 
-async function fetchActivities() {
+async function fetchActivities(force = false) {
   listBusy.value = true;
   try {
-    const result = await api<Page<Activity>>(activitiesQueryUrl());
+    const url = activitiesQueryUrl();
+    const result = await cachedQuery(
+      `activities:${url}`,
+      () => api<Page<Activity>>(url),
+      20_000,
+      force,
+    );
     activities.value = result.items;
     total.value = result.total;
   } finally {
@@ -107,7 +119,7 @@ async function fetchActivities() {
 }
 
 async function fetchAccounts() {
-  const list = await api<Account[]>("/accounts");
+  const list = await loadAccounts();
   accounts.value = list;
   const pullableIds = list
     .filter((a) => a.pullSupported !== false)
@@ -165,7 +177,10 @@ async function refreshPullStatus(explicitIds?: string[]) {
     if (wasPulling && status.jobs.length) {
       pullSummary.value = formatPullSummary(status);
       page.value = 0;
-      await Promise.all([fetchActivities(), fetchAccounts()]);
+      invalidate("accounts");
+      invalidate("activities");
+      invalidate("dashboard");
+      await Promise.all([fetchAccounts(), fetchActivities()]);
     }
   }
 }
@@ -179,9 +194,17 @@ function startPullPoll() {
   }, 1500);
 }
 
-const { loading, error, reload } = useLoad(async () => {
-  await Promise.all([fetchAccounts(), fetchActivities()]);
+const { loading, refreshing, error, fatalError, staleError, reload } = useLoad(async (force) => {
+  await Promise.all([fetchAccounts(), fetchActivities(force)]);
   await refreshPullStatus().catch(() => {});
+}, { ttl: 30_000, scope: "activities" });
+
+useTabIntent("activities", (intent) => {
+  if (intent.kind === "refresh") void reload(true);
+});
+
+onShow(() => {
+  if (pulling.value && !pullPollTimer) void refreshPullStatus();
 });
 
 watch(searchInput, (next) => {
@@ -257,10 +280,7 @@ function togglePullAccount(id: string) {
 }
 
 function openConnect(platform?: string) {
-  const suffix = platform
-    ? `?connect=${encodeURIComponent(platform)}`
-    : "?connect=1";
-  uni.reLaunch({ url: `/pages/sync/index${suffix}` });
+  go("sync", { kind: "connect", platform });
 }
 
 async function pullFromConnectedPlatforms() {
@@ -292,9 +312,7 @@ function chooseActivities(event: any) {
 
 function deliverSelected() {
   if (!selectedIds.value.length) return;
-  uni.navigateTo({
-    url: `/pages/sync/index?activityIds=${encodeURIComponent(selectedIds.value.join(","))}`,
-  });
+  go("sync", { kind: "activityIds", ids: [...selectedIds.value] });
 }
 
 async function turn(delta: number) {
@@ -375,12 +393,12 @@ const selectedPlatformFilterIndex = computed(() =>
     ><template #action
       ><button
         class="btn secondary small"
-        :disabled="loading || listBusy || importing"
-        @click="reload"
+        :disabled="loading || refreshing || listBusy || importing"
+        @click="reload(true)"
       >
-        刷新活动
+        {{ refreshing ? "刷新中…" : "刷新活动" }}
       </button></template
-    ><SessionGate @ready="reload"
+    ><SessionGate @ready="reload(true)"
       ><view class="activities-entry-grid"
         ><view class="card pull-card"
           ><view class="card-heading"
@@ -601,15 +619,18 @@ const selectedPlatformFilterIndex = computed(() =>
         ></view
       ><LoadState
         :loading="loading && !activities.length"
-        :error="error"
+        :refreshing="refreshing"
+        :error="fatalError"
+        :stale-error="staleError"
         :empty="!activities.length"
+        skeleton="list"
         :empty-title="hasActiveFilter ? '没有匹配的活动' : '还没有运动记录'"
         :empty-text="
           hasActiveFilter
             ? '试试调整搜索关键词、运动类型或来源筛选。'
             : '上方可一键从已连接平台去重拉取，或导入本地 FIT 文件。'
         "
-        @retry="reload"
+        @retry="reload(true)"
         ><template #empty-action
           ><button
             v-if="hasActiveFilter"
@@ -638,7 +659,9 @@ const selectedPlatformFilterIndex = computed(() =>
           >
             同步选中活动
           </button></view
-        ><view class="card activity-list"
+        ><view v-if="listBusy" class="inline-loading" role="status"
+          ><view class="spinner" /><text>正在加载活动…</text></view
+        ><view class="card activity-list" :class="{ 'is-loading': listBusy }"
           ><checkbox-group v-if="selecting" @change="chooseActivities"
             ><view
               v-for="activity in activities"

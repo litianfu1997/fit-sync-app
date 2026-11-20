@@ -1,6 +1,13 @@
 import { reactive } from "vue";
 import type { Config, LoginResult, User } from "./types";
 import { themeColors } from "./theme";
+import {
+  notifyIfActive,
+  routeOf,
+  setTabIntent,
+  type TabIntent,
+} from "./tab-intent";
+import { beginNavigation, endNavigation } from "./nav-progress";
 
 const TOKEN_KEY = "fitsync.session.v1";
 export const session = reactive({
@@ -180,10 +187,10 @@ export async function initialize(force = false): Promise<void> {
   })();
   return initializing;
 }
-/** 发送邮箱验证码（注册或绑定邮箱）。 */
+/** 发送邮箱验证码（登录、注册或绑定邮箱）。 */
 export async function sendEmailCode(
   email: string,
-  purpose: "REGISTER" | "BIND",
+  purpose: "LOGIN" | "REGISTER" | "BIND",
 ): Promise<{ success: boolean }> {
   return api<{ success: boolean }>(
     "/auth/email/code",
@@ -191,6 +198,16 @@ export async function sendEmailCode(
     { email, purpose },
     purpose === "BIND",
   );
+}
+/** 邮箱验证码登录，成功后保存会话。 */
+export async function loginWithEmailCode(email: string, code: string) {
+  const result = await api<LoginResult>(
+    "/auth/login",
+    "POST",
+    { email, code },
+    false,
+  );
+  setSession(result);
 }
 /** 邮箱验证码注册，成功后保存会话。 */
 export async function registerWithEmail(
@@ -381,12 +398,77 @@ export function confirm(title: string, content: string): Promise<boolean> {
     }),
   );
 }
-export function go(page: string) {
-  uni.reLaunch({ url: `/pages/${page}/index` });
+const TAB_PAGES = new Set(["overview", "activities", "sync", "jobs", "settings"]);
+const MAX_PAGE_STACK = 9;
+let navigationLocked = false;
+
+/**
+ * tab 页导航：优先复用页面栈里已有的实例，避免每次切页销毁重建。
+ * 目标不在栈中时新增页面；栈接近小程序 10 层上限时改为替换。
+ */
+export function go(page: string, intent?: TabIntent) {
+  const target = `/pages/${page}/index`;
+  if (!TAB_PAGES.has(page)) {
+    beginNavigation();
+    uni.navigateTo({
+      url: target,
+      complete: endNavigation,
+      fail: endNavigation,
+    });
+    return;
+  }
+  if (intent) setTabIntent(page, intent);
+
+  const stack = getCurrentPages();
+  const wanted = target.slice(1);
+  if (routeOf(stack[stack.length - 1]) === wanted) {
+    if (intent) notifyIfActive(page);
+    return;
+  }
+
+  let index = -1;
+  for (let i = stack.length - 1; i >= 0; i -= 1) {
+    if (routeOf(stack[i]) === wanted) {
+      index = i;
+      break;
+    }
+  }
+
+  if (navigationLocked) return;
+  navigationLocked = true;
+  beginNavigation();
+  const done = () => {
+    navigationLocked = false;
+    endNavigation();
+  };
+
+  if (index >= 0) {
+    uni.navigateBack({ delta: stack.length - 1 - index, complete: done });
+    return;
+  }
+  if (stack.length >= MAX_PAGE_STACK) {
+    uni.redirectTo({ url: target, complete: done });
+    return;
+  }
+  uni.navigateTo({
+    url: target,
+    complete: done,
+    fail: () => uni.redirectTo({ url: target, complete: done }),
+  });
 }
 export function detail(id: string) {
-  uni.navigateTo({ url: `/pages/activity/index?id=${encodeURIComponent(id)}` });
+  beginNavigation();
+  uni.navigateTo({
+    url: `/pages/activity/index?id=${encodeURIComponent(id)}`,
+    complete: endNavigation,
+    fail: endNavigation,
+  });
 }
 export function openMap(id: string) {
-  uni.navigateTo({ url: `/pages/map/index?id=${encodeURIComponent(id)}` });
+  beginNavigation();
+  uni.navigateTo({
+    url: `/pages/map/index?id=${encodeURIComponent(id)}`,
+    complete: endNavigation,
+    fail: endNavigation,
+  });
 }

@@ -38,10 +38,14 @@ const props = withDefaults(
   },
 );
 
-const emit = defineEmits<{ (e: "tap"): void }>();
+const emit = defineEmits<{
+  (e: "tap"): void;
+  (e: "tiles-state", state: "loading" | "ready" | "failed"): void;
+}>();
 
 const uid = Math.random().toString(36).slice(2, 9);
 const validPoints = computed(() => filterValidPoints(props.points));
+const renderPoints = computed(() => downsamplePoints(validPoints.value, 2500));
 const containerStyle = computed(() => ({ height: props.height }));
 
 // #ifdef H5
@@ -69,6 +73,10 @@ const viewLon = ref(121.4737);
 const viewZoom = ref(MAP_MIN_ZOOM);
 const hasUserViewport = ref(false);
 const hasAnyTileReady = ref(false);
+const tileState = ref<"loading" | "ready" | "failed">("loading");
+let pendingTiles = 0;
+let failedTiles = 0;
+let tileWatchdog: ReturnType<typeof setTimeout> | null = null;
 
 let hostEl: HTMLElement | null = null;
 let canvasEl: HTMLCanvasElement | null = null;
@@ -81,13 +89,35 @@ const activePointers = new Map<number, { x: number; y: number }>();
 let lastPanPoint: { x: number; y: number } | null = null;
 let lastPinchDist = 0;
 
+function armTileWatchdog() {
+  if (tileWatchdog) return;
+  tileWatchdog = setTimeout(() => {
+    tileWatchdog = null;
+    if (!hasAnyTileReady.value && tileState.value === "loading")
+      tileState.value = "failed";
+  }, 8000);
+}
+function markTileReady() {
+  if (!hasAnyTileReady.value) hasAnyTileReady.value = true;
+  if (tileWatchdog) {
+    clearTimeout(tileWatchdog);
+    tileWatchdog = null;
+  }
+  tileState.value = "ready";
+}
+function settleTileState() {
+  if (hasAnyTileReady.value) tileState.value = "ready";
+  else if (pendingTiles <= 0 && failedTiles > 0) tileState.value = "failed";
+  else tileState.value = "loading";
+}
+
 function requestTile(z: number, x: number, y: number): HTMLImageElement | null {
   const cache = getTileCache();
   const key = `${z}/${x}/${y}`;
   const existing = cache.get(key);
   if (existing) {
     if (existing.status === "ready") {
-      hasAnyTileReady.value = true;
+      markTileReady();
       return existing.img;
     }
     return null;
@@ -99,16 +129,38 @@ function requestTile(z: number, x: number, y: number): HTMLImageElement | null {
   const img = new Image();
   const entry: TileCacheEntry = { status: "loading", img };
   cache.set(key, entry);
+  pendingTiles += 1;
+  armTileWatchdog();
   img.onload = () => {
     entry.status = "ready";
-    hasAnyTileReady.value = true;
+    pendingTiles = Math.max(0, pendingTiles - 1);
+    markTileReady();
     scheduleDraw();
   };
   img.onerror = () => {
     entry.status = "error";
+    pendingTiles = Math.max(0, pendingTiles - 1);
+    failedTiles += 1;
+    settleTileState();
   };
   img.src = `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
   return null;
+}
+
+function retryTiles() {
+  const cache = getTileCache();
+  for (const [key, entry] of [...cache.entries()]) {
+    if (entry.status === "error") cache.delete(key);
+  }
+  pendingTiles = 0;
+  failedTiles = 0;
+  if (tileWatchdog) {
+    clearTimeout(tileWatchdog);
+    tileWatchdog = null;
+  }
+  tileState.value = hasAnyTileReady.value ? "ready" : "loading";
+  armTileWatchdog();
+  scheduleDraw();
 }
 
 function fitToTrack(resetUserFlag = true) {
@@ -181,7 +233,7 @@ function drawFrame() {
   ctx.fillStyle = colors["surface-high"];
   ctx.fillRect(0, 0, w, h);
 
-  const pts = validPoints.value;
+  const pts = renderPoints.value;
   if (!pts.length) return;
 
   const zoom = viewZoom.value;
@@ -398,8 +450,15 @@ onMounted(() => {
   nextTick(() => setupH5Canvas());
 });
 
+watch(tileState, (state) => emit("tiles-state", state));
+defineExpose({ retryTiles });
+
 onBeforeUnmount(() => {
   if (rafId !== null) window.cancelAnimationFrame(rafId);
+  if (tileWatchdog) {
+    clearTimeout(tileWatchdog);
+    tileWatchdog = null;
+  }
   resizeObserver?.disconnect();
   if (canvasEl) {
     canvasEl.removeEventListener("pointerdown", handlePointerDown);

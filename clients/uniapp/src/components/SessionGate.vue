@@ -3,6 +3,7 @@ import { computed, onUnmounted, ref, watch } from "vue";
 import {
   initialize,
   loginAsDev,
+  loginWithEmailCode,
   loginWithPassword,
   loginWithWechat,
   messageOf,
@@ -59,6 +60,15 @@ onUnmounted(() => {
 const useEmailRegister = computed(
   () => emailAuthEnabled.value && registerByEmail.value,
 );
+const loginByEmail = ref(false);
+const useEmailLogin = computed(
+  () => emailAuthEnabled.value && loginByEmail.value,
+);
+const showEmailFields = computed(
+  () =>
+    (mode.value === "login" && useEmailLogin.value) ||
+    (mode.value === "register" && useEmailRegister.value),
+);
 const displayError = computed(() => error.value || session.authNotice);
 
 function clearNotice() {
@@ -72,6 +82,21 @@ function switchMode(next: "login" | "register") {
   clearNotice();
   password.value = "";
   confirmPassword.value = "";
+  emailCode.value = "";
+}
+
+function toggleLoginKind() {
+  if (busy.value || !emailAuthEnabled.value) return;
+  clearNotice();
+  password.value = "";
+  emailCode.value = "";
+  if (!loginByEmail.value) {
+    if (!email.value && account.value.includes("@"))
+      email.value = account.value.trim();
+  } else if (!account.value && email.value) {
+    account.value = email.value;
+  }
+  loginByEmail.value = !loginByEmail.value;
 }
 
 function toggleRegisterKind() {
@@ -106,7 +131,7 @@ async function requestEmailCode() {
     return (error.value = "邮箱格式不正确");
   sendingCode.value = true;
   try {
-    await sendEmailCode(addr, "REGISTER");
+    await sendEmailCode(addr, mode.value === "login" ? "LOGIN" : "REGISTER");
     startCooldown();
     toast("验证码已发送至邮箱，请查收");
   } catch (reason) {
@@ -121,6 +146,26 @@ async function submitPassword() {
   const pwd = password.value;
 
   if (mode.value === "login") {
+    if (useEmailLogin.value) {
+      const addr = email.value.trim().toLowerCase();
+      const code = emailCode.value.trim();
+      if (!addr) return (error.value = "请输入邮箱地址");
+      if (addr.length > 160 || !EMAIL_RE.test(addr))
+        return (error.value = "邮箱格式不正确");
+      if (!/^\d{6}$/.test(code))
+        return (error.value = "请输入 6 位数字验证码");
+      busy.value = true;
+      try {
+        await loginWithEmailCode(addr, code);
+        emailCode.value = "";
+        emit("ready");
+      } catch (reason) {
+        error.value = messageOf(reason);
+      } finally {
+        busy.value = false;
+      }
+      return;
+    }
     const acct = account.value.trim();
     if (!acct) return (error.value = "请输入邮箱或用户名");
     if (!pwd) return (error.value = "请输入密码");
@@ -260,7 +305,7 @@ async function retry() {
           ></view
         >
 
-        <template v-if="mode === 'login'">
+        <template v-if="mode === 'login' && !useEmailLogin">
           <view class="form-field"
             ><text class="field-label">邮箱或用户名</text
             ><input
@@ -273,7 +318,7 @@ async function retry() {
           >
         </template>
 
-        <template v-else-if="useEmailRegister">
+        <template v-else-if="showEmailFields">
           <view class="form-field"
             ><text class="field-label">邮箱</text
             ><input
@@ -325,7 +370,8 @@ async function retry() {
             maxlength="24"
             placeholder="选填"
             :disabled="busy" /></view
-        ><view class="form-field"
+        >
+        <view v-if="mode === 'register' || !useEmailLogin" class="form-field"
           ><text class="field-label">密码</text
           ><input
             v-model="password"
@@ -347,6 +393,10 @@ async function retry() {
             placeholder="再次输入密码"
             :disabled="busy"
             @confirm="submitPassword" /></view
+        ><view v-if="mode === 'login' && emailAuthEnabled" class="auth-subswitch"
+          ><button class="text-button" :disabled="busy" @click="toggleLoginKind">
+            {{ useEmailLogin ? "改用密码登录" : "改用邮箱验证码登录" }}
+          </button></view
         ><view v-if="mode === 'register' && emailAuthEnabled" class="auth-subswitch"
           ><button class="text-button" :disabled="busy" @click="toggleRegisterKind">
             {{ useEmailRegister ? "改用用户名注册" : "改用邮箱验证码注册" }}

@@ -372,7 +372,7 @@ async function logout() {
 
           <view v-if="hasEmail" class="info-notice notice"
             ><text
-              >已绑定邮箱：{{ session.user?.email }}，可用于密码登录及关联同邮箱 Google 账号。</text
+              >已绑定邮箱：{{ session.user?.email }}，可用于验证码或密码登录，并关联同邮箱 Google 账号。</text
             ></view
           >
           <view v-else-if="emailAuthEnabled" class="form-panel"

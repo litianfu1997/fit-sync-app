@@ -21,12 +21,16 @@ const trackPointsAttr = computed(() => {
     (p) => Number.isFinite(p.lat) && Number.isFinite(p.lon),
   );
   if (valid.length < 2) return "";
-  const lats = valid.map((p) => p.lat);
-  const lons = valid.map((p) => p.lon);
-  const minLat = Math.min(...lats);
-  const maxLat = Math.max(...lats);
-  const minLon = Math.min(...lons);
-  const maxLon = Math.max(...lons);
+  let minLat = Infinity,
+    maxLat = -Infinity,
+    minLon = Infinity,
+    maxLon = -Infinity;
+  for (const point of valid) {
+    if (point.lat < minLat) minLat = point.lat;
+    if (point.lat > maxLat) maxLat = point.lat;
+    if (point.lon < minLon) minLon = point.lon;
+    if (point.lon > maxLon) maxLon = point.lon;
+  }
   const cosLat = Math.max(
     0.2,
     Math.cos((((minLat + maxLat) / 2) * Math.PI) / 180),
