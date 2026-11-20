@@ -156,6 +156,18 @@ const selectedRuleSource = computed(() =>
 const selectedRuleDestination = computed(() =>
   ruleDestinations.value.findIndex((a) => a.id === ruleDestination.value),
 );
+const ruleDestinationOptions = computed(() =>
+  ruleDestinations.value.map((a) => ({
+    id: a.id,
+    label: `${platformName(a.platform)} · ${a.displayName}`,
+  })),
+);
+const ruleDestinationLabel = computed(() => {
+  const account = accounts.value.find((a) => a.id === ruleDestination.value);
+  return account
+    ? `${platformName(account.platform)} · ${account.displayName}`
+    : "";
+});
 function applyDefaultSyncSportTypes() {
   if (syncSportTouched.value) return;
   syncSportTypes.value = onlyOnelapDestination.value
@@ -871,16 +883,14 @@ const accountPlatform = (id: string) =>
                 ></picker
               ><text class="flow-arrow">↓</text
               ><picker
-                :range="ruleDestinations"
-                range-key="displayName"
+                :range="ruleDestinationOptions"
+                range-key="label"
                 :value="Math.max(0, selectedRuleDestination)"
-                :disabled="!ruleDestinations.length"
+                :disabled="!ruleDestinationOptions.length"
                 @change="chooseRuleDestination(Number($event.detail.value))"
                 ><view class="input select-input"
                   >{{
-                    ruleDestinations.length
-                      ? platformName(accountPlatform(ruleDestination))
-                      : "请先连接目标平台"
+                    ruleDestinationLabel || "请先连接目标平台"
                   }}<text>⌄</text></view
                 ></picker
               ><view class="rule-sport-field"
