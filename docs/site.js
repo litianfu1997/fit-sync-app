@@ -78,7 +78,7 @@
       const version = typeof release.tag_name === 'string' ? release.tag_name.replace(/-build\..*$/, '') : '最新版本';
       const size = Number.isFinite(apk.size) && apk.size > 0 ? ` · ${(apk.size / 1024 / 1024).toFixed(1)} MB` : '';
       document.querySelectorAll('[data-release-meta]').forEach((meta) => {
-        meta.textContent = `${version}${size} · Android 8.0+`;
+        meta.textContent = `${version}${size} · Android 8.0+ · 网页版免安装`;
       });
     } catch {
       // 离线、超时或接口限流时，继续使用静态下载入口。

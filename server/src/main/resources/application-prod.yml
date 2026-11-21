@@ -1,0 +1,11 @@
+spring:
+  datasource:
+    url: ${DATABASE_URL}
+    username: ${DATABASE_USERNAME}
+    password: ${DATABASE_PASSWORD}
+fitsync:
+  dev-login-enabled: false
+  cors-origins: ${FITSYNC_CORS_ORIGINS:}
+server:
+  address: 0.0.0.0
+  forward-headers-strategy: framework

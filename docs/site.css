@@ -74,6 +74,8 @@ h1 > span { color: var(--orange); }
 .hero-description { max-width: 510px; margin-top: 25px; color: #606774; font-size: 16px; line-height: 1.95; }
 .hero-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 31px; }
 .release-meta { min-height: 20px; margin-top: 15px; color: #656d79; font-size: 12px; line-height: 1.8; }
+.source-link { margin-top: 2px; }
+.source-link .text-link { min-height: 34px; color: #5e6673; font-size: 12px; }
 .hero-proof { display: flex; flex-wrap: wrap; gap: 24px; margin-top: 34px; padding-top: 25px; border-top: 1px solid var(--line); color: #535c68; font-size: 12px; }
 .hero-proof > span { display: inline-flex; align-items: center; gap: 5px; }
 .hero-proof .icon { width: 17px; height: 17px; color: var(--orange); }
@@ -204,6 +206,7 @@ h2 { font-size: clamp(32px, 3.6vw, 48px); line-height: 1.32; font-weight: 800; l
 .step-number { display: grid; width: 35px; height: 35px; margin-bottom: 21px; place-items: center; border: 1px solid #f0d7ca; border-radius: 10px; color: #b84113; background: #fff2e9; font-size: 15px; font-weight: 750; }
 .start-steps h3 { font-size: 21px; font-weight: 700; letter-spacing: -.04em; }
 .start-steps p { max-width: 300px; margin-top: 13px; color: #626d7b; font-size: 13px; line-height: 1.85; }
+.start-steps p a, .faq-list details p a { color: #a63b13; text-decoration: underline; text-underline-offset: 3px; }
 .faq-section { display: grid; grid-template-columns: .75fr 1fr; gap: 95px; padding-block: 0 105px; }
 .faq-heading h2 { font-size: 38px; }
 .faq-heading > p:last-child { margin-top: 28px; color: #68717e; font-size: 13px; line-height: 1.9; }

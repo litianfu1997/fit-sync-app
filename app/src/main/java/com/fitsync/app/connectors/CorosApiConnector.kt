@@ -33,10 +33,10 @@ import java.net.URI
  * - 鉴权：业务请求带 `accesstoken: <token>` 头（非 Bearer）。
  * - 列表：`GET /activity/query?size=&pageNumber=`（活动 ID = labelId，sportType 写入 metadata）。
  * - 下载：`POST /activity/detail/download?labelId=&sportType=&fileType=4`（fileType=4=FIT）→ `data.fileUrl` → 匿名 GET。
- * - 上传：① `GET faq.coros.com/openapi/oss/sts` 拿 STS 凭证（删盐 base64 解码）
+ * - 上传：① `GET trainingcn.coros.com/api/proxy/oss/sts`（Cookie `CPL-coros-token` / `CPL-coros-region=2`）拿 STS 凭证（删盐 base64 解码）
  *        ② FIT 打 zip
  *        ③ [CorosOssSigner] V1 签名 PUT 到阿里云 OSS（bucket coros-oss@北京）
- *        ④ `POST /activity/fit/import`（multipart 字段 jsonParameter，serviceName="oss"）
+ *        ④ `POST /activity/fit/import`（multipart 字段 jsonParameter，serviceName 取 STS 返回值）
  *
  * 仅支持中国站（regionId=2）。协议为逆向私有接口，可能随 COROS 调整失效（实验性）。
  */
@@ -207,9 +207,10 @@ internal class CorosApiConnector(
 
     /** STS 凭证 → 打 zip → OSS V1 签名 PUT → multipart import。 */
     private suspend fun uploadViaOss(file: File, uploadName: String): ConnectorResult<RemoteCopy> = withRelogin {
-        // 1) 申请 OSS STS 临时凭证（固定 sign，不走 apiRequest，不 inject accesstoken）
+        // 1) 申请 OSS STS 临时凭证（走网页代理接口，需带 CPL-coros-token / CPL-coros-region Cookie）
         val sts = when (val result = fetchOssSts()) {
             is ConnectorResult.Success -> result.value
+            is ConnectorResult.RequiresLogin -> return@withRelogin result
             is ConnectorResult.RetryableFailure -> return@withRelogin result
             is ConnectorResult.PermanentFailure -> return@withRelogin result
             else -> return@withRelogin ConnectorResult.PermanentFailure(
@@ -230,7 +231,7 @@ internal class CorosApiConnector(
                 resp.code.toString(), "COROS OSS 上传失败（HTTP ${resp.code}）",
             )
         }
-        // 4) 通知服务端用该 OSS 对象创建活动（serviceName 必须 "oss"，不是 sts 的 "aliyun"）
+        // 4) 通知服务端用该 OSS 对象创建活动（serviceName 与网页代理 STS 返回值一致）
         val jsonParameter = JSONObject()
             .put("source", 1)
             .put("timezone", TIMEZONE_CN)
@@ -238,7 +239,7 @@ internal class CorosApiConnector(
             .put("md5", fitMd5)
             .put("size", zipBytes.size)
             .put("object", objectKey)
-            .put("serviceName", "oss")
+            .put("serviceName", sts.serviceName)
             .put("oriFileName", uploadName)
             .toString()
         val multipart = MultipartBody.Builder().setType(MultipartBody.FORM)
@@ -267,16 +268,21 @@ internal class CorosApiConnector(
         }
     }
 
-    /** `GET faq.coros.com/openapi/oss/sts`，区分临时网络失败与永久协议错误。 */
+    /** `GET trainingcn.coros.com/api/proxy/oss/sts`，鉴权失败上报 RequiresLogin 供静默重登。 */
     private suspend fun fetchOssSts(): ConnectorResult<CorosStsCredentials> = runCatching {
-        val url = "$OSS_STS_URL?bucket=$OSS_BUCKET&service=$OSS_SERVICE_QS&app_id=$OSS_APP_ID&sign=$OSS_SIGN&v=2"
+        val token = sessionManager.token(platform)?.takeIf { it.isNotBlank() }
+            ?: return requiresLogin()
         execute(
-            Request.Builder().url(url).get()
+            Request.Builder().url(OSS_STS_URL).get()
                 .header("Accept", "application/json, text/plain, */*")
+                .header("Origin", WEB_SITE_ORIGIN)
+                .header("Referer", "$WEB_SITE_ORIGIN/")
                 .header("User-Agent", USER_AGENT)
+                .header("Cookie", "CPL-coros-token=$token; CPL-coros-region=$REGION_CN")
                 .build(),
         ).use { resp ->
             when {
+                resp.code == 401 || resp.code == 403 -> requiresLogin()
                 resp.code == 408 || resp.code == 429 || resp.code >= 500 ->
                     ConnectorResult.RetryableFailure(
                         resp.code.toString(),
@@ -286,12 +292,23 @@ internal class CorosApiConnector(
                     resp.code.toString(),
                     "COROS 上传凭证请求失败（HTTP ${resp.code}）",
                 )
-                else -> parseCorosSts(resp.body?.string().orEmpty())
-                    ?.let { ConnectorResult.Success(it) }
-                    ?: ConnectorResult.PermanentFailure(
-                        "COROS_STS_INVALID_RESPONSE",
-                        "COROS 未返回有效上传凭证（接口可能已变更）",
-                    )
+                else -> {
+                    val text = resp.body?.string().orEmpty()
+                    val code = runCatching { JSONObject(text).optInt("code", -1) }.getOrDefault(-1)
+                    if (code == 401 || code == 403) return@use requiresLogin()
+                    val sts = parseCorosSts(text)
+                        ?: return@use ConnectorResult.PermanentFailure(
+                            "COROS_STS_INVALID_RESPONSE",
+                            "COROS 未返回有效上传凭证（接口可能已变更）",
+                        )
+                    if (sts.serviceName !in setOf("aliyun", "oss")) {
+                        return@use ConnectorResult.PermanentFailure(
+                            "COROS_STS_UNSUPPORTED_SERVICE",
+                            "COROS 返回了暂不支持的存储服务类型",
+                        )
+                    }
+                    ConnectorResult.Success(sts)
+                }
             }
         }
     }.getOrElse {
@@ -363,17 +380,13 @@ internal class CorosApiConnector(
 
     companion object {
         private const val WEB_ORIGIN = "https://teamcnapi.coros.com"
+        private const val WEB_SITE_ORIGIN = "https://trainingcn.coros.com"
         private const val API_BASE = "https://teamcnapi.coros.com"
         private const val LOGIN_URL = "$API_BASE/account/login"
         private const val LIST_URL = "$API_BASE/activity/query"
         private const val DOWNLOAD_URL = "$API_BASE/activity/detail/download"
         private const val IMPORT_URL = "$API_BASE/activity/fit/import"
-        private const val OSS_STS_URL = "https://faq.coros.com/openapi/oss/sts"
-
-        private const val OSS_APP_ID = "1660188068672619112"
-        private const val OSS_SIGN = "9AD4AA35AAFEE6BB1E847A76848D58DF"
-        private const val OSS_BUCKET = "coros-oss"
-        private const val OSS_SERVICE_QS = "aliyun" // sts query 参数；⚠️ import 的 serviceName 必须 "oss"
+        private const val OSS_STS_URL = "$WEB_SITE_ORIGIN/api/proxy/oss/sts"
 
         private const val ACCOUNT_TYPE = 2 // 邮箱登录
         private const val REGION_CN = 2

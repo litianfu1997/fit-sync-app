@@ -1,0 +1,18 @@
+{
+  "name": "FitSync",
+  "appid": "",
+  "description": "骑行活动管理与跨平台同步",
+  "versionName": "0.1.0",
+  "versionCode": "1",
+  "transformPx": false,
+  "h5": { "title": "FitSync", "router": { "mode": "hash" }, "darkmode": true, "themeLocation": "theme.json" },
+  "mp-weixin": {
+    "appid": "wx29c36a9a81bf9220",
+    "darkmode": true,
+    "themeLocation": "theme.json",
+    "setting": { "urlCheck": true, "es6": true, "minified": true },
+    "usingComponents": true,
+    "requiredPrivateInfos": []
+  },
+  "uniStatistics": { "enable": false }
+}

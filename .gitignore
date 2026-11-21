@@ -24,3 +24,18 @@ out/
 /keystore/
 *.jks
 *.keystore
+
+# 云端与跨端工程的本机配置、依赖及构建产物
+/.cache/
+**/target/
+**/node_modules/
+/server/data/
+/clients/uniapp/dist/
+/clients/uniapp/.env.local
+/clients/uniapp/.env.*.local
+/server/.env
+/.env.cloud
+.data/
+
+# ZCode 本机会话/计划目录
+/.zcode/

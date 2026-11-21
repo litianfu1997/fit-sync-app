@@ -2,6 +2,7 @@ package com.fitsync.app.web
 
 import android.graphics.Bitmap
 import android.net.http.SslError
+import android.os.Looper
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -19,6 +20,7 @@ import com.fitsync.app.domain.model.Platform
 import com.fitsync.app.domain.model.SessionState
 import com.fitsync.app.sync.SyncScheduler
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -39,8 +41,12 @@ class GarminSilentSessionRefresher(
     private val accounts: PlatformAccountRepository,
 ) {
     private val refreshing = AtomicBoolean(false)
+    private val lastRefreshAttemptMs = AtomicLong(0L)
 
     fun refreshOnAppStart(activity: ComponentActivity) {
+        val now = System.currentTimeMillis()
+        val lastAttempt = lastRefreshAttemptMs.get()
+        if (lastAttempt > 0L && now - lastAttempt < REFRESH_COOLDOWN_MS) return
         if (!refreshing.compareAndSet(false, true)) return
         activity.lifecycleScope.launch {
             val shouldRefresh = withContext(Dispatchers.IO) {
@@ -54,8 +60,22 @@ class GarminSilentSessionRefresher(
                 refreshing.set(false)
                 return@launch
             }
-            runCatching { startHiddenRefresh(activity) }
-                .onFailure { refreshing.set(false) }
+            // 让出冷启动前 4 秒交互窗口，再等主线程空闲帧才实例化 WebView，避免首屏掉帧。
+            delay(START_REFRESH_DELAY_MS)
+            if (activity.isFinishing || activity.isDestroyed) {
+                refreshing.set(false)
+                return@launch
+            }
+            lastRefreshAttemptMs.set(System.currentTimeMillis())
+            Looper.myQueue().addIdleHandler {
+                if (activity.isFinishing || activity.isDestroyed) {
+                    refreshing.set(false)
+                } else {
+                    runCatching { startHiddenRefresh(activity) }
+                        .onFailure { refreshing.set(false) }
+                }
+                false
+            }
         }
     }
 
@@ -159,6 +179,8 @@ class GarminSilentSessionRefresher(
     }
 
     companion object {
+        private const val START_REFRESH_DELAY_MS = 4_000L
+        private const val REFRESH_COOLDOWN_MS = 15L * 60 * 1000
         private const val REFRESH_TIMEOUT_MS = 30_000L
         private const val GARMIN_DESKTOP_USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +

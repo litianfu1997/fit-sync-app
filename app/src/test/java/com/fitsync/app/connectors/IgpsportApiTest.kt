@@ -137,4 +137,20 @@ class IgpsportApiTest {
             file.delete()
         }
     }
+
+    @Test
+    fun parseActivities_marksDateOnlyStartTimePrecisionAndParsesStringDownloadUrl() {
+        val json = """{"code":0,"data":{"rows":[""" +
+            """{"rideId":201,"title":"基础训练","startTime":"2026.08.22","rideDistance":8187.88,"exerciseType":5},""" +
+            """{"rideId":202,"title":"晨骑","startTime":"2026-08-22 17:48:08","rideDistance":42500.0,"exerciseType":0}""" +
+            """]}}"""
+        val items = requireNotNull(parseIgpsportActivities(json))
+        assertThat(items).hasSize(2)
+        assertThat(items[0].metadata["start_time_precision"]).isEqualTo("DATE")
+        assertThat(items[1].metadata.containsKey("start_time_precision")).isFalse()
+
+        val downloadJson = """{"code":0,"data":"https://igp-zh.oss-cn-hangzhou.aliyuncs.com/direct.fit"}"""
+        assertThat(parseIgpsportFitUrl(downloadJson))
+            .isEqualTo("https://igp-zh.oss-cn-hangzhou.aliyuncs.com/direct.fit")
+    }
 }

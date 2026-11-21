@@ -121,3 +121,6 @@ git bash 下 `adb shell … /sdcard/xxx` 会被 MSYS 路径转换破坏（变成
 - `System.currentTimeMillis()` 用于持久化的 epoch ms；测试里需要可控时间时用依赖注入或 `calculatePullSince` 这类纯函数（已有 `SyncWindowTest` 覆盖）。
 - UI 主题在 `ui/theme/Theme.kt`。`design-system/fitsync/MASTER.md` 是早期生成的 Web 端设计参考（配色/字体为 CSS 变量），与 Compose 实现不完全对应，作灵感参考即可。
 - 文档：`README.md`（总览）、`docs/platform-capabilities.md`（五平台能力矩阵与执行模式语义）。
+  35.201.205.33:22
+  用户名ltf
+  ssh密钥在C:\Users\Administrator\.ssh

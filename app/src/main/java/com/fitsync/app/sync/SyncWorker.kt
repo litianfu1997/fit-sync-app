@@ -91,11 +91,16 @@ object SyncScheduler {
      * 冷启动或平台登录恢复后立即执行一次完整自动同步。
      * 与手动同步使用不同的唯一任务链，避免覆盖用户正在执行的一次性同步。
      */
-    fun enqueueAutoNow(context: Context) {
+    fun enqueueAutoNow(context: Context, delayMs: Long = 0L) {
         WorkManager.getInstance(context).enqueueUniqueWork(
             AUTO_NOW_NAME,
             ExistingWorkPolicy.APPEND_OR_REPLACE,
-            oneTimeRequest(force = false, deliveryOnly = false, expedited = true),
+            oneTimeRequest(
+                force = false,
+                deliveryOnly = false,
+                delayMs = delayMs,
+                expedited = delayMs <= 0L,
+            ),
         )
     }
 

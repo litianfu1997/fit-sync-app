@@ -85,7 +85,7 @@ class CorosApiTest {
             """"Expiration":"2026-01-01T00:00:00Z"}"""
         // 模拟服务端：把盐拼进 base64 文本（位置不限，replace 能去掉即可）
         val salted = Base64.getEncoder().encodeToString(json.toByteArray()) + OSS_SALT
-        val resp = """{"code":200,"data":{"credentials":"$salted"}}"""
+        val resp = """{"code":200,"data":{"credentials":"$salted","service":"aliyun"}}"""
 
         val c = parseCorosSts(resp)
         assertThat(c).isNotNull()
@@ -95,6 +95,20 @@ class CorosApiTest {
         assertThat(c.bucket).isEqualTo("coros-oss")
         assertThat(c.region).isEqualTo("oss-cn-beijing")
         assertThat(c.expiration).isEqualTo("2026-01-01T00:00:00Z")
+        assertThat(c.serviceName).isEqualTo("aliyun")
+    }
+
+    @Test
+    fun parseSts_defaultsServiceToAliyunAndNormalizesRegionSuffix() {
+        val json = """{"AccessKeyId":"ak","AccessKeySecret":"sk","SecurityToken":"st",""" +
+            """"Bucket":"coros-oss","Region":"oss-cn-shanghai.aliyuncs.com"}"""
+        val encoded = Base64.getEncoder().encodeToString(json.toByteArray())
+        val resp = """{"code":200,"data":{"credentials":"$encoded"}}"""
+
+        val c = parseCorosSts(resp)
+        assertThat(c).isNotNull()
+        assertThat(c!!.region).isEqualTo("oss-cn-shanghai")
+        assertThat(c.serviceName).isEqualTo("aliyun")
     }
 
     @Test

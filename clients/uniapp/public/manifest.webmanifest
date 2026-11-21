@@ -1,0 +1,27 @@
+{
+  "id": "/",
+  "name": "FitSync · 骑行活动跨平台同步",
+  "short_name": "FitSync",
+  "description": "在迈金、行者、Garmin、COROS、iGPSPORT 与 Strava 之间自动去重同步 FIT 骑行活动。",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#111827",
+  "theme_color": "#111827",
+  "lang": "zh-CN",
+  "icons": [
+    {
+      "src": "/static/logo.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

@@ -15,13 +15,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.toArgb
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.fitsync.app.FitSyncApp
 import com.fitsync.app.fit.LatLng
 import com.fitsync.app.ui.theme.FitSpacing
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
@@ -47,7 +47,6 @@ fun TrackMap(
     interactive: Boolean = false,
     onTap: (() -> Unit)? = null,
 ) {
-    val context = LocalContext.current
     val density = LocalDensity.current.density
     val lifecycleOwner = LocalLifecycleOwner.current
     val colors = MaterialTheme.colorScheme
@@ -63,6 +62,8 @@ fun TrackMap(
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { ctx ->
+                // 兜底确保 osmdroid 已完成目录与 UA 初始化（正常启动在后台 IO 线程已完成）。
+                FitSyncApp.instance.osMapBootstrap.ensureInitialized()
                 // 新建视图时清掉渲染缓存，保证下面的 update 一定会重画 overlays
                 handle.reset()
                 MapView(ctx).apply {
@@ -85,7 +86,6 @@ fun TrackMap(
                     view.onResume()
                     handle.resumed = true
                 }
-                view.setBackgroundColor(backgroundColor)
                 renderTrack(
                     view = view,
                     handle = handle,
@@ -93,6 +93,7 @@ fun TrackMap(
                     lineColor = lineColor,
                     startColor = startColor,
                     endColor = endColor,
+                    backgroundColor = backgroundColor,
                     density = density,
                 )
             },
@@ -147,24 +148,28 @@ private class TrackMapHandle {
     private var renderedLineColor = 0
     private var renderedStartColor = 0
     private var renderedEndColor = 0
+    private var renderedBackgroundColor = 0
 
     /** 视图被重建（LazyColumn 回收、配置变化）时必须整体重来：overlays 随视图消失，onResume 也要对新视图补一次。 */
     fun reset() {
         renderedPoints = null
+        renderedBackgroundColor = 0
         resumed = false
     }
 
-    fun needsRender(points: List<LatLng>, line: Int, start: Int, end: Int): Boolean =
+    fun needsRender(points: List<LatLng>, line: Int, start: Int, end: Int, bg: Int): Boolean =
         renderedPoints != points ||
             renderedLineColor != line ||
             renderedStartColor != start ||
-            renderedEndColor != end
+            renderedEndColor != end ||
+            renderedBackgroundColor != bg
 
-    fun markRendered(points: List<LatLng>, line: Int, start: Int, end: Int) {
+    fun markRendered(points: List<LatLng>, line: Int, start: Int, end: Int, bg: Int) {
         renderedPoints = points
         renderedLineColor = line
         renderedStartColor = start
         renderedEndColor = end
+        renderedBackgroundColor = bg
     }
 }
 
@@ -175,10 +180,12 @@ private fun renderTrack(
     lineColor: Int,
     startColor: Int,
     endColor: Int,
+    backgroundColor: Int,
     density: Float,
 ) {
-    if (!handle.needsRender(points, lineColor, startColor, endColor)) return
-    handle.markRendered(points, lineColor, startColor, endColor)
+    if (!handle.needsRender(points, lineColor, startColor, endColor, backgroundColor)) return
+    handle.markRendered(points, lineColor, startColor, endColor, backgroundColor)
+    view.setBackgroundColor(backgroundColor)
 
     val geoPoints = points.map { GeoPoint(it.lat, it.lon) }
     view.overlays.clear()

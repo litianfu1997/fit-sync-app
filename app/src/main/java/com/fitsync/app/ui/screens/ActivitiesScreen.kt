@@ -12,6 +12,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
@@ -31,34 +33,24 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.paging.LoadState
-import androidx.paging.Pager
-import androidx.paging.PagingConfig
 import androidx.paging.compose.collectAsLazyPagingItems
 import androidx.paging.compose.itemKey
-import androidx.paging.map
-import com.fitsync.app.FitSyncApp
-import com.fitsync.app.data.db.dao.ActivityListItem
-import com.fitsync.app.data.db.dao.ActivityListQuery
 import com.fitsync.app.domain.model.DedupStatus
 import com.fitsync.app.domain.model.SportType
-import com.fitsync.app.fit.LatLng
-import com.fitsync.app.fit.TrackCodec
 import com.fitsync.app.performance.PerformanceTrace
 import com.fitsync.app.ui.components.EmptyStateVariant
 import com.fitsync.app.ui.components.FitEmptyState
 import com.fitsync.app.ui.components.FitListRow
 import com.fitsync.app.ui.components.FitPagingFooter
+import com.fitsync.app.ui.components.FitRefreshBanner
 import com.fitsync.app.ui.components.FitSkeletonListRow
 import com.fitsync.app.ui.components.FitTopBar
 import com.fitsync.app.ui.components.IconBadge
@@ -66,83 +58,44 @@ import com.fitsync.app.ui.components.IconBadgeSize
 import com.fitsync.app.ui.components.StatusPill
 import com.fitsync.app.ui.components.StatusTone
 import com.fitsync.app.ui.components.TrackThumbnail
+import com.fitsync.app.ui.state.ActivitiesViewModel
+import com.fitsync.app.ui.state.ActivityListUiModel
 import com.fitsync.app.ui.theme.FitShape
 import com.fitsync.app.ui.theme.FitSpacing
 import com.fitsync.app.ui.theme.FitType
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.map
 
 enum class ActivityFilter(val label: String) {
     ALL("全部"), CYCLING("骑行"), RUNNING("跑步"), REVIEW("待复核")
 }
 
-/** 活动列表按活动开始时间排序。默认倒序（最新在前）。 */
-private enum class ActivityTimeSort(val label: String) {
-    NEWEST_FIRST("时间倒序"),
-    OLDEST_FIRST("时间正序"),
-}
-
 @Composable
 fun ActivitiesScreen(
-    filter: ActivityFilter = ActivityFilter.ALL,
-    onFilterChange: (ActivityFilter) -> Unit = {},
+    viewModel: ActivitiesViewModel,
+    listState: LazyListState = rememberLazyListState(),
     onOpenActivity: (Long) -> Unit = {},
     onOpenPlatforms: () -> Unit = {},
 ) {
-    var query by rememberSaveable { mutableStateOf("") }
-    var debouncedQuery by rememberSaveable { mutableStateOf("") }
-    var timeSort by rememberSaveable { mutableStateOf(ActivityTimeSort.NEWEST_FIRST) }
-    val dateFormat = remember { SimpleDateFormat("MM月dd日 · HH:mm", Locale.getDefault()) }
+    val query by viewModel.query.collectAsStateWithLifecycle()
+    val filter by viewModel.filter.collectAsStateWithLifecycle()
+    val oldestFirst by viewModel.oldestFirst.collectAsStateWithLifecycle()
+    val activities = viewModel.activities.collectAsLazyPagingItems()
 
-    LaunchedEffect(query) {
-        delay(250)
-        debouncedQuery = query.trim()
-    }
     LaunchedEffect(Unit) {
         PerformanceTrace.section("FitSync:activity_list_first_frame") {
             withFrameNanos { }
         }
     }
-    val listQuery = remember(debouncedQuery, filter, timeSort) {
-        ActivityListQuery(
-            searchText = debouncedQuery,
-            filter = filter.name,
-            oldestFirst = timeSort == ActivityTimeSort.OLDEST_FIRST,
-        )
-    }
-    val pager = remember(listQuery) {
-        Pager(
-            config = PagingConfig(
-                pageSize = 50,
-                prefetchDistance = 15,
-                enablePlaceholders = false,
-                maxSize = 200,
-            ),
-            pagingSourceFactory = {
-                FitSyncApp.instance.database.canonicalActivityDao().pagingSource(
-                    query = listQuery.searchText,
-                    filter = listQuery.filter,
-                    oldestFirst = listQuery.oldestFirst,
-                )
-            },
-        )
-    }
-    val formattedActivities = remember(pager, dateFormat) {
-        pager.flow.map { pagingData ->
-            pagingData.map { it.toUiModel(dateFormat) }
-        }
-    }
-    val activities = formattedActivities.collectAsLazyPagingItems()
 
-    val showingEverything = debouncedQuery.isBlank() && filter == ActivityFilter.ALL
-    val firstLoad = activities.loadState.refresh is LoadState.Loading && activities.itemCount == 0
+    val showingEverything = query.isBlank() && filter == ActivityFilter.ALL
+    val refreshState = activities.loadState.refresh
+    val isInitialLoading = refreshState is LoadState.Loading && activities.itemCount == 0
+    val isRefreshingWithContent = refreshState is LoadState.Loading && activities.itemCount > 0
+    val isRefreshError = refreshState is LoadState.Error && activities.itemCount == 0
 
     Column(Modifier.fillMaxSize()) {
         FitTopBar(title = "运动记录", subtitle = "所有来源已合并去重")
         LazyColumn(
+            state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(
                 start = FitSpacing.screenGutter,
@@ -152,33 +105,28 @@ fun ActivitiesScreen(
             ),
             verticalArrangement = Arrangement.spacedBy(FitSpacing.md),
         ) {
-            item {
+            item(key = "search-field") {
                 ActivitySearchField(
                     query = query,
-                    onQueryChange = { query = it },
+                    onQueryChange = viewModel::updateQuery,
                 )
             }
-            item {
+            item(key = "sort-row") {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        "${activities.itemCount} 条已加载",
+                        if (isInitialLoading) "正在加载活动…" else "${activities.itemCount} 条已加载",
                         style = FitType.dataLabel,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     FilterChip(
                         modifier = Modifier.height(36.dp),
                         selected = true,
-                        onClick = {
-                            timeSort = when (timeSort) {
-                                ActivityTimeSort.NEWEST_FIRST -> ActivityTimeSort.OLDEST_FIRST
-                                ActivityTimeSort.OLDEST_FIRST -> ActivityTimeSort.NEWEST_FIRST
-                            }
-                        },
-                        label = { Text(timeSort.label) },
+                        onClick = viewModel::toggleSort,
+                        label = { Text(if (oldestFirst) "时间正序" else "时间倒序") },
                         leadingIcon = {
                             Icon(
                                 Icons.AutoMirrored.Filled.Sort,
@@ -194,7 +142,7 @@ fun ActivitiesScreen(
                     )
                 }
             }
-            item {
+            item(key = "filter-chips") {
                 Row(
                     modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(FitSpacing.sm),
@@ -203,7 +151,7 @@ fun ActivitiesScreen(
                         FilterChip(
                             modifier = Modifier.height(36.dp),
                             selected = filter == option,
-                            onClick = { onFilterChange(option) },
+                            onClick = { viewModel.updateFilter(option) },
                             label = { Text(option.label) },
                             colors = FilterChipDefaults.filterChipColors(
                                 selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
@@ -214,14 +162,30 @@ fun ActivitiesScreen(
                 }
             }
             when {
-                firstLoad -> {
-                    items(4, key = { "skeleton-$it" }) {
+                isInitialLoading -> {
+                    item(key = "first-load-banner") {
+                        FitRefreshBanner(message = "正在加载活动列表…")
+                    }
+                    items(5, key = { "skeleton-$it" }) {
                         FitSkeletonListRow()
                     }
                 }
 
-                activities.loadState.refresh is LoadState.NotLoading && activities.itemCount == 0 -> {
-                    item {
+                isRefreshError -> {
+                    item(key = "refresh-error") {
+                        val error = (refreshState as LoadState.Error).error
+                        FitEmptyState(
+                            title = "活动列表加载失败",
+                            body = error.localizedMessage ?: "读取本地运动记录时发生异常。",
+                            variant = EmptyStateVariant.Error,
+                            actionLabel = "重试",
+                            onAction = { activities.retry() },
+                        )
+                    }
+                }
+
+                refreshState is LoadState.NotLoading && activities.itemCount == 0 -> {
+                    item(key = "empty-state") {
                         if (showingEverything) {
                             FitEmptyState(
                                 title = "还没有活动",
@@ -238,16 +202,18 @@ fun ActivitiesScreen(
                                 variant = EmptyStateVariant.NoResults,
                                 icon = Icons.Default.Search,
                                 actionLabel = "清除筛选",
-                                onAction = {
-                                    query = ""
-                                    onFilterChange(ActivityFilter.ALL)
-                                },
+                                onAction = viewModel::clearFilters,
                             )
                         }
                     }
                 }
 
                 else -> {
+                    if (isRefreshingWithContent) {
+                        item(key = "refresh-banner") {
+                            FitRefreshBanner(message = "正在筛选活动…")
+                        }
+                    }
                     items(
                         count = activities.itemCount,
                         key = activities.itemKey { it.id },
@@ -375,30 +341,6 @@ private fun ActivityRow(
         showChevron = true,
     )
 }
-
-private data class ActivityListUiModel(
-    val id: Long,
-    val title: String,
-    val sportType: SportType,
-    val dedupStatus: DedupStatus,
-    val dateText: String,
-    val distanceText: String,
-    val durationText: String?,
-    val sportText: String,
-    val trackPoints: List<LatLng>,
-)
-
-private fun ActivityListItem.toUiModel(dateFormat: SimpleDateFormat): ActivityListUiModel = ActivityListUiModel(
-    id = id,
-    title = title?.takeIf { it.isNotBlank() } ?: sportLabel(sportType),
-    sportType = sportType,
-    dedupStatus = dedupStatus,
-    dateText = dateFormat.format(Date(startTimeEpochMs)),
-    distanceText = distanceMeters?.let { "%.1f km".format(it / 1000) } ?: "--",
-    durationText = elapsedSeconds?.let(::formatDuration),
-    sportText = sportLabel(sportType),
-    trackPoints = TrackCodec.decodeTrack(trackJson),
-)
 
 fun sportLabel(sport: SportType): String = when (sport) {
     SportType.CYCLING -> "骑行"

@@ -68,7 +68,7 @@
 - 范围：仅支持 iGPSPORT 中国站（后端 `prod.zh.igpsport.com`，前端 `app.igpsport.cn`）。
 - 认证：**纯 API 账号密码登录**（不走 WebView）。`POST /service/auth/account/login` body `{appId:"igpsport-web", username, password}` 返回 JWT `access_token`（7 天有效，payload 含 `memberid`）。账号密码经 Android Keystore 加密持久化；JWT 过期且无刷新接口，故 token 失效时用持久化的账号密码自动重登（`IgpsportApiConnector.withRelogin`），实现全自动。
 - 执行方式：list/download/upload 均为 `BACKGROUND`：
-  - 列表：`GET /service/web-gateway/web-analyze/activity/queryMyActivity?reqType=1&sportType=0&pageNo=&pageSize=&sort=1`（pageNo 分页，客户端按增量窗口过滤）。
+  - 列表：`GET /service/web-gateway/web-analyze/activity/queryMyActivity?reqType=0&pageNo=&pageSize=&sort=1&sortType=1`（pageNo 分页，客户端按增量窗口过滤）。
   - 下载：列表行 `fitUrl`（或回退 `queryActivityDetail/{rideId}` 的 `fitOssPath`）是阿里云 OSS **公共读**直链 `igp-zh.oss-cn-hangzhou.aliyuncs.com/{uuid}.fit`，匿名 GET。
   - 上传：`getSignedUrl?fileExtension=.fit` 拿 OSS 直传地址 → `PUT` FIT 字节到签名 URL（匿名且不附带 `Content-Type`，与中国站网页端保持一致）→ `POST uploadByOss {fileName, ossName:ossId}` 创建活动。响应只表示异步受理，ossId 仅保存在投递确认令牌中；下次 list 取得真实 rideId 后才写入平台副本。
 - 失效处理：仅中国站业务 API 的 401/403 触发账号密码静默重登；OSS 直传失败按投递失败重试，不会把账号误标为 `AUTH_EXPIRED`。
@@ -82,6 +82,6 @@
 - 执行方式：list/download/upload 均为 `BACKGROUND`：
   - 列表：`GET /activity/query?size=&pageNumber=`（活动 ID = `labelId`，分页看 `totalPage`，客户端按增量窗口过滤；`sportType` 写入 metadata 供下载用）。
   - 下载：`POST /activity/detail/download?labelId=&sportType=&fileType=4`（fileType=4=FIT）拿 `data.fileUrl`，再匿名 GET（阿里云 OSS 直链 `coros-oss.oss-cn-beijing.aliyuncs.com`）。
-  - 上传：① `GET faq.coros.com/openapi/oss/sts`（固定 sign/app_id）拿 STS 临时凭证——盐串污染的 base64 解码 ② FIT 打 zip ③ 用 STS 凭证按阿里云 OSS **V1 签名（HMAC-SHA1）** PUT 到 `coros-oss/fit_zip/{userId}/{md5}.zip` ④ `POST /activity/fit/import`（multipart 字段 `jsonParameter`，`serviceName="oss"`，`md5`=原始 FIT 的、`size`=zip 的）。import 只表示异步受理，fitMd5 仅作为确认标识；下次 list 取得真实 labelId 后才写入平台副本。
-- 失效处理：业务 401 触发账号密码静默重登；OSS/STS 失败按可重试失败处理，不把账号误标 `AUTH_EXPIRED`（STS 失效重拿即可）。
+  - 上传：① `GET trainingcn.coros.com/api/proxy/oss/sts`（带 Cookie `CPL-coros-token` / `CPL-coros-region=2`）拿 STS 临时凭证——盐串污染的 base64 解码 ② FIT 打 zip ③ 用 STS 凭证按阿里云 OSS **V1 签名（HMAC-SHA1）** PUT 到 `coros-oss/fit_zip/{userId}/{md5}.zip` ④ `POST /activity/fit/import`（multipart 字段 `jsonParameter`，`serviceName` 取 STS 返回值，`md5`=原始 FIT 的、`size`=zip 的）。import 只表示异步受理，fitMd5 仅作为确认标识；下次 list 取得真实 labelId 后才写入平台副本。
+- 失效处理：业务及 STS 接口的 401/403 触发账号密码静默重登；OSS 请求或其他临时失败按可重试失败处理，不把账号误标 `AUTH_EXPIRED`（STS 失效重拿即可）。
 - 实验性：依赖逆向的私有接口与硬编码常量（sign/app_id/盐），可能随 COROS 调整失效；失效时降级为失败任务并提示，不会静默丢任务。中国站访问不要走 VPN/代理。

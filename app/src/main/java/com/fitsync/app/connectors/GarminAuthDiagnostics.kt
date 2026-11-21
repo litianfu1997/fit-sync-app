@@ -27,10 +27,11 @@ object GarminAuthDiagnostics {
     private val buffer = ArrayDeque<Event>()
     private var prefs: android.content.SharedPreferences? = null
 
-    /** 在 [FitSyncApp.onCreate] 调用，拿到 Context 以启用持久化；未初始化时仅保留内存缓冲。 */
+    /** 可在后台初始化线程安全调用，拿到 Context 以启用持久化；未初始化时仅保留内存缓冲。 */
+    @Synchronized
     fun init(context: Context) {
         if (prefs != null) return
-        prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         runCatching { prefs?.getString(PREF_KEY, null)?.let { restore(it) } }
     }
 

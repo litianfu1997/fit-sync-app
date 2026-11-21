@@ -1,5 +1,6 @@
 package com.fitsync.app.web
 
+import android.content.Context
 import android.webkit.CookieManager
 import android.webkit.WebStorage
 import com.fitsync.app.domain.model.Platform
@@ -245,6 +246,21 @@ class WebSessionManager(
     private fun key(platform: Platform, field: String) = "${platform.name}:$field"
 
     companion object {
+        private const val MIGRATION_PREFS_NAME = "fitsync_migrations"
+        private const val KEY_STRAVA_LEGACY_CLEANED = "strava_legacy_cleaned"
+
+        /**
+         * 冷启动后台清理旧版 Strava API 凭据（只执行一次），
+         * 直接操作 [SecureSessionStore]，避免触发 [WebSessionManager] 懒加载而提前拉起 Chromium CookieManager。
+         */
+        fun clearLegacyStravaApiCredentialsOnce(context: Context) {
+            val prefs = context.getSharedPreferences(MIGRATION_PREFS_NAME, Context.MODE_PRIVATE)
+            if (prefs.getBoolean(KEY_STRAVA_LEGACY_CLEANED, false)) return
+            val store = SecureSessionStore(context.applicationContext)
+            STRAVA_LEGACY_API_FIELDS.forEach { field -> store.remove("${Platform.STRAVA.name}:$field") }
+            prefs.edit().putBoolean(KEY_STRAVA_LEGACY_CLEANED, true).apply()
+        }
+
         private val STRAVA_LEGACY_API_FIELDS = listOf(
             "client_id",
             "client_secret",

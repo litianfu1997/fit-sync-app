@@ -1,0 +1,40 @@
+{
+  "pages": [
+    {
+      "path": "pages/overview/index",
+      "style": { "navigationBarTitleText": "FitSync · 概览" }
+    },
+    {
+      "path": "pages/activities/index",
+      "style": { "navigationBarTitleText": "运动记录" }
+    },
+    {
+      "path": "pages/activity/index",
+      "style": { "navigationBarTitleText": "活动详情" }
+    },
+    {
+      "path": "pages/map/index",
+      "style": { "navigationBarTitleText": "轨迹地图" }
+    },
+    {
+      "path": "pages/sync/index",
+      "style": { "navigationBarTitleText": "同步中心" }
+    },
+    {
+      "path": "pages/jobs/index",
+      "style": { "navigationBarTitleText": "同步任务" }
+    },
+    {
+      "path": "pages/settings/index",
+      "style": { "navigationBarTitleText": "设置" }
+    }
+  ],
+  "globalStyle": {
+    "navigationStyle": "custom",
+    "backgroundColor": "@backgroundColor",
+    "backgroundColorTop": "@backgroundColor",
+    "backgroundColorBottom": "@backgroundColor",
+    "navigationBarBackgroundColor": "@backgroundColor",
+    "navigationBarTextStyle": "@navigationBarTextStyle"
+  }
+}

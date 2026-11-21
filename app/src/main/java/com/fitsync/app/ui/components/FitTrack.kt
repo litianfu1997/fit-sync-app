@@ -1,8 +1,8 @@
 package com.fitsync.app.ui.components
 
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -11,6 +11,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -39,18 +40,21 @@ fun TrackPreview(
     color: Color = MaterialTheme.colorScheme.onSurfaceVariant,
     strokeWidth: Dp = 1.5.dp,
 ) {
-    Canvas(modifier) {
-        val path = trackPath(points, size) ?: return@Canvas
-        drawPath(
-            path = path,
-            color = color,
-            style = Stroke(
+    Spacer(
+        modifier = modifier.drawWithCache {
+            val path = trackPath(points, size)
+            val stroke = Stroke(
                 width = strokeWidth.toPx(),
                 cap = StrokeCap.Round,
                 join = StrokeJoin.Round,
-            ),
-        )
-    }
+            )
+            onDrawBehind {
+                if (path != null) {
+                    drawPath(path = path, color = color, style = stroke)
+                }
+            }
+        },
+    )
 }
 
 /**
@@ -89,43 +93,48 @@ fun SeriesChart(
     color: Color = MaterialTheme.colorScheme.primary,
     strokeWidth: Dp = 1.5.dp,
 ) {
-    Canvas(modifier) {
-        if (values.size < 2 || size.width <= 0f || size.height <= 0f) return@Canvas
-        var lo = Float.MAX_VALUE
-        var hi = -Float.MAX_VALUE
-        values.forEach {
-            lo = min(lo, it)
-            hi = max(hi, it)
-        }
-        val span = (hi - lo).takeIf { it > 1e-6f } ?: 1f
-        val inset = size.height * 0.08f
-        val usable = size.height - inset * 2f
-        val stepX = size.width / (values.size - 1)
+    Spacer(
+        modifier = modifier.drawWithCache {
+            if (values.size < 2 || size.width <= 0f || size.height <= 0f) {
+                onDrawBehind {}
+            } else {
+                var lo = Float.MAX_VALUE
+                var hi = -Float.MAX_VALUE
+                values.forEach {
+                    lo = min(lo, it)
+                    hi = max(hi, it)
+                }
+                val span = (hi - lo).takeIf { it > 1e-6f } ?: 1f
+                val inset = size.height * 0.08f
+                val usable = size.height - inset * 2f
+                val stepX = size.width / (values.size - 1)
 
-        val line = Path()
-        values.forEachIndexed { index, value ->
-            val x = index * stepX
-            val y = inset + (1f - (value - lo) / span) * usable
-            if (index == 0) line.moveTo(x, y) else line.lineTo(x, y)
-        }
+                val line = Path()
+                values.forEachIndexed { index, value ->
+                    val x = index * stepX
+                    val y = inset + (1f - (value - lo) / span) * usable
+                    if (index == 0) line.moveTo(x, y) else line.lineTo(x, y)
+                }
 
-        val area = Path().apply {
-            addPath(line)
-            lineTo(size.width, size.height)
-            lineTo(0f, size.height)
-            close()
-        }
-        drawPath(path = area, color = color.copy(alpha = 0.12f))
-        drawPath(
-            path = line,
-            color = color,
-            style = Stroke(
-                width = strokeWidth.toPx(),
-                cap = StrokeCap.Round,
-                join = StrokeJoin.Round,
-            ),
-        )
-    }
+                val area = Path().apply {
+                    addPath(line)
+                    lineTo(size.width, size.height)
+                    lineTo(0f, size.height)
+                    close()
+                }
+                val areaColor = color.copy(alpha = 0.12f)
+                val stroke = Stroke(
+                    width = strokeWidth.toPx(),
+                    cap = StrokeCap.Round,
+                    join = StrokeJoin.Round,
+                )
+                onDrawBehind {
+                    drawPath(path = area, color = areaColor)
+                    drawPath(path = line, color = color, style = stroke)
+                }
+            }
+        },
+    )
 }
 
 /**
