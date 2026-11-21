@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 仅在 cloudDebug 允许本地开发连接 http://10.0.2.2 等测试地址，release 严格要求 HTTPS。 -->
+    <application android:usesCleartextTraffic="true" />
+</manifest>

@@ -476,6 +476,34 @@ public class AuthService {
         user);
   }
 
+  /** 注销并彻底删除当前用户账号及其关联的活动、平台连接、同步规则、任务与会话。 */
+  @Transactional
+  public void deleteAccount(String user) {
+    var rows = store.db.queryForList("SELECT id,email FROM app_user WHERE id=? FOR UPDATE", user);
+    if (rows.isEmpty()) throw ApiException.missing();
+    String email = CloudStore.str(rows.getFirst(), "email");
+
+    store.db.update(
+        "DELETE FROM account_lease WHERE account_id IN (SELECT id FROM platform_account WHERE"
+            + " user_id=?)",
+        user);
+    store.db.update("DELETE FROM remote_activity_skip WHERE user_id=?", user);
+    store.db.update("DELETE FROM sync_job WHERE user_id=?", user);
+    store.db.update("DELETE FROM sync_rule WHERE user_id=?", user);
+    store.db.update("DELETE FROM platform_copy WHERE user_id=?", user);
+    store.db.update("DELETE FROM activity_variant WHERE user_id=?", user);
+    store.db.update("DELETE FROM activity WHERE user_id=?", user);
+    store.db.update("DELETE FROM oauth_challenge WHERE user_id=?", user);
+    store.db.update(
+        "DELETE FROM google_oauth_challenge WHERE user_id=? OR resolved_user_id=?", user, user);
+    store.db.update("DELETE FROM platform_account WHERE user_id=?", user);
+    store.db.update("DELETE FROM user_session WHERE user_id=?", user);
+    if (email != null) {
+      store.db.update("DELETE FROM email_verification_code WHERE email=?", email);
+    }
+    store.db.update("DELETE FROM app_user WHERE id=?", user);
+  }
+
   public String authenticate(String header) {
     if (header == null || !header.startsWith("Bearer ") || header.length() > 512)
       throw new ApiException(401, "UNAUTHORIZED", "请先登录");

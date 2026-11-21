@@ -9,12 +9,14 @@ import TrackMap from "../../components/TrackMap.vue";
 import SeriesChart from "../../components/SeriesChart.vue";
 import NativeAd from "../../components/NativeAd.vue";
 import { filterValidPoints } from "../../lib/geo";
+import { downloadFitViaNative } from "../../lib/native-bridge";
 import {
   fetchAccounts,
   fetchActivity,
   invalidate,
 } from "../../lib/data-cache";
 import {
+  absApiBase,
   api,
   apiBase,
   confirm,
@@ -336,6 +338,10 @@ async function download() {
   try {
     const url = `${apiBase()}/v1/activities/${encodeURIComponent(id.value)}/file`;
     // #ifdef H5
+    if (downloadFitViaNative(id.value, session.token, absApiBase())) {
+      toast("正在通过系统导出 FIT 文件…");
+      return;
+    }
     const response = await fetch(url, {
       headers: { Authorization: `Bearer ${session.token}` },
     });

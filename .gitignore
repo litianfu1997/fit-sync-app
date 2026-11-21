@@ -21,6 +21,7 @@ out/
 
 # Signing — never commit keystores or credentials
 /keystore.properties
+/cloud.properties
 /keystore/
 *.jks
 *.keystore

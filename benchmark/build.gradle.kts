@@ -6,12 +6,18 @@ plugins {
 
 android {
     namespace = "com.fitsync.app.benchmark"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         minSdk = 26
-        targetSdk = 34
+        targetSdk = 36
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    flavorDimensions += "edition"
+    productFlavors {
+        create("local") { dimension = "edition" }
+        create("cloud") { dimension = "edition" }
     }
 
     targetProjectPath = ":app"

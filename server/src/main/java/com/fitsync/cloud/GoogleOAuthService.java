@@ -61,14 +61,7 @@ public class GoogleOAuthService {
     this.clientId = clientId == null ? "" : clientId.strip();
     this.clientSecret = clientSecret == null ? "" : clientSecret.strip();
     this.configuredRedirectUri = redirectUri == null ? "" : redirectUri.strip();
-    Set<String> origins = new LinkedHashSet<>();
-    if (corsOrigins != null) {
-      for (String item : corsOrigins.split(",")) {
-        String s = item.strip();
-        if (!s.isEmpty()) origins.add(s.toLowerCase(Locale.ROOT));
-      }
-    }
-    this.allowedOrigins = Set.copyOf(origins);
+    this.allowedOrigins = OAuthReturnUrls.parseAllowedOrigins(corsOrigins);
   }
 
   void setIdentityResolverForTest(IdentityResolver resolver) {
@@ -103,8 +96,9 @@ public class GoogleOAuthService {
       throw ApiException.bad("Google 登录尚未配置");
     }
     String redirectUri = resolveRedirectUri(rawRedirectUri, request);
-    String redirectOrigin = originOf(URI.create(redirectUri));
-    String returnUrl = validateReturnUrl(rawReturnUrl, redirectOrigin);
+    String redirectOrigin = OAuthReturnUrls.originOf(URI.create(redirectUri));
+    String returnUrl =
+        OAuthReturnUrls.validateReturnUrl(rawReturnUrl, redirectOrigin, allowedOrigins);
 
     long now = System.currentTimeMillis();
     long expires = now + TTL_MS;
@@ -356,78 +350,17 @@ public class GoogleOAuthService {
     String candidate =
         rawRedirectUri != null && !rawRedirectUri.isBlank()
             ? rawRedirectUri.strip()
-            : defaultCallbackFromRequest(request);
-    URI uri = parseHttpUri(candidate, "Google 授权回调地址无效");
+            : OAuthReturnUrls.defaultCallbackFromRequest(request, CALLBACK_PATH);
+    URI uri = OAuthReturnUrls.parseHttpUri(candidate, "Google 授权回调地址无效");
     if (!CALLBACK_PATH.equals(uri.getPath())
         || uri.getRawQuery() != null
         || uri.getFragment() != null) {
       throw ApiException.bad("Google 授权回调地址路径必须是 " + CALLBACK_PATH);
     }
-    if (!"https".equalsIgnoreCase(uri.getScheme()) && !isLoopback(uri.getHost())) {
+    if (!"https".equalsIgnoreCase(uri.getScheme()) && !OAuthReturnUrls.isLoopback(uri.getHost())) {
       throw ApiException.bad("Google 授权回调地址必须使用 HTTPS；仅本地开发允许使用 HTTP");
     }
     return uri.toString();
-  }
-
-  private String defaultCallbackFromRequest(HttpServletRequest request) {
-    String scheme = request.getScheme();
-    String host = request.getServerName();
-    int port = request.getServerPort();
-    boolean standardPort =
-        ("http".equalsIgnoreCase(scheme) && port == 80)
-            || ("https".equalsIgnoreCase(scheme) && port == 443);
-    return scheme + "://" + host + (standardPort ? "" : ":" + port) + CALLBACK_PATH;
-  }
-
-  private String validateReturnUrl(String rawReturnUrl, String redirectOrigin) {
-    if (rawReturnUrl == null || rawReturnUrl.isBlank()) return null;
-    String trimmed = rawReturnUrl.strip();
-    if (trimmed.indexOf('\r') >= 0 || trimmed.indexOf('\n') >= 0) {
-      throw ApiException.bad("返回地址格式无效");
-    }
-    URI uri = parseHttpUri(trimmed, "返回地址格式无效");
-    if (!"https".equalsIgnoreCase(uri.getScheme()) && !isLoopback(uri.getHost())) {
-      throw ApiException.bad("返回地址必须使用 HTTPS 或本地开发地址");
-    }
-    String origin = originOf(uri);
-    boolean sameOrigin = origin.equalsIgnoreCase(redirectOrigin);
-    boolean inCors = allowedOrigins.contains(origin.toLowerCase(Locale.ROOT));
-    if (!sameOrigin && !inCors) {
-      throw ApiException.bad("返回地址不在允许的域名白名单内");
-    }
-    return uri.toString();
-  }
-
-  private static URI parseHttpUri(String raw, String message) {
-    try {
-      URI uri = URI.create(raw);
-      String scheme = uri.getScheme();
-      String host = uri.getHost();
-      if (scheme == null
-          || host == null
-          || uri.getUserInfo() != null
-          || (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))) {
-        throw ApiException.bad(message);
-      }
-      return uri;
-    } catch (IllegalArgumentException e) {
-      throw ApiException.bad(message);
-    }
-  }
-
-  private static String originOf(URI uri) {
-    String scheme = uri.getScheme().toLowerCase(Locale.ROOT);
-    String host = uri.getHost().toLowerCase(Locale.ROOT);
-    int port = uri.getPort();
-    boolean standardPort =
-        port == -1
-            || ("http".equals(scheme) && port == 80)
-            || ("https".equals(scheme) && port == 443);
-    return scheme + "://" + host + (standardPort ? "" : ":" + port);
-  }
-
-  private static boolean isLoopback(String host) {
-    return "127.0.0.1".equals(host) || "localhost".equalsIgnoreCase(host);
   }
 
   private static String enc(String text) {

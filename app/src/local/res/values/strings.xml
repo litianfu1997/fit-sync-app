@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FitSync</string>
+    <string name="share_receiver_label">导入到 FitSync</string>
+</resources>

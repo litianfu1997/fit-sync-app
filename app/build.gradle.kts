@@ -1,3 +1,4 @@
+import java.net.URI
 import java.util.Properties
 
 plugins {
@@ -18,9 +19,40 @@ val keystoreProperties = Properties().apply {
 fun signingProperty(environmentName: String, propertyName: String): String? =
     providers.environmentVariable(environmentName).orNull ?: keystoreProperties.getProperty(propertyName)
 
+val cloudProperties = Properties().apply {
+    val file = rootProject.file("cloud.properties")
+    if (file.exists()) {
+        file.inputStream().use { load(it) }
+    }
+}
+
+fun cloudProperty(environmentName: String, propertyName: String): String? =
+    providers.environmentVariable(environmentName).orNull?.takeIf { it.isNotBlank() }
+        ?: cloudProperties.getProperty(propertyName)?.takeIf { it.isNotBlank() }
+
+fun quoteGradleString(value: String): String =
+    "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+val cloudWebUrl = (cloudProperty("FITSYNC_CLOUD_WEB_URL", "webUrl") ?: "https://fitsync.example.com")
+    .trim()
+    .trimEnd('/')
+val cloudWebHost = runCatching { URI(cloudWebUrl).host }
+    .getOrNull()
+    ?.takeIf { it.isNotBlank() }
+    ?: "fitsync.example.com"
+val cloudApiBaseUrl = (cloudProperty("FITSYNC_CLOUD_API_BASE_URL", "apiBaseUrl") ?: "$cloudWebUrl/api")
+    .trim()
+    .trimEnd('/')
+val cloudApplicationId = cloudProperty("FITSYNC_CLOUD_APPLICATION_ID", "applicationId") ?: "com.fitsync.cloud"
+val admobEnabled = (cloudProperty("FITSYNC_ADMOB_ENABLED", "admobEnabled") ?: "false").toBoolean()
+// 未填真实 AdMob App ID 时回落 Google 官方测试 ID，避免 MobileAdsInitProvider 在启动期崩溃。
+val admobAppId = cloudProperty("FITSYNC_ADMOB_APP_ID", "admobAppId")
+    ?: "ca-app-pub-3940256099942544~3347511713"
+val admobBannerUnitId = cloudProperty("FITSYNC_ADMOB_BANNER_UNIT_ID", "admobBannerUnitId") ?: ""
+
 android {
     namespace = "com.fitsync.app"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.fitsync.app"
@@ -29,6 +61,31 @@ android {
         versionCode = providers.environmentVariable("FITSYNC_VERSION_CODE").orNull?.toInt() ?: 2
         versionName = providers.environmentVariable("FITSYNC_VERSION_NAME").orNull ?: "0.2.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    flavorDimensions += "edition"
+    productFlavors {
+        create("local") {
+            dimension = "edition"
+            applicationId = "com.fitsync.app"
+            targetSdk = 34
+            buildConfigField("boolean", "IS_CLOUD_EDITION", "false")
+        }
+        create("cloud") {
+            dimension = "edition"
+            applicationId = cloudApplicationId
+            targetSdk = 36
+            cloudProperty("FITSYNC_CLOUD_VERSION_CODE", "versionCode")?.toIntOrNull()?.let { versionCode = it }
+            cloudProperty("FITSYNC_CLOUD_VERSION_NAME", "versionName")?.let { versionName = it }
+            buildConfigField("boolean", "IS_CLOUD_EDITION", "true")
+            buildConfigField("String", "CLOUD_WEB_URL", quoteGradleString(cloudWebUrl))
+            buildConfigField("String", "CLOUD_API_BASE_URL", quoteGradleString(cloudApiBaseUrl))
+            buildConfigField("boolean", "ADMOB_ENABLED", admobEnabled.toString())
+            buildConfigField("String", "ADMOB_BANNER_UNIT_ID", quoteGradleString(admobBannerUnitId))
+            manifestPlaceholders["admobAppId"] = admobAppId
+            manifestPlaceholders["admobDelayAppMeasurementInit"] = (!admobEnabled).toString()
+            manifestPlaceholders["cloudWebHost"] = cloudWebHost
+        }
     }
 
     signingConfigs {
@@ -67,6 +124,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     composeOptions {
@@ -114,6 +172,9 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.osmdroid:osmdroid-android:6.1.20")
+
+    "cloudImplementation"("androidx.browser:browser:1.8.0")
+    "cloudImplementation"("com.google.android.gms:play-services-ads:23.6.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")

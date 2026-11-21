@@ -124,6 +124,8 @@ class AuthIntegrationTest {
         .andExpect(jsonPath("$.passwordLoginEnabled").value(true))
         .andExpect(jsonPath("$.emailAuthEnabled").value(true))
         .andExpect(jsonPath("$.googleLoginEnabled").value(true))
+        .andExpect(jsonPath("$.admob.enabled").value(false))
+        .andExpect(jsonPath("$.admob.bannerAdUnitId").value(""))
         .andExpect(jsonPath("$.webLoginEnabled").doesNotExist());
   }
 
@@ -676,5 +678,143 @@ class AuthIntegrationTest {
     mvc.perform(get("/api/v1/me").header("Authorization", "Bearer " + token))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.hasWechat").value(false));
+  }
+
+  @Test
+  void googleOAuthAllowsCloudAppSchemeReturnUrlAndRejectsUntrustedSchemes() throws Exception {
+    var allowedResp =
+        mvc.perform(
+                post("/api/v1/auth/google/start")
+                    .contentType("application/json")
+                    .content(
+                        store.encode(
+                            Map.of(
+                                "redirectUri",
+                                "https://fit.example.com/api/v1/auth/google/callback",
+                                "returnUrl",
+                                "fitsync-cloud://oauth?returnPath=%2Fpages%2Foverview%2Findex"))))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse();
+    String authorizeUrl =
+        store.json.readTree(allowedResp.getContentAsString()).get("authorizeUrl").asText();
+    String state = queryParam(authorizeUrl, "state");
+
+    googleOAuth.setIdentityResolverForTest(
+        (cid, csecret, ruri, code) ->
+            new GoogleOAuthService.GoogleProfile(
+                "google-sub-app-1", "app.rider@example.com", true, "云端骑友"));
+    var callbackResp =
+        mvc.perform(
+                get("/api/v1/auth/google/callback")
+                    .param("state", state)
+                    .param("code", "app-code"))
+            .andExpect(status().isFound())
+            .andReturn()
+            .getResponse();
+    String location = callbackResp.getHeader("Location");
+    assertNotNull(location);
+    assertTrue(location.startsWith("fitsync-cloud://oauth?returnPath=%2Fpages%2Foverview%2Findex"));
+    assertTrue(location.contains("googleTicket="));
+
+    mvc.perform(
+            post("/api/v1/auth/google/start")
+                .contentType("application/json")
+                .content(
+                    store.encode(
+                        Map.of(
+                            "redirectUri",
+                            "https://fit.example.com/api/v1/auth/google/callback",
+                            "returnUrl",
+                            "fitsync-cloud://other-host"))))
+        .andExpect(status().isBadRequest());
+
+    mvc.perform(
+            post("/api/v1/auth/google/start")
+                .contentType("application/json")
+                .content(
+                    store.encode(
+                        Map.of(
+                            "redirectUri",
+                            "https://fit.example.com/api/v1/auth/google/callback",
+                            "returnUrl",
+                            "javascript://alert(1)"))))
+        .andExpect(status().isBadRequest());
+  }
+
+  @Test
+  void deleteAccountRemovesUserSessionsRecordsAndStoredFits() throws Exception {
+    mvc.perform(delete("/api/v1/me")).andExpect(status().isUnauthorized());
+
+    JsonNode created = register("rider_delete_me", "delete-pass-123", "待注销用户");
+    String token = created.get("token").asText();
+    String userId = created.get("user").get("id").asText();
+
+    // 为该用户写入平台账号、活动、原件、规则、任务以及磁盘 FIT 文件，确认注销能完整清理。
+    String accountId = CloudStore.id();
+    String activityId = CloudStore.id();
+    String variantId = CloudStore.id();
+    long now = System.currentTimeMillis();
+    java.nio.file.Path userDir = java.nio.file.Path.of("./target/auth-test-fits", userId);
+    java.nio.file.Files.createDirectories(userDir);
+    java.nio.file.Path fitFile = userDir.resolve("sample.fit");
+    java.nio.file.Files.writeString(fitFile, "dummy-fit");
+
+    store.db.update(
+        "INSERT INTO platform_account(id,user_id,platform,display_name,status,encrypted_session)"
+            + " VALUES(?,?,?,?,?,?)",
+        accountId,
+        userId,
+        "COROS",
+        "COROS",
+        "ACTIVE",
+        "enc");
+    store.db.update(
+        "INSERT INTO activity(id,user_id,title,start_time,source_platform,needs_review,created_at)"
+            + " VALUES(?,?,?,?,?,?,?)",
+        activityId,
+        userId,
+        "测试骑行",
+        now,
+        "LOCAL",
+        false,
+        now);
+    store.db.update(
+        "INSERT INTO"
+            + " activity_variant(id,user_id,activity_id,sha256,file_path,metadata_json,quality_score)"
+            + " VALUES(?,?,?,?,?,?,?)",
+        variantId,
+        userId,
+        activityId,
+        "abc123",
+        userId + "/sample.fit",
+        "{}",
+        10);
+
+    mvc.perform(delete("/api/v1/me").header("Authorization", "Bearer " + token))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.success").value(true));
+
+    assertEquals(
+        0,
+        store.db.queryForObject(
+            "SELECT COUNT(*) FROM app_user WHERE id=?", Integer.class, userId));
+    assertEquals(
+        0,
+        store.db.queryForObject(
+            "SELECT COUNT(*) FROM user_session WHERE user_id=?", Integer.class, userId));
+    assertEquals(
+        0,
+        store.db.queryForObject(
+            "SELECT COUNT(*) FROM activity WHERE user_id=?", Integer.class, userId));
+    assertEquals(
+        0,
+        store.db.queryForObject(
+            "SELECT COUNT(*) FROM platform_account WHERE user_id=?", Integer.class, userId));
+    assertFalse(java.nio.file.Files.exists(fitFile));
+    assertFalse(java.nio.file.Files.exists(userDir));
+
+    mvc.perform(get("/api/v1/me").header("Authorization", "Bearer " + token))
+        .andExpect(status().isUnauthorized());
   }
 }

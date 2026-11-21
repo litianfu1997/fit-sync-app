@@ -22,6 +22,11 @@ export interface WebSessionFields {
   externalUserId?: string;
   userAgent?: string;
 }
+export interface AdMobConfig {
+  enabled: boolean;
+  bannerAdUnitId?: string;
+  rewardedAdUnitId?: string;
+}
 export interface Config {
   wechatLoginEnabled: boolean;
   passwordLoginEnabled?: boolean;
@@ -35,6 +40,7 @@ export interface Config {
     rewardedAdUnitId?: string;
     rewardVerificationEnabled?: boolean;
   };
+  admob?: AdMobConfig;
   platforms: PlatformInfo[];
 }
 export interface User {

@@ -2,4 +2,5 @@
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
     <files-path name="fits" path="fits/" />
     <cache-path name="garmin_upload" path="garmin_upload/" />
+    <cache-path name="shared_fits" path="shared_fits/" />
 </paths>

@@ -768,6 +768,24 @@ public class ActivityService {
     return variantFile(user, id, CloudStore.str(activity, "primary_variant_id"));
   }
 
+  /** 清理用户在存储目录中保存的所有原始 FIT 文件；仅在账号数据库记录删除提交后调用。 */
+  public void deleteUserStorage(String user) {
+    if (user == null || user.isBlank()) return;
+    Path userDir = root.resolve(user).normalize();
+    if (!userDir.startsWith(root) || userDir.equals(root) || !Files.exists(userDir)) return;
+    try (var walk = Files.walk(userDir)) {
+      walk.sorted(Comparator.reverseOrder())
+          .forEach(
+              path -> {
+                try {
+                  Files.deleteIfExists(path);
+                } catch (Exception ignored) {
+                }
+              });
+    } catch (Exception ignored) {
+    }
+  }
+
   public byte[] variantFile(String user, String activity, String variantId) {
     store.owned("activity", activity, user);
     var variant =

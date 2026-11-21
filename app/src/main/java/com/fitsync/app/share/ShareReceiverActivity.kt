@@ -1,7 +1,5 @@
 package com.fitsync.app.share
 
-import android.content.Intent
-import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -46,7 +44,7 @@ class ShareReceiverActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        val uris = extractUris(intent)
+        val uris = ShareIntentUris.extract(intent)
 
         setContent {
             FitSyncTheme {
@@ -137,22 +135,6 @@ class ShareReceiverActivity : ComponentActivity() {
                     }
                 }
             }
-        }
-    }
-
-    private fun extractUris(intent: Intent?): List<Uri> {
-        if (intent == null) return emptyList()
-        return when (intent.action) {
-            Intent.ACTION_SEND -> {
-                @Suppress("DEPRECATION")
-                listOfNotNull(intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri)
-            }
-            Intent.ACTION_SEND_MULTIPLE -> {
-                @Suppress("DEPRECATION")
-                intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM).orEmpty()
-            }
-            Intent.ACTION_VIEW -> listOfNotNull(intent.data)
-            else -> emptyList()
         }
     }
 

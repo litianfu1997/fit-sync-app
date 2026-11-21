@@ -94,7 +94,7 @@ jobs:
       - name: 准备 Android SDK
         run: |
           set -euo pipefail
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" "platform-tools"
           chmod +x gradlew
 
       - name: 运行单元测试并构建正式 APK
@@ -102,13 +102,13 @@ jobs:
           FITSYNC_KEYSTORE_PASSWORD: ${{ secrets.FITSYNC_KEYSTORE_PASSWORD }}
           FITSYNC_KEY_ALIAS: ${{ secrets.FITSYNC_KEY_ALIAS }}
           FITSYNC_KEY_PASSWORD: ${{ secrets.FITSYNC_KEY_PASSWORD }}
-        run: ./gradlew :app:testReleaseUnitTest :app:assembleRelease --no-daemon --no-configuration-cache --stacktrace --info
+        run: ./gradlew :app:testLocalReleaseUnitTest :app:assembleLocalRelease --no-daemon --no-configuration-cache --stacktrace --info
 
       - name: 校验签名并整理发布文件
         id: package
         run: |
           set -euo pipefail
-          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose app/build/outputs/apk/local/release/app-local-release.apk
           python3 - <<'PY'
           import hashlib
           import json
@@ -117,10 +117,10 @@ jobs:
           import shutil
           from pathlib import Path
 
-          apk_dir = Path("app/build/outputs/apk/release")
+          apk_dir = Path("app/build/outputs/apk/local/release")
           metadata = json.loads((apk_dir / "output-metadata.json").read_text())
           elements = metadata["elements"]
-          if len(elements) != 1 or elements[0]["outputFile"] != "app-release.apk":
+          if len(elements) != 1 or elements[0]["outputFile"] != "app-local-release.apk":
               raise SystemExit("APK 输出格式发生变化，请检查打包步骤。")
           info = elements[0]
           version = info["versionName"]

@@ -22,6 +22,9 @@ public class ApiController {
   private final GoogleOAuthService googleOAuth;
   private final JobService jobs;
   private final String nativeAd;
+  private final boolean admobEnabled;
+  private final String admobBannerUnitId;
+  private final String admobRewardedUnitId;
 
   public ApiController(
       AuthService auth,
@@ -31,7 +34,10 @@ public class ApiController {
       StravaOAuthService stravaOAuth,
       GoogleOAuthService googleOAuth,
       JobService jobs,
-      @Value("${fitsync.native-ad-unit-id:}") String nativeAd) {
+      @Value("${fitsync.native-ad-unit-id:}") String nativeAd,
+      @Value("${fitsync.admob.enabled:false}") boolean admobEnabled,
+      @Value("${fitsync.admob.banner-ad-unit-id:}") String admobBannerUnitId,
+      @Value("${fitsync.admob.rewarded-ad-unit-id:}") String admobRewardedUnitId) {
     this.auth = auth;
     this.dashboards = dashboards;
     this.activities = activities;
@@ -40,6 +46,9 @@ public class ApiController {
     this.googleOAuth = googleOAuth;
     this.jobs = jobs;
     this.nativeAd = nativeAd;
+    this.admobEnabled = admobEnabled;
+    this.admobBannerUnitId = admobBannerUnitId == null ? "" : admobBannerUnitId.strip();
+    this.admobRewardedUnitId = admobRewardedUnitId == null ? "" : admobRewardedUnitId.strip();
   }
 
   private String user(HttpServletRequest request) {
@@ -79,6 +88,14 @@ public class ApiController {
             "",
             "rewardVerificationEnabled",
             false),
+        "admob",
+        Map.of(
+            "enabled",
+            admobEnabled,
+            "bannerAdUnitId",
+            admobEnabled ? admobBannerUnitId : "",
+            "rewardedAdUnitId",
+            admobEnabled ? admobRewardedUnitId : ""),
         "platforms",
         platforms);
   }
@@ -273,6 +290,14 @@ public class ApiController {
   @PostMapping("/auth/logout")
   public Map<String, Object> logout(HttpServletRequest request) {
     auth.logout(user(request), request.getHeader("Authorization"));
+    return Map.of("success", true);
+  }
+
+  @DeleteMapping("/me")
+  public Map<String, Object> deleteAccount(HttpServletRequest request) {
+    String userId = user(request);
+    auth.deleteAccount(userId);
+    activities.deleteUserStorage(userId);
     return Map.of("success", true);
   }
 

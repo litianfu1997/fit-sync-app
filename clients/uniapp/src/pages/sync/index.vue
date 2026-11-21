@@ -5,7 +5,8 @@ import { onHide, onLoad, onShow } from "@dcloudio/uni-app";
 import AppShell from "../../components/AppShell.vue";
 import SessionGate from "../../components/SessionGate.vue";
 import LoadState from "../../components/LoadState.vue";
-import { api, apiBase, confirm, go, messageOf, session, toast } from "../../lib/api";
+import { api, absApiBase, confirm, go, messageOf, session, toast } from "../../lib/api";
+import { nativeOAuthReturnUrl } from "../../lib/native-bridge";
 import { useLoad } from "../../lib/page";
 import { cachedQuery } from "../../lib/query-cache";
 import { fetchAccounts, invalidate } from "../../lib/data-cache";
@@ -289,14 +290,11 @@ async function startStravaOAuth() {
   connecting.value = true;
   try {
     const isH5 = typeof window !== "undefined";
-    const base = apiBase();
-    const absApi = /^https?:\/\//i.test(base)
-      ? base
-      : isH5
-        ? new URL(base, window.location.origin).toString().replace(/\/+$/, "")
-        : base;
+    const absApi = isH5 ? absApiBase() : "";
     const redirectUri = `${absApi}/v1/accounts/oauth/strava/callback`;
-    const returnUrl = isH5 ? `${window.location.origin}/#/pages/sync/index` : undefined;
+    const returnUrl =
+      nativeOAuthReturnUrl("/pages/sync/index") ||
+      (isH5 ? `${window.location.origin}/#/pages/sync/index` : undefined);
     const result = await api<{ challengeId: string; authorizeUrl: string }>(
       "/accounts/oauth/strava/start",
       "POST",

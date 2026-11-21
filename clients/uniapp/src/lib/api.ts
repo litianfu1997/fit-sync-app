@@ -8,6 +8,12 @@ import {
   type TabIntent,
 } from "./tab-intent";
 import { beginNavigation, endNavigation } from "./nav-progress";
+import {
+  clearNativeSession,
+  nativeOAuthReturnUrl,
+  notifyNativeAdConfig,
+  notifyNativeSession,
+} from "./native-bridge";
 
 const TOKEN_KEY = "fitsync.session.v1";
 const CONFIG_KEY = "fitsync.config.v1";
@@ -66,12 +72,18 @@ export function validateBase(value: string): string {
   // #endif
   return base;
 }
+export function absApiBase(): string {
+  const base = apiBase();
+  if (typeof window === "undefined" || /^https?:\/\//i.test(base)) return base;
+  return new URL(base, window.location.origin).toString().replace(/\/+$/, "");
+}
 export function clearSession() {
   session.token = "";
   session.user = null;
   uni.removeStorageSync(TOKEN_KEY);
   // 资料快照含账号信息，登出即清；config 与账号无关，保留给下次冷启动。
   uni.removeStorageSync(USER_KEY);
+  clearNativeSession();
 }
 export class ApiError extends Error {
   constructor(
@@ -156,7 +168,7 @@ function extractH5GoogleParams(): {
 
   if (!ticket && !oauth && !oauthMsg) return null;
 
-  for (const key of ["googleTicket", "googleOAuth", "googleOAuthMsg"]) {
+  for (const key of ["googleTicket", "googleOAuth", "googleOAuthMsg", "_oauthTs"]) {
     searchParams.delete(key);
     hashParams.delete(key);
   }
@@ -194,7 +206,9 @@ function refreshSessionSnapshot() {
     try {
       session.config = await api<Config>("/config", "GET", undefined, false);
       writeSnapshot(CONFIG_KEY, session.config);
+      notifyNativeAdConfig(session.config?.admob);
       if (session.token) {
+        notifyNativeSession(session.token, absApiBase());
         session.user = await api<User>("/me");
         writeSnapshot(USER_KEY, session.user);
       }
@@ -219,6 +233,7 @@ export async function initialize(force = false): Promise<void> {
     try {
       session.config = await api<Config>("/config", "GET", undefined, false);
       writeSnapshot(CONFIG_KEY, session.config);
+      notifyNativeAdConfig(session.config?.admob);
       let exchanged = false;
       // #ifdef H5
       const callback = extractH5GoogleParams();
@@ -237,6 +252,7 @@ export async function initialize(force = false): Promise<void> {
       }
       // #endif
       if (session.token && !exchanged) {
+        notifyNativeSession(session.token, absApiBase());
         session.user = await api<User>("/me");
         writeSnapshot(USER_KEY, session.user);
       }
@@ -335,10 +351,7 @@ export async function startGoogleOAuth(
   if (typeof window === "undefined") {
     throw new Error("当前环境不支持网页 Google 授权");
   }
-  const base = apiBase();
-  const absApi = /^https?:\/\//i.test(base)
-    ? base
-    : new URL(base, window.location.origin).toString().replace(/\/+$/, "");
+  const absApi = absApiBase();
   const redirectUri = `${absApi}/v1/auth/google/callback`;
   const currentHash = window.location.hash.split("?")[0];
   const resolvedPath =
@@ -346,7 +359,9 @@ export async function startGoogleOAuth(
     (currentHash.startsWith("#/")
       ? currentHash.slice(1)
       : "/pages/overview/index");
-  const returnUrl = `${window.location.origin}/#${resolvedPath}`;
+  const returnUrl =
+    nativeOAuthReturnUrl(resolvedPath) ||
+    `${window.location.origin}/#${resolvedPath}`;
   const endpoint =
     mode === "bind" ? "/auth/google/bind/start" : "/auth/google/start";
   const result = await api<{ challengeId: string; authorizeUrl: string }>(
@@ -413,11 +428,17 @@ export async function changePassword(
 export async function updateProfile(displayName: string): Promise<User> {
   return api<User>("/me", "PUT", { displayName });
 }
+/** 注销并删除当前用户及全部云端数据。 */
+export async function deleteAccount(): Promise<void> {
+  await api<{ success: boolean }>("/me", "DELETE");
+  clearSession();
+}
 export function setSession(result: LoginResult) {
   session.token = result.token;
   session.user = result.user;
   uni.setStorageSync(TOKEN_KEY, result.token);
   writeSnapshot(USER_KEY, result.user);
+  notifyNativeSession(result.token, absApiBase());
 }
 /** 本地更新用户资料后同步内存中的会话对象。 */
 export function patchSessionUser(user: User) {

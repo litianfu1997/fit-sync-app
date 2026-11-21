@@ -48,6 +48,10 @@ fitsync:
   wechat-app-secret: ${WECHAT_APP_SECRET:}
   native-ad-unit-id: ${WECHAT_NATIVE_AD_UNIT_ID:}
   rewarded-ad-unit-id: ${WECHAT_REWARDED_AD_UNIT_ID:}
+  admob:
+    enabled: ${ADMOB_ENABLED:false}
+    banner-ad-unit-id: ${ADMOB_BANNER_AD_UNIT_ID:}
+    rewarded-ad-unit-id: ${ADMOB_REWARDED_AD_UNIT_ID:}
   scheduler-enabled: ${FITSYNC_SCHEDULER_ENABLED:true}
   session-days: 30
   sync-interval-ms: 900000

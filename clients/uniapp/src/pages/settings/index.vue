@@ -11,6 +11,7 @@ import {
   changePassword as changePasswordApi,
   clearSession,
   confirm,
+  deleteAccount,
   go,
   initialize,
   messageOf,
@@ -22,6 +23,7 @@ import {
   toast,
   updateProfile,
 } from "../../lib/api";
+import { invalidateAll } from "../../lib/data-cache";
 const EMAIL_RE = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
 const themeOptions: { value: ThemeMode; label: string }[] = [
   { value: "system", label: "跟随系统" },
@@ -54,6 +56,9 @@ const bindingWechat = ref(false),
 const bindingGoogle = ref(false),
   googleBindError = ref(""),
   googleBindSuccess = ref("");
+const deleteModal = ref(false),
+  deletingAccount = ref(false),
+  deleteError = ref("");
 let emailCooldownTimer: ReturnType<typeof setInterval> | null = null;
 
 const hasPassword = computed(() => !!session.user?.hasPassword);
@@ -281,6 +286,31 @@ async function logout() {
     go("overview");
   }
 }
+function openDeleteModal() {
+  deleteError.value = "";
+  deleteModal.value = true;
+}
+function closeDeleteModal() {
+  if (deletingAccount.value) return;
+  deleteError.value = "";
+  deleteModal.value = false;
+}
+async function submitDeleteAccount() {
+  if (deletingAccount.value) return;
+  deletingAccount.value = true;
+  deleteError.value = "";
+  try {
+    await deleteAccount();
+    invalidateAll();
+    deleteModal.value = false;
+    toast("账号及云端数据已永久删除");
+    go("overview");
+  } catch (reason) {
+    deleteError.value = messageOf(reason);
+  } finally {
+    deletingAccount.value = false;
+  }
+}
 </script>
 <template>
   <AppShell
@@ -441,6 +471,15 @@ async function logout() {
               pwdSuccess
             }}</text
             ></view
+          >
+
+          <view class="form-panel"
+            ><text class="section-title danger">注销并删除账号</text
+            ><text class="muted"
+              >永久删除当前 FitSync 账号，以及云端保存的活动记录、原始 FIT 文件、平台连接、同步规则与会话。此操作不可恢复。</text
+            ><button class="btn secondary danger" @click="openDeleteModal">
+              删除我的账号与数据
+            </button></view
           >
         </view>
 
@@ -641,6 +680,43 @@ async function logout() {
           ></view
         ></view
       >
-    ></AppShell
+      <view
+        v-if="deleteModal"
+        class="modal-mask"
+        @click="closeDeleteModal"
+        @touchmove.stop
+        ><view class="modal-card" @click.stop
+          ><view class="modal-head"
+            ><text class="section-title danger">确认永久删除账号</text
+            ><button
+              class="text-button"
+              :disabled="deletingAccount"
+              @click="closeDeleteModal"
+            >
+              关闭
+            </button></view
+          ><text class="muted"
+            >删除后，你在 FitSync 云端的全部活动、原始 FIT 文件、已连接的平台凭据与自动同步规则都会被立即清除且无法恢复。已同步到第三方平台的活动不受影响。</text
+          ><text v-if="deleteError" class="error-text">{{ deleteError }}</text
+          ><view class="modal-actions"
+            ><button
+              class="btn secondary"
+              :disabled="deletingAccount"
+              @click="closeDeleteModal"
+            >
+              取消
+            </button>
+            <button
+              class="btn primary"
+              :loading="deletingAccount"
+              :disabled="deletingAccount"
+              @click="submitDeleteAccount"
+            >
+              确认永久删除
+            </button></view
+          ></view
+        ></view
+      >
+    </AppShell
   >
 </template>
